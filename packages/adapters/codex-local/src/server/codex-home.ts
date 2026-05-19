@@ -136,7 +136,7 @@ export async function prepareManagedCodexHome(
     await writeApiKeyAuthJson(targetHome, apiKey);
     await onLog(
       "stdout",
-      `[paperclip] Wrote API-key auth.json into Codex home "${targetHome}" from configured OPENAI_API_KEY.\n`,
+      `[paperclip] Wrote API-key auth.json into Codex home "${targetHome}" from provided OPENAI_API_KEY.\n`,
     );
   }
 

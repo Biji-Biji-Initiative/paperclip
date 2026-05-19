@@ -93,6 +93,19 @@ function resolveCodexBiller(env: Record<string, string>, billingType: "api" | "s
   return billingType === "subscription" ? "chatgpt" : openAiCompatibleBiller ?? "openai";
 }
 
+export function resolveCodexOpenAiApiKeyForAuth(
+  envConfig: Record<string, unknown>,
+  hostEnv: NodeJS.ProcessEnv = process.env,
+): string | null {
+  const configured = typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
+    ? envConfig.OPENAI_API_KEY.trim()
+    : null;
+  if (configured) return configured;
+  return typeof hostEnv.OPENAI_API_KEY === "string" && hostEnv.OPENAI_API_KEY.trim().length > 0
+    ? hostEnv.OPENAI_API_KEY.trim()
+    : null;
+}
+
 async function isLikelyPaperclipRepoRoot(candidate: string): Promise<boolean> {
   const [hasWorkspace, hasPackageJson, hasServerDir, hasAdapterUtilsDir] = await Promise.all([
     pathExists(path.join(candidate, "pnpm-workspace.yaml")),
@@ -335,10 +348,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const codexSkillEntries = await readPaperclipRuntimeSkillEntries(config, __moduleDir);
   const desiredSkillNames = resolveCodexDesiredSkillNames(config, codexSkillEntries);
   await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
-  const configuredOpenAiApiKey =
-    typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length > 0
-      ? envConfig.OPENAI_API_KEY.trim()
-      : null;
+  const configuredOpenAiApiKey = resolveCodexOpenAiApiKeyForAuth(envConfig, process.env);
   const preparedManagedCodexHome =
     configuredCodexHome
       ? null

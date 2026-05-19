@@ -70,7 +70,31 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
   };
 });
 
-import { execute } from "./execute.js";
+import { execute, resolveCodexOpenAiApiKeyForAuth } from "./execute.js";
+
+describe("resolveCodexOpenAiApiKeyForAuth", () => {
+  it("prefers the adapter-configured key over the host environment", () => {
+    expect(
+      resolveCodexOpenAiApiKeyForAuth(
+        { OPENAI_API_KEY: " configured-key " },
+        { OPENAI_API_KEY: "host-key" },
+      ),
+    ).toBe("configured-key");
+  });
+
+  it("falls back to the host environment when the adapter config has no key", () => {
+    expect(
+      resolveCodexOpenAiApiKeyForAuth(
+        { OPENAI_API_KEY: "   " },
+        { OPENAI_API_KEY: " host-key " },
+      ),
+    ).toBe("host-key");
+  });
+
+  it("returns null when no usable API key is available", () => {
+    expect(resolveCodexOpenAiApiKeyForAuth({}, {})).toBeNull();
+  });
+});
 
 describe("codex remote execution", () => {
   const cleanupDirs: string[] = [];
