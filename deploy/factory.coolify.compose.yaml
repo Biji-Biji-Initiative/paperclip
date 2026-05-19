@@ -31,6 +31,7 @@ services:
       SERVE_UI: "true"
       PAPERCLIP_HOME: "/paperclip"
       PAPERCLIP_INSTANCE_ID: "factory"
+      PAPERCLIP_CONFIG: "/paperclip/instances/factory/config.json"
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
       PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:?PAPERCLIP_PUBLIC_URL must be set}"
