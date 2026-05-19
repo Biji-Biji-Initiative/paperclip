@@ -1,0 +1,27 @@
+# Optional override for subscription-backed local CLI auth.
+#
+# Do not mount the whole CAAM vault into the app. Prepare dedicated, read-only
+# auth snapshots on the Coolify worker and mount only those directories.
+#
+# Example worker paths:
+#   /srv/paperclip-factory/caam/codex/auth.json
+#   /srv/paperclip-factory/caam/claude/.credentials.json or Claude config files
+#   /srv/paperclip-factory/caam/gemini/oauth_credentials.json
+#
+# Use this only after API-key mode is healthy and the operator accepts the
+# broader trust boundary of letting Paperclip-run agents spend subscription
+# quota through mounted CLI sessions.
+
+services:
+  server:
+    environment:
+      CODEX_HOME: "/paperclip/caam/codex"
+      CLAUDE_CONFIG_DIR: "/paperclip/caam/claude"
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+      GOOGLE_API_KEY: ""
+    volumes:
+      - /srv/paperclip-factory/caam/codex:/paperclip/caam/codex:ro
+      - /srv/paperclip-factory/caam/claude:/paperclip/caam/claude:ro
+      - /srv/paperclip-factory/caam/gemini:/paperclip/.gemini:ro
