@@ -59,8 +59,10 @@ The adapter creates a temporary directory with symlinks to Paperclip skills and 
 For Docker/Coolify deployments, seed Claude credentials into the persistent
 container home, such as `/paperclip/.claude`, or set `CLAUDE_CONFIG_DIR` to a
 profile-specific directory. The adapter snapshots those files for managed remote
-runs. See [Coolify subscription CLI auth](/deploy/coolify-subscription-auth) for
-the deployment checklist.
+runs. If deployment-level `ANTHROPIC_API_KEY` exists for fallback tooling, blank
+it in subscription-backed agents with `ANTHROPIC_API_KEY=` in adapter env. See
+[Coolify subscription CLI auth](/deploy/coolify-subscription-auth) for the
+deployment checklist.
 
 For manual local CLI usage outside heartbeat runs (for example running as `claudecoder` directly), use:
 

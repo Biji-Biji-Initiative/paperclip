@@ -33,8 +33,10 @@ operator's laptop shell.
   `CODEX_HOME=/paperclip/caam-codex-profiles/g6/codex_home`.
 - Claude subscription auth: `/paperclip/.claude` or an explicit
   `CLAUDE_CONFIG_DIR`.
-- Keep `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` unset when subscription billing
-  is intended; those env vars switch the CLIs into API-key mode.
+- Deployment-level model API keys may exist for explicit fallback or special
+  tooling, but subscription-backed agents must blank the matching env variable
+  in their adapter env (`OPENAI_API_KEY=` for Codex, `ANTHROPIC_API_KEY=` for
+  Claude) so the effective run stays on local CLI auth.
 - Verify with real CLI probes from inside the running server container, with the
   API key env explicitly unset, before creating heartbeat agents.
 

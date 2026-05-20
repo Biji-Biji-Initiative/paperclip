@@ -57,11 +57,14 @@ Then set an individual agent's adapter env to:
 
 ```dotenv
 CODEX_HOME=/paperclip/caam-codex-profiles/g6/codex_home
+OPENAI_API_KEY=
 ```
 
-Leave `OPENAI_API_KEY` unset for subscription billing. If `OPENAI_API_KEY` is
-present in the process environment or the agent config, Codex is treated as
-API-key mode and can bypass the subscription login.
+Deployment-level `OPENAI_API_KEY` can exist for explicit API-key tooling or
+fallback use, but subscription-backed Codex agents should blank it in their own
+adapter env. If `OPENAI_API_KEY` is non-empty in the effective process
+environment, Paperclip records the run as API-key mode and Codex may bypass the
+subscription login.
 
 Verify from the running container with the API key explicitly unset:
 
@@ -89,9 +92,11 @@ container deployment, seed these files into the persistent Paperclip home:
 ```
 
 For remote managed execution, the Claude adapter snapshots this config and
-materializes it for each run. Keep `ANTHROPIC_API_KEY` unset when subscription
-billing is desired. If `ANTHROPIC_API_KEY` is present, Claude Code uses API-key
-mode instead of local subscription credentials.
+materializes it for each run. Deployment-level `ANTHROPIC_API_KEY` can exist for
+explicit API-key fallback, but subscription-backed Claude agents should blank it
+in their adapter env when subscription billing is desired. If `ANTHROPIC_API_KEY`
+is non-empty in the effective process environment, Claude Code uses API-key mode
+instead of local subscription credentials.
 
 Verify with:
 
@@ -108,14 +113,15 @@ EOF
 ## Coolify Env Rules
 
 - The Paperclip data volume must persist `/paperclip`.
-- Remove or unset model API keys after subscription auth is proven:
-  - `OPENAI_API_KEY`
-  - `ANTHROPIC_API_KEY`
-- Redeploy/restart after env changes; verify the running container, not only the
-  Coolify API status string.
-- Coolify may report the old app as `running:healthy` while a new build helper is
-  still building. Confirm the live Docker image and container status on the
-  worker.
+- Model API keys may remain in Coolify for explicit fallback or special tooling,
+  but do not rely on them for default Codex/Claude agents when subscription
+  billing is intended.
+- For subscription-backed agents, set profile-specific auth homes in adapter env
+  and blank the matching model API-key variable:
+  - Codex: `CODEX_HOME=/paperclip/caam-codex-profiles/<profile>/codex_home` and `OPENAI_API_KEY=`
+  - Claude: `CLAUDE_CONFIG_DIR=/paperclip/caam-claude-profiles/<profile>/claude_config` and `ANTHROPIC_API_KEY=`
+- Redeploy/restart after deployment-level env changes; verify the running
+  container, not only the Coolify API status string.
 
 ## Proof Checklist
 
@@ -127,5 +133,6 @@ Before declaring subscription auth ready:
 4. `codex exec` succeeds with `OPENAI_API_KEY` unset.
 5. Claude is either not used, or `claude --print` succeeds with
    `ANTHROPIC_API_KEY` unset.
-6. Coolify runtime env no longer contains unnecessary model API keys.
+6. Subscription-backed agents have profile-specific adapter env and blank
+   model-key overrides.
 7. The public health endpoint returns `{"status":"ok"}` after restart.

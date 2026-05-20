@@ -60,7 +60,11 @@ profile-specific home, for example:
 
 ```dotenv
 CODEX_HOME=/paperclip/caam-codex-profiles/g6/codex_home
+OPENAI_API_KEY=
 ```
+
+The blank `OPENAI_API_KEY` is intentional when deployment-level model keys exist
+for fallback tooling: it keeps this agent on subscription auth.
 
 See [Coolify subscription CLI auth](/deploy/coolify-subscription-auth) for the
 container deployment checklist.
