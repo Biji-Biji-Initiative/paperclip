@@ -8,7 +8,14 @@ The `claude_local` adapter runs Anthropic's Claude Code CLI locally. It supports
 ## Prerequisites
 
 - Claude Code CLI installed (`claude` command available)
-- `ANTHROPIC_API_KEY` set in the environment or agent config
+- Auth configured by one of:
+  - local Claude subscription login in the runtime `CLAUDE_CONFIG_DIR` or `~/.claude`
+  - `ANTHROPIC_API_KEY` set in the environment or agent config
+
+Use only one billing mode intentionally. If `ANTHROPIC_API_KEY` is present,
+Claude Code uses API-key mode. For subscription billing, leave
+`ANTHROPIC_API_KEY` unset and make sure Claude credential files are present in
+the same machine or container that runs the Paperclip server.
 
 ## Configuration Fields
 
@@ -46,6 +53,14 @@ If resume fails with an unknown session error, the adapter automatically retries
 ## Skills Injection
 
 The adapter creates a temporary directory with symlinks to Paperclip skills and passes it via `--add-dir`. This makes skills discoverable without polluting the agent's working directory.
+
+## Container Subscription Auth
+
+For Docker/Coolify deployments, seed Claude credentials into the persistent
+container home, such as `/paperclip/.claude`, or set `CLAUDE_CONFIG_DIR` to a
+profile-specific directory. The adapter snapshots those files for managed remote
+runs. See [Coolify subscription CLI auth](/deploy/coolify-subscription-auth) for
+the deployment checklist.
 
 For manual local CLI usage outside heartbeat runs (for example running as `claudecoder` directly), use:
 
