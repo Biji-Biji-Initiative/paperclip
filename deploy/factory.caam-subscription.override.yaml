@@ -1,0 +1,29 @@
+# Optional override for subscription-backed local CLI auth.
+#
+# Do not mount the whole CAAM vault into the app. Prepare dedicated profile
+# homes on the Coolify worker and mount only those directories. Codex writes
+# runtime state into CODEX_HOME, so these profile homes must be writable by the
+# container while remaining scoped to selected production profiles only.
+#
+# Example worker paths:
+#   /srv/paperclip-factory/caam/codex/g7/auth.json
+#   /srv/paperclip-factory/caam/codex/g6/auth.json
+#   /srv/paperclip-factory/caam/codex/g5/auth.json
+#   /srv/paperclip-factory/caam/claude/team-profile/home/.claude/.credentials.json
+#   /srv/paperclip-factory/caam/claude/team-profile/xdg_config/claude-code/.credentials.json
+#
+# Provider API keys must stay out of the Paperclip server env. Shared provider
+# keys for image generation or fallback tooling belong in the encrypted
+# Paperclip company vault seeded from Infisical.
+
+services:
+  server:
+    environment:
+      CODEX_HOME: "/paperclip/caam/codex/g7"
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+      GOOGLE_API_KEY: ""
+    volumes:
+      - /srv/paperclip-factory/caam/codex:/paperclip/caam/codex:rw
+      - /srv/paperclip-factory/caam/claude:/paperclip/caam/claude:rw

@@ -8,7 +8,14 @@ The `codex_local` adapter runs OpenAI's Codex CLI locally. It supports session p
 ## Prerequisites
 
 - Codex CLI installed (`codex` command available)
-- `OPENAI_API_KEY` set in the environment or agent config
+- Auth configured by one of:
+  - subscription login in the runtime `CODEX_HOME` (`codex login --device-auth`, or a copied CAAM `auth.json`)
+  - `OPENAI_API_KEY` set in the environment or agent config
+
+Use only one billing mode intentionally. If `OPENAI_API_KEY` is present,
+Paperclip treats the run as API-key mode. For subscription billing, leave
+`OPENAI_API_KEY` unset and make sure `$CODEX_HOME/auth.json` exists in the same
+machine or container that runs the Paperclip server.
 
 ## Configuration Fields
 
@@ -45,6 +52,23 @@ Paperclip currently applies that only when the selected model is `gpt-5.4`. On o
 
 When Paperclip is running inside a managed worktree instance (`PAPERCLIP_IN_WORKTREE=true`), the adapter instead uses a worktree-isolated `CODEX_HOME` under the Paperclip instance so Codex skills, sessions, logs, and other runtime state do not leak across checkouts. It seeds that isolated home from the user's main Codex home for shared auth/config continuity.
 
+In Docker/Coolify deployments, the user's main Codex home is the container user's
+home, for example `/paperclip/.codex`. To use subscription billing, log in or
+copy CAAM-managed `auth.json` into that persistent home. To dedicate different
+subscription accounts to different agents, set that agent's adapter env to a
+profile-specific home, for example:
+
+```dotenv
+CODEX_HOME=/paperclip/caam-codex-profiles/g6/codex_home
+OPENAI_API_KEY=
+```
+
+The blank `OPENAI_API_KEY` is intentional when deployment-level model keys exist
+for fallback tooling: it keeps this agent on subscription auth.
+
+See [Coolify subscription CLI auth](/deploy/coolify-subscription-auth) for the
+container deployment checklist.
+
 ## Manual Local CLI
 
 For manual local CLI usage outside heartbeat runs (for example running as `codexcoder` directly), use:
@@ -67,5 +91,5 @@ The environment test checks:
 
 - Codex CLI is installed and accessible
 - Working directory is absolute and available (auto-created if missing and permitted)
-- Authentication signal (`OPENAI_API_KEY` presence)
+- Authentication signal (`OPENAI_API_KEY` presence or subscription login in `CODEX_HOME`)
 - A live hello probe (`codex exec --json -` with prompt `Respond with hello.`) to verify the CLI can actually run

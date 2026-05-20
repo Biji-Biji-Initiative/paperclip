@@ -124,17 +124,25 @@ export function companyService(db: Db) {
     return "A".repeat(attempt - 1);
   }
 
+  function isObjectRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null;
+  }
+
   function isIssuePrefixConflict(error: unknown) {
-    const constraint = typeof error === "object" && error !== null && "constraint" in error
-      ? (error as { constraint?: string }).constraint
-      : typeof error === "object" && error !== null && "constraint_name" in error
-        ? (error as { constraint_name?: string }).constraint_name
-        : undefined;
-    return typeof error === "object"
-      && error !== null
-      && "code" in error
-      && (error as { code?: string }).code === "23505"
-      && constraint === "companies_issue_prefix_idx";
+    let current: unknown = error;
+    const seen = new Set<unknown>();
+    while (isObjectRecord(current) && !seen.has(current)) {
+      seen.add(current);
+      const code = typeof current.code === "string" ? current.code : undefined;
+      const constraint = typeof current.constraint === "string"
+        ? current.constraint
+        : typeof current.constraint_name === "string"
+          ? current.constraint_name
+          : undefined;
+      if (code === "23505" && constraint === "companies_issue_prefix_idx") return true;
+      current = current.cause;
+    }
+    return false;
   }
 
   async function createCompanyWithUniquePrefix(data: typeof companies.$inferInsert) {

@@ -21,6 +21,29 @@ Some adapters also inject `PAPERCLIP_WAKE_PAYLOAD_JSON` on comment-driven wakes.
 
 Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>` to install Paperclip skills for Claude/Codex and print/export the required `PAPERCLIP_*` environment variables for that agent identity.
 
+## CLI Subscription Auth For Self-Hosted Instances
+
+For `codex_local` and `claude_local`, subscription billing only works when the
+CLI is logged in where the Paperclip server actually runs. In Docker/Coolify,
+that means the persistent container home, usually `/paperclip`, not the board
+operator's laptop shell.
+
+- Codex default subscription auth: `/paperclip/.codex/auth.json`.
+- Per-agent Codex account homes can be assigned with adapter env, for example
+  `CODEX_HOME=/paperclip/caam-codex-profiles/g6/codex_home`.
+- Claude subscription auth: `/paperclip/.claude` or an explicit
+  `CLAUDE_CONFIG_DIR`.
+- Deployment-level model API keys may exist for explicit fallback or special
+  tooling, but subscription-backed agents must blank the matching env variable
+  in their adapter env (`OPENAI_API_KEY=` for Codex, `ANTHROPIC_API_KEY=` for
+  Claude) so the effective run stays on local CLI auth.
+- Verify with real CLI probes from inside the running server container, with the
+  API key env explicitly unset, before creating heartbeat agents.
+
+Never paste or print CAAM token contents in comments. It is acceptable to report
+that an auth file exists, which profile it came from, and that a live probe
+returned the expected marker.
+
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
 ## The Heartbeat Procedure

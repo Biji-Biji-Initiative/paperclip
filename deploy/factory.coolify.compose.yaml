@@ -1,0 +1,70 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-paperclip}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: "${POSTGRES_DB:-paperclip}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:-paperclip}\" -d \"$${POSTGRES_DB:-paperclip}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - paperclip-factory-pgdata:/var/lib/postgresql/data
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3100"
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set}"
+      HOST: "0.0.0.0"
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_HOME: "/paperclip"
+      PAPERCLIP_INSTANCE_ID: "factory"
+      PAPERCLIP_CONFIG: "/paperclip/instances/factory/config.json"
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
+      PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:?PAPERCLIP_PUBLIC_URL must be set}"
+      PAPERCLIP_API_URL: "${PAPERCLIP_API_URL:?PAPERCLIP_API_URL must be set}"
+      PAPERCLIP_ALLOWED_HOSTNAMES: "${PAPERCLIP_ALLOWED_HOSTNAMES:-factory.mereka.io,paperclip-factory.deploy.mereka.io}"
+      PAPERCLIP_AUTH_BASE_URL_MODE: "explicit"
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "${PAPERCLIP_AUTH_DISABLE_SIGN_UP:-false}"
+      PAPERCLIP_MIGRATION_AUTO_APPLY: "${PAPERCLIP_MIGRATION_AUTO_APPLY:-true}"
+      PAPERCLIP_DB_BACKUP_ENABLED: "${PAPERCLIP_DB_BACKUP_ENABLED:-true}"
+      PAPERCLIP_DB_BACKUP_RETENTION_DAYS: "${PAPERCLIP_DB_BACKUP_RETENTION_DAYS:-14}"
+      PAPERCLIP_SECRETS_STRICT_MODE: "${PAPERCLIP_SECRETS_STRICT_MODE:-true}"
+      PAPERCLIP_SECRETS_MASTER_KEY: "${PAPERCLIP_SECRETS_MASTER_KEY:?PAPERCLIP_SECRETS_MASTER_KEY must be set}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      # Do not expose provider API keys globally to the Paperclip server: local
+      # CLI adapters auto-switch to API billing when these env vars are present.
+      # Shared provider keys for image generation or fallback tooling belong in
+      # the Paperclip encrypted vault seeded from Infisical, not process env.
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      CODEX_HOME: "/paperclip/caam/codex/g7"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3100/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    volumes:
+      - paperclip-factory-data:/paperclip
+      - /srv/paperclip-factory/caam/codex:/paperclip/caam/codex:rw
+      - /srv/paperclip-factory/caam/claude:/paperclip/caam/claude:rw
+
+volumes:
+  paperclip-factory-pgdata:
+  paperclip-factory-data:
