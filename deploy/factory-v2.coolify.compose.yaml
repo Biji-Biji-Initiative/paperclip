@@ -1,0 +1,90 @@
+# Paperclip Factory v2: an isolated, current-source deployment for Coolify.
+#
+# This intentionally starts with fresh state. It must not mount CAAM profiles,
+# host credential directories, or ambient AI-provider keys. Paperclip remains a
+# control plane; any future agent execution runtime is separately configured
+# and explicitly authorized after the board and security boundaries are proven.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-paperclip}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: "${POSTGRES_DB:-paperclip}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:-paperclip}\" -d \"$${POSTGRES_DB:-paperclip}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - paperclip-factory-v2-pgdata:/var/lib/postgresql/data
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3100"
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set}"
+      HOST: "0.0.0.0"
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_HOME: "/paperclip"
+      PAPERCLIP_INSTANCE_ID: "factory-v2"
+      PAPERCLIP_CONFIG: "/paperclip/instances/factory-v2/config.json"
+
+      # This is an internet-facing, authenticated control plane. The external
+      # base URL is explicit so cookies and callback links cannot inherit an
+      # internal Docker hostname.
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
+      PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:?PAPERCLIP_PUBLIC_URL must be set}"
+      PAPERCLIP_API_URL: "${PAPERCLIP_API_URL:?PAPERCLIP_API_URL must be set}"
+      PAPERCLIP_ALLOWED_HOSTNAMES: "${PAPERCLIP_ALLOWED_HOSTNAMES:?PAPERCLIP_ALLOWED_HOSTNAMES must be set}"
+      PAPERCLIP_AUTH_BASE_URL_MODE: "explicit"
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true"
+      PAPERCLIP_AUTH_RATE_LIMIT_ENABLED: "true"
+      PAPERCLIP_ENABLE_COMPANY_DELETION: "false"
+
+      # Fresh v2 state gets upstream migrations on boot, but it cannot wake or
+      # execute any legacy agent. Recovery is handled by the worker-level
+      # backup contract after v2 is promoted, not by an unproven in-app job.
+      PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
+      HEARTBEAT_SCHEDULER_ENABLED: "false"
+      PAPERCLIP_DB_BACKUP_ENABLED: "false"
+
+      # Per-instance keys come from Infisical. Keeping every durable signing
+      # key explicit makes a backed-up v2 instance restorable without relying
+      # on an untracked generated file.
+      PAPERCLIP_SECRETS_STRICT_MODE: "true"
+      PAPERCLIP_SECRETS_MASTER_KEY: "${PAPERCLIP_SECRETS_MASTER_KEY:?PAPERCLIP_SECRETS_MASTER_KEY must be set}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: "${PAPERCLIP_TOOL_ACTION_SIGNING_SECRET:?PAPERCLIP_TOOL_ACTION_SIGNING_SECRET must be set}"
+      PAPERCLIP_DECISION_SIGNING_SECRET: "${PAPERCLIP_DECISION_SIGNING_SECRET:?PAPERCLIP_DECISION_SIGNING_SECRET must be set}"
+
+      # No ambient provider credential may select API billing or grant a
+      # container-wide identity. Provider access, if later approved, belongs
+      # in Paperclip's encrypted vault or a scoped remote runtime.
+      OPENAI_API_KEY: ""
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+      GOOGLE_API_KEY: ""
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3100/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+    volumes:
+      - paperclip-factory-v2-data:/paperclip
+
+volumes:
+  paperclip-factory-v2-pgdata:
+  paperclip-factory-v2-data:
