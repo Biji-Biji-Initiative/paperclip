@@ -19,7 +19,9 @@ services:
       timeout: 5s
       retries: 30
     volumes:
-      - paperclip-factory-v3-pgdata:/var/lib/postgresql/data
+      # r1 deliberately starts a fresh disposable state plane after the
+      # initial private candidate's malformed bootstrap configuration.
+      - paperclip-factory-v3-r1-pgdata:/var/lib/postgresql/data
 
   server:
     build:
@@ -69,8 +71,8 @@ services:
       retries: 20
       start_period: 90s
     volumes:
-      - paperclip-factory-v3-data:/paperclip
+      - paperclip-factory-v3-r1-data:/paperclip
 
 volumes:
-  paperclip-factory-v3-pgdata:
-  paperclip-factory-v3-data:
+  paperclip-factory-v3-r1-pgdata:
+  paperclip-factory-v3-r1-data:
