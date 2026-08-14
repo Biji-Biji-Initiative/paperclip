@@ -175,6 +175,12 @@ export async function discoverOpenCodeModelsCached(input: {
   return models;
 }
 
+export function isTruthyEnvFlag(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const v = value.trim().toLowerCase();
+  return v === "true" || v === "1" || v === "yes";
+}
+
 export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
   model?: unknown;
   command?: unknown;
@@ -183,14 +189,45 @@ export async function ensureOpenCodeModelConfiguredAndAvailable(input: {
 }): Promise<AdapterModel[]> {
   const model = requireOpenCodeModelId(input.model);
 
-  const models = await discoverOpenCodeModelsCached({
-    command: input.command,
-    cwd: input.cwd,
-    env: input.env,
-  });
+  // When the caller opts into OPENCODE_ALLOW_ALL_MODELS, OpenCode accepts any
+  // provider/model at run time (e.g. gateway-routed models that never appear in
+  // `opencode models` output). Honour that by skipping the availability probe;
+  // we still enforce the provider/model format above and do not second-guess
+  // the configured model. Prefer the explicit run env, then the process env.
+  const env = normalizeEnv(input.env);
+  if (isTruthyEnvFlag(env.OPENCODE_ALLOW_ALL_MODELS ?? process.env.OPENCODE_ALLOW_ALL_MODELS)) {
+    return [{ id: model, label: model }];
+  }
+
+  let models: AdapterModel[];
+  try {
+    models = await discoverOpenCodeModelsCached({
+      command: input.command,
+      cwd: input.cwd,
+      env: input.env,
+    });
+  } catch (err) {
+    // The availability probe is a best-effort pre-flight guard, not a gate. If
+    // `opencode models` itself cannot run — a transient CLI error, a timeout, a
+    // provider hiccup — do NOT abort the run. The real invocation is
+    // authoritative, so a probe that can't execute must never be fatal.
+    // (Previously this threw and crashed runs mid-flight, discarding the agent's
+    // completed work and its terminal disposition, which then reopened the issue.)
+    console.warn(
+      `[opencode-local] Model availability probe could not run for "${model}" (${
+        err instanceof Error ? err.message : String(err)
+      }); proceeding with the configured model.`,
+    );
+    return [{ id: model, label: model }];
+  }
 
   if (models.length === 0) {
-    throw new Error("OpenCode returned no models. Run `opencode models` and verify provider auth.");
+    // The probe ran but returned nothing (e.g. a transient provider-auth blip).
+    // Same reasoning as above: warn, don't block the run.
+    console.warn(
+      `[opencode-local] \`opencode models\` returned no models; proceeding with the configured model "${model}".`,
+    );
+    return [{ id: model, label: model }];
   }
 
   if (!models.some((entry) => entry.id === model)) {

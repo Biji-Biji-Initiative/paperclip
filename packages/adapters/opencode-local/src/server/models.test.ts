@@ -9,6 +9,7 @@ import {
 describe("openCode models", () => {
   afterEach(() => {
     delete process.env.PAPERCLIP_OPENCODE_COMMAND;
+    delete process.env.OPENCODE_ALLOW_ALL_MODELS;
     resetOpenCodeModelsCacheForTests();
   });
 
@@ -36,12 +37,41 @@ describe("openCode models", () => {
     );
   });
 
-  it("rejects when discovery cannot run for configured model", async () => {
+  it("proceeds with the configured model when discovery cannot run (probe is best-effort, never fatal)", async () => {
     process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
     await expect(
       ensureOpenCodeModelConfiguredAndAvailable({
         model: "openai/gpt-5",
       }),
-    ).rejects.toThrow("Failed to start command");
+    ).resolves.toEqual([{ id: "openai/gpt-5", label: "openai/gpt-5" }]);
+  });
+
+  it("skips the availability check when OPENCODE_ALLOW_ALL_MODELS is set in the run env", async () => {
+    process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+    await expect(
+      ensureOpenCodeModelConfiguredAndAvailable({
+        model: "anthropic/tensorix/deepseek/deepseek-chat-v3.1",
+        env: { OPENCODE_ALLOW_ALL_MODELS: "true" },
+      }),
+    ).resolves.toEqual([
+      { id: "anthropic/tensorix/deepseek/deepseek-chat-v3.1", label: "anthropic/tensorix/deepseek/deepseek-chat-v3.1" },
+    ]);
+  });
+
+  it("honours OPENCODE_ALLOW_ALL_MODELS from the process env", async () => {
+    process.env.PAPERCLIP_OPENCODE_COMMAND = "__paperclip_missing_opencode_command__";
+    process.env.OPENCODE_ALLOW_ALL_MODELS = "1";
+    await expect(
+      ensureOpenCodeModelConfiguredAndAvailable({ model: "anthropic/gateway/some-model" }),
+    ).resolves.toEqual([{ id: "anthropic/gateway/some-model", label: "anthropic/gateway/some-model" }]);
+  });
+
+  it("still enforces provider/model format when OPENCODE_ALLOW_ALL_MODELS is set", async () => {
+    await expect(
+      ensureOpenCodeModelConfiguredAndAvailable({
+        model: "not-a-valid-id",
+        env: { OPENCODE_ALLOW_ALL_MODELS: "true" },
+      }),
+    ).rejects.toThrow("OpenCode requires `adapterConfig.model`");
   });
 });

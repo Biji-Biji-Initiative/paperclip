@@ -168,12 +168,136 @@ describe("buildPluginWorkerEnv", () => {
     });
   });
 
+  it("passes in-cluster Kubernetes service-discovery vars to environment driver plugins", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: { capabilities: ["environment.drivers.register"] },
+      instanceInfo,
+      processEnv: {
+        KUBERNETES_SERVICE_HOST: "10.0.0.1",
+        KUBERNETES_SERVICE_PORT: "443",
+        KUBERNETES_SERVICE_PORT_HTTPS: " ",
+        AWS_SECRET_ACCESS_KEY: "aws-secret",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      KUBERNETES_SERVICE_HOST: "10.0.0.1",
+      KUBERNETES_SERVICE_PORT: "443",
+    });
+  });
+
   it("does not pass provider keys to non-environment plugins", () => {
     const env = buildPluginWorkerEnv({
       manifest: { capabilities: ["ui.slots.register"] },
       instanceInfo,
       processEnv: {
         OPENAI_API_KEY: "openai-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
+
+  it("passes a first-party sandbox provider's documented credential env var to its own worker", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: {
+        capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "daytona" }],
+      },
+      packageName: "@paperclipai/plugin-daytona",
+      packagePath: null,
+      instanceInfo,
+      processEnv: {
+        DAYTONA_API_KEY: "daytona-token",
+        NOVITA_API_KEY: "novita-token",
+        E2B_API_KEY: " ",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      DAYTONA_API_KEY: "daytona-token",
+    });
+  });
+
+  it("passes the credential to a first-party plugin installed from the bundled catalog", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: {
+        capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "daytona" }],
+      },
+      packageName: "@paperclipai/plugin-daytona",
+      packagePath: "/app/packages/plugins/sandbox-providers/daytona",
+      trustedLocalPluginRoots: ["/app/packages/plugins"],
+      instanceInfo,
+      processEnv: {
+        DAYTONA_API_KEY: "daytona-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      DAYTONA_API_KEY: "daytona-token",
+    });
+  });
+
+  it("does not pass the credential to a local plugin that self-declares the first-party name", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: {
+        capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "daytona" }],
+      },
+      packageName: "@paperclipai/plugin-daytona",
+      packagePath: "/home/operator/.paperclip/plugins/fake-daytona",
+      trustedLocalPluginRoots: ["/app/packages/plugins"],
+      instanceInfo,
+      processEnv: {
+        DAYTONA_API_KEY: "daytona-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
+
+  it("does not pass a credential to a third-party plugin that claims a first-party driver key", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: {
+        capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "daytona" }],
+      },
+      packageName: "@acme/plugin-fake-daytona",
+      instanceInfo,
+      processEnv: {
+        DAYTONA_API_KEY: "daytona-token",
+      },
+    });
+
+    expect(env).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
+
+  it("does not pass a credential when the first-party package omits its expected driver key", () => {
+    const env = buildPluginWorkerEnv({
+      manifest: {
+        capabilities: ["environment.drivers.register"],
+        environmentDrivers: [{ driverKey: "kubernetes" }],
+      },
+      packageName: "@paperclipai/plugin-daytona",
+      instanceInfo,
+      processEnv: {
+        DAYTONA_API_KEY: "daytona-token",
       },
     });
 
@@ -520,10 +644,19 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     const staleManifest = manifest("paperclip.refresh");
     const refreshedManifest: PaperclipPluginManifestV1 = {
       ...staleManifest,
+      capabilities: [...staleManifest.capabilities, "agent.tools.register"],
       database: {
         ...staleManifest.database!,
         coreReadTables: ["companies"],
       },
+      tools: [
+        {
+          name: "db-smoke",
+          displayName: "DB Smoke",
+          description: "Exercises plugin tool registration worker lookup.",
+          parametersSchema: { type: "object", properties: {} },
+        },
+      ],
     };
     const namespace = derivePluginDatabaseNamespace(refreshedManifest.id);
     const packageRoot = await createInstallablePluginPackage(
@@ -548,6 +681,9 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       startWorker: vi.fn().mockResolvedValue(undefined),
       stopAll: vi.fn().mockResolvedValue(undefined),
     };
+    const toolDispatcher = {
+      registerPluginTools: vi.fn(),
+    };
     const loader = pluginLoader(db, {
       enableLocalFilesystem: false,
       enableNpmDiscovery: false,
@@ -564,9 +700,7 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       jobStore: {
         syncJobDeclarations: vi.fn().mockResolvedValue(undefined),
       },
-      toolDispatcher: {
-        registerPluginTools: vi.fn(),
-      },
+      toolDispatcher,
       lifecycleManager: {
         markError: vi.fn().mockResolvedValue(undefined),
       },
@@ -594,6 +728,13 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
           database: expect.objectContaining({ coreReadTables: ["companies"] }),
         }),
       }),
+    );
+    expect(toolDispatcher.registerPluginTools).toHaveBeenCalledWith(
+      refreshedManifest.id,
+      expect.objectContaining({
+        tools: refreshedManifest.tools,
+      }),
+      pluginId,
     );
     const [plugin] = await db
       .select()
