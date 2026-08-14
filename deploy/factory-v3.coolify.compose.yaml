@@ -1,10 +1,9 @@
-# Paperclip Factory v3: a fresh, current-upstream, private Coolify candidate.
+# Paperclip Factory v3: a fresh, current-upstream Coolify application.
 #
 # This is deliberately a new data plane rather than an in-place upgrade of
 # factory-v2: the upstream source lineage is discontinuous and existing
-# experimental state is disposable. It has no public domain by default.
-# Coolify health checks use the container-local API while Paperclip's private
-# hostname guard rejects arbitrary externally supplied Host headers.
+# experimental state is disposable. The only public surface is the
+# authenticated canonical board URL; agent execution remains disabled.
 services:
   db:
     image: postgres:17-alpine
@@ -43,13 +42,17 @@ services:
       PAPERCLIP_INSTANCE_ID: "factory-v3"
       PAPERCLIP_CONFIG: "/paperclip/instances/factory-v3/config.json"
 
-      # This instance is deliberately authenticated and private.  Do not add a
-      # public URL/domain or hostname allowlist until a separate access packet
-      # exists. With no configured hostname, only container-local health probes
-      # are accepted by the private-hostname guard.
+      # One explicit authenticated/public board URL avoids proxy-derived auth
+      # callbacks and makes the hostname contract deterministic. Coolify owns
+      # the corresponding service route; the legacy app stays available as a
+      # rollback target until the monitored cutover is complete.
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
-      PAPERCLIP_DEPLOYMENT_EXPOSURE: "private"
-      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
+      PAPERCLIP_PUBLIC_URL: "https://factory.mereka.io"
+      # The dedicated Infisical projection is false only for the sealed,
+      # internal first-admin bootstrap. It must be returned to true before
+      # the Coolify route is moved to the canonical hostname.
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "${PAPERCLIP_AUTH_DISABLE_SIGN_UP:?PAPERCLIP_AUTH_DISABLE_SIGN_UP must be set}"
       PAPERCLIP_ENABLE_COMPANY_DELETION: "false"
 
       # Fresh, disposable state receives current upstream migrations, but
