@@ -1,0 +1,80 @@
+# Paperclip Factory v4: fresh state on upstream stable v2026.722.0.
+#
+# The old factory experiment is intentionally not migrated. V4 starts with a
+# separate PostgreSQL/data plane, remains authenticated, and disables agent
+# execution until a dedicated policy and runner proof are complete. The source
+# branch is pinned to this release tag; Docker builds the matching source.
+#
+# Before provisioning, prove this source with:
+#   IMAGE_NAME=<locally-built-image> scripts/factory-v4-local-smoke.sh
+# Keep the application route-free while claiming the first administrator, then
+# set PAPERCLIP_AUTH_DISABLE_SIGN_UP=true and verify backup/restore before
+# attaching the canonical hostname.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-paperclip}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}"
+      POSTGRES_DB: "${POSTGRES_DB:-paperclip}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER:-paperclip}\" -d \"$${POSTGRES_DB:-paperclip}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - paperclip-factory-v4-r1-pgdata:/var/lib/postgresql/data
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    expose:
+      - "3100"
+    environment:
+      DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set}"
+      PAPERCLIP_BIND: "lan"
+      PORT: "3100"
+      SERVE_UI: "true"
+      PAPERCLIP_HOME: "/paperclip"
+      PAPERCLIP_INSTANCE_ID: "factory-v4"
+      PAPERCLIP_CONFIG: "/paperclip/instances/factory-v4/config.json"
+
+      # The public URL is explicit so auth callbacks cannot inherit a proxy
+      # hostname. A sealed worker-only bootstrap temporarily permits the
+      # dedicated administrator to sign up; the Infisical projection is then
+      # locked before this service receives a Coolify route.
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
+      PAPERCLIP_PUBLIC_URL: "https://factory.mereka.io"
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "${PAPERCLIP_AUTH_DISABLE_SIGN_UP:?PAPERCLIP_AUTH_DISABLE_SIGN_UP must be set}"
+      PAPERCLIP_ENABLE_COMPANY_DELETION: "false"
+      PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
+      HEARTBEAT_SCHEDULER_ENABLED: "false"
+      PAPERCLIP_DB_BACKUP_ENABLED: "false"
+
+      # Backups are worker-owned and proved independently. Provider keys,
+      # CAAM profiles, host directories, Hermes configuration, and agent
+      # workspaces are intentionally not projected into this public process.
+      PAPERCLIP_SECRETS_STRICT_MODE: "true"
+      PAPERCLIP_SECRETS_MASTER_KEY: "${PAPERCLIP_SECRETS_MASTER_KEY:?PAPERCLIP_SECRETS_MASTER_KEY must be set}"
+      BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET:?BETTER_AUTH_SECRET must be set}"
+      DO_NOT_TRACK: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3100/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+    volumes:
+      - paperclip-factory-v4-r1-data:/paperclip
+
+volumes:
+  paperclip-factory-v4-r1-pgdata:
+  paperclip-factory-v4-r1-data:
