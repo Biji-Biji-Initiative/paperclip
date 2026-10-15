@@ -83,6 +83,28 @@ describe("auth routes", () => {
     expect(response.body).toEqual({ providers: [{ id: "authentik", name: "Staff SSO" }], passwordSignInEnabled: false });
   });
 
+  it("keeps staff sign-in available after the recovery window closes", async () => {
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ISSUER", "https://authentik.fixture/application/o/factory/");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_CLIENT_ID", "fixture-client");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_CLIENT_SECRET", "fixture-value-never-returned");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_COMPANY_ID", "0da2d522-a3c2-4658-87e9-c089698fc111"); // gitleaks:allow -- public fixture company UUID, not a credential
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN", "true");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL", baseUser.email);
+    const expiry = Date.now() + 1800_000;
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL", new Date(expiry).toISOString());
+    const app = createApp({ type: "none" }, baseUser);
+    expect((await request(app).get("/api/auth/providers")).body.passwordSignInEnabled).toBe(true);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(expiry + 1);
+    try {
+      const response = await request(app).get("/api/auth/providers");
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ providers: [{ id: "authentik", name: "Staff SSO" }], passwordSignInEnabled: false });
+      expect(response.headers["cache-control"]).toBe("no-store");
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it("returns the persisted user profile in the session payload", async () => {
     vi.stubEnv("SENTRY_ENVIRONMENT", undefined);
     delete process.env.SENTRY_DSN;

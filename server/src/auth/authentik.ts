@@ -36,7 +36,7 @@ export function authentikConfiguration(env: NodeJS.ProcessEnv = process.env) {
   const recoveryEmail = env.PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL?.trim().toLowerCase();
   const recoveryUntil = Date.parse(env.PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL ?? "");
   if (recoveryOption === "true" && (!recoveryEmail || !Number.isFinite(recoveryUntil) ||
-      recoveryUntil <= Date.now() || recoveryUntil > Date.now() + 3600_000)) {
+      recoveryUntil > Date.now() + 3600_000)) {
     throw new Error("Password recovery requires one operator email and an expiry within one hour");
   }
   return {
@@ -44,7 +44,7 @@ export function authentikConfiguration(env: NodeJS.ProcessEnv = process.env) {
     clientId: clientId.trim(),
     clientSecret,
     companyId,
-    allowPasswordLogin: recoveryOption === "true",
+    allowPasswordLogin: recoveryOption === "true" && recoveryUntil > Date.now(),
     recoveryEmail, recoveryUntil,
   };
 }

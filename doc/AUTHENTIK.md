@@ -51,7 +51,9 @@ when this integration is enabled, unless the operator explicitly sets
 `PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN=true` for controlled recovery, together
 with `PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL` and `PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL`
 (an ISO timestamp within one hour). Only that operator may use password recovery;
-the request hook enforces the expiry even without a restart. Keep
+the request hook enforces the expiry even without a restart. An expired window
+closes password recovery while staff SSO and its metadata remain available,
+including after a restart. Keep
 `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true` throughout production use and recovery.
 
 Existing local accounts, verified or unverified, cannot be silently merged

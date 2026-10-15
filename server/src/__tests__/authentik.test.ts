@@ -25,7 +25,9 @@ describe("Authentik configuration", () => {
     expect(() => authentikConfiguration({ PAPERCLIP_AUTHENTIK_REQUIRED: "true" })).toThrow(/Required/);
     expect(() => authentikConfiguration({ ...settings, PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN: "true" })).toThrow(/one operator/);
     expect(() => authentikConfiguration({ ...settings, PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN: "true",
-      PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL: "operator@mereka.my", PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL: new Date(Date.now() - 1000).toISOString() })).toThrow(/expiry/);
+      PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL: "operator@mereka.my", PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL: new Date(Date.now() + 7200_000).toISOString() })).toThrow(/expiry/);
+    expect(authentikConfiguration({ ...settings, PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN: "true",
+      PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL: "operator@mereka.my", PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL: new Date(Date.now() - 1000).toISOString() })?.allowPasswordLogin).toBe(false);
   });
 });
 

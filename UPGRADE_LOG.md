@@ -162,3 +162,19 @@ or a production incident; the native integration remains unenabled in production
 UBS scanned the auth module: its three critical reports are boolean recovery
 option comparisons labelled as secret comparisons. They compare true/false
 configuration values, not credentials; no scanner rule was disabled.
+
+## Recovery expiry keeps staff SSO available
+
+A real HTTP metadata test reproduced HTTP500 when a temporary recovery window
+expired: the shared configuration parser rejected the stale deadline on every
+metadata request. Expired recovery now becomes inactive, including at startup,
+while staff SSO remains configured. Missing/malformed deadlines and windows
+longer than one hour still fail validation; the request hook continues to deny
+password recovery after the deadline without needing a restart. The same HTTP
+test now returns200, advertises Staff SSO and hides password sign-in. All41
+auth-route and migrated-PostgreSQL staff-auth tests pass with required database
+support. The preceding 7fba1275 image does not contain this correction and is
+retained only for earlier-image rehearsal until an identified rebuild qualifies.
+Server TypeScript checking passes. UBS directly scanned the auth module and
+retains the same three boolean-comparison false positives described above,
+with zero warnings and17 informational items.
