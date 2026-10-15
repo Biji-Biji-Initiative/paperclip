@@ -31,3 +31,11 @@ This patch is restricted to the existing 3.x dependency line. It requires a new
 identified image; it does not alter the earlier image build already running.
 
 After the URI patch, the production dependency audit reports **0 critical and 13 high** advisories.
+
+## Undici 8.x security patch
+
+`undici` 8.10.0 → 8.10.2 follows the upstream security patch for WebSocket,
+BalancedPool TLS and cache-origin isolation. The override is restricted to 8.x;
+no untested cross-major upgrade is applied to the older Cursor SDK transport.
+The application's jsdom consumers pass all 57 targeted UI tests. The production
+source audit now reports **0 critical and 10 high** advisories (6 low, 28 moderate).
