@@ -43,6 +43,12 @@ interface UseSignOutOptions {
 export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
   const cloud = useCloudInstance();
   const queryClient = useQueryClient();
+  const clearAccountState = async () => {
+    await queryClient.cancelQueries({ predicate: (query) => isAccountScopedQueryKey(query.queryKey) });
+    for (const query of queryClient.getQueryCache().findAll({ predicate: (query) => isAccountScopedQueryKey(query.queryKey) })) {
+      query.reset();
+    }
+  };
 
   return useMutation({
     mutationFn: async () => {
@@ -52,13 +58,19 @@ export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
         return "cloud" as const;
       }
 
-      const result = await authApi.signOut();
-      return result?.providerLogoutUrl ?? "self-hosted";
+      await clearAccountState();
+      try {
+        const result = await authApi.signOut();
+        return result.providerLogoutUrl ?? "self-hosted";
+      } finally {
+        await clearAccountState();
+      }
     },
+    onError: () => navigateTopLevel("/auth?logout=unconfirmed"),
     onSuccess: async (target) => {
       if (target === "cloud") return;
 
-      onSignedOut?.();
+      try { onSignedOut?.(); } catch { /* UI callbacks cannot prevent privacy cleanup or logout navigation. */ }
 
       // Drop every account-scoped cache entry, rather than invalidating a
       // couple of them. `invalidateQueries` only marks an entry stale and goes

@@ -48,10 +48,13 @@ before the session is issued. No company is silently created.
 New staff—including `miranda@mereka.my`—use **Continue with Staff SSO**. Authentik
 owns Google/MFA/passkey choices and staff admission. Password sign-in is disabled
 when this integration is enabled, unless the operator explicitly sets
-`PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN=true` for controlled recovery. Keep
+`PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN=true` for controlled recovery, together
+with `PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL` and `PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL`
+(an ISO timestamp within one hour). Only that operator may use password recovery;
+the request hook enforces the expiry even without a restart. Keep
 `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true` throughout production use and recovery.
 
-Existing local accounts with unverified local email cannot be silently merged
+Existing local accounts, verified or unverified, cannot be silently merged
 by matching an IdP email. Preserve this Better Auth protection. For the existing
 operator, enable the controlled password recovery option, sign into the existing
 account normally, open Profile settings and choose **Connect staff SSO**. The
@@ -89,3 +92,38 @@ central provider/policies, and prove real staff login, denied nonstaff access,
 company boundaries, logout and expiry. Then bind each agent to the responsible
 user's intended AI connection and prove a bounded real task. No live staff
 access or successful agent run follows merely from enabling SSO configuration.
+
+## Enabling and recovery acceptance
+
+Set `PAPERCLIP_AUTHENTIK_REQUIRED=true` in the production deployment after
+qualification: loss of all four SSO settings must fail startup, rather than
+silently accepting a password-only deployment. Revoke pre-existing sessions
+through supported session management when enabling SSO, and again after the
+operator links the existing profile and recovery is closed. New one-hour session
+settings do not rewrite old session expiry rows. Preserve the encryption secret.
+
+The pinned Better Auth patch validates the discovery metadata actually consumed:
+exact configured issuer and HTTPS endpoints on that issuer's origin. Authentik
+code exchanges must return an ID token; user-info fallback is refused. Public
+client-supplied ID tokens are rejected for sign-in and linking. Request receipts
+are single-use and bound to the verified provider subject and local account.
+Implicit mailbox matching cannot inherit an existing account; authenticated
+linking is required. An email change on an already bound subject fails membership
+provisioning until an operator resolves it; it cannot transfer another identity.
+
+Startup no longer restores missing human grant rows. Role defaults and simple
+company mode remain separate authorization policies: removing a row alone is not
+an explicit deny of every role/default capability. Use supported role changes or
+membership suspension/removal for effective denial. Existing instance admins are
+not demoted by a company membership change.
+
+Membership, its initial grant and its audit event commit together. The wider
+OAuth account/session lifecycle is not one transaction: session persistence can
+fail after an idempotent membership is committed. Retry must preserve existing
+users, roles and connection ownership; no distributed compensation is claimed.
+
+Logout deletion failure clears browser cookies but returns a server error, and
+the UI clears account state on every logout attempt. Failed revocation routes to
+an explicit uncertainty/retry screen. A copied session cookie can still work
+until revocation succeeds; never report that failure as completed sign-out.
+Provider logout endpoints come only from the origin-validated discovery data.

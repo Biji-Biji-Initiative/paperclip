@@ -11,7 +11,7 @@ const mockNavigate = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/browserNavigation", () => ({ navigateTopLevel: (url: string) => mockNavigate(url) }));
 
 const mockAuthApi = vi.hoisted(() => ({
-  getSession: vi.fn(), getProviders: vi.fn(), linkAuthentik: vi.fn(),
+  getSession: vi.fn(), getProviders: vi.fn(), getLinkedProviders: vi.fn().mockResolvedValue([]), linkAuthentik: vi.fn(),
   signInEmail: vi.fn(),
   signUpEmail: vi.fn(),
   getProfile: vi.fn(),

@@ -49,3 +49,23 @@ libvips 8.18.7. Avatar, Telegram photo and Teams inline-image tests pass
 (58 tests). The production source audit reports 0 critical, 9 high,
 28 moderate and 6 low advisories. The pending image build predates this patch;
 only a subsequent identified rebuild will include it.
+
+## Native authentication review corrections
+
+The independent follow-up identified application-lifecycle defects beyond the
+initial callback helper. Startup now preserves missing human grant rows; agent
+membership compatibility remains. Existing role/default authorization is a
+separate policy and is not represented as a grant-removal deny.
+
+The narrow pinned Better Auth 1.7.2 patch binds consumed discovery metadata to
+the configured issuer and HTTPS authority, requires an ID token for Authentik,
+and returns an error after clearing cookies if database revocation fails.
+Factory rejects direct ID-token sign-in/linking, disables implicit account
+linking, and consumes a provider-subject/local-account-bound request receipt.
+Recovery is scoped to one operator with a one-hour maximum expiry. Required SSO
+configuration can fail startup on complete projection loss. See doc/AUTHENTIK.md
+for old-session revocation and the remaining real staff acceptance gates.
+
+The image's global Codex CLI is pinned to the release-qualified 0.160.0,
+matching its native compatibility window; an unbounded latest CLI would make
+an otherwise identified image inherit an unsupported runtime.

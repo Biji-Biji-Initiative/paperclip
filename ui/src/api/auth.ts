@@ -154,7 +154,10 @@ async function authPatch<T>(path: string, body: Record<string, unknown>, parse: 
 }
 
 async function staffAuthorization(path: string, callbackURL: string): Promise<string> {
-  const payload = await authPost(path, { provider: "authentik", callbackURL, errorCallbackURL: "/auth?next=" + encodeURIComponent(callbackURL), disableRedirect: true });
+  const errorCallbackURL = path === "/link-social"
+    ? callbackURL + (callbackURL.includes("?") ? "&" : "?") + "staffLink=failed"
+    : "/auth?next=" + encodeURIComponent(callbackURL);
+  const payload = await authPost(path, { provider: "authentik", callbackURL, errorCallbackURL, disableRedirect: true });
   const url = payload && typeof payload === "object" ? (payload as Record<string, unknown>).url : null;
   if (typeof url !== "string") throw new Error("Staff sign-in did not return a secure authorization URL");
   const target = new URL(url);
@@ -173,6 +176,15 @@ export const authApi = {
 
   signInAuthentik: (callbackURL: string) => staffAuthorization("/sign-in/social", callbackURL),
   linkAuthentik: (callbackURL: string) => staffAuthorization("/link-social", callbackURL),
+  getLinkedProviders: async (): Promise<string[]> => {
+    const response = await fetch("/api/auth/list-accounts", { credentials: "include", cache: "no-store" });
+    if (!response.ok) throw new Error("Unable to check linked sign-in accounts");
+    const accounts: unknown = await response.json();
+    if (!Array.isArray(accounts) || accounts.some((account) => !account || typeof account.providerId !== "string")) {
+      throw new Error("Invalid linked sign-in account response");
+    }
+    return accounts.map((account) => account.providerId as string);
+  },
 
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
@@ -218,9 +230,11 @@ export const authApi = {
   updateProfile: async (input: UpdateCurrentUserProfile): Promise<CurrentUserProfile> =>
     authPatch("/profile", input, (payload) => currentUserProfileSchema.parse(payload)),
 
-  signOut: async (): Promise<SignOutResult | null> => {
+  signOut: async (): Promise<SignOutResult> => {
     const payload = await authPost("/sign-out", {});
-    if (!payload || typeof payload !== "object") return null;
+    if (!payload || typeof payload !== "object" || (payload as Record<string, unknown>).success !== true) {
+      throw new Error("Session revocation could not be confirmed. Retry sign out.");
+    }
 
     const result = payload as Record<string, unknown>;
     let providerLogoutUrl: string | undefined;

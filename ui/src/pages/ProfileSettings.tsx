@@ -29,7 +29,8 @@ export function ProfileSettings() {
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const [name, setName] = useState("");
   const [image, setImage] = useState("");
-  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(() => new URLSearchParams(window.location.search).get("staffLink") === "failed"
+    ? "Staff sign-in was not linked. Check that both accounts use the same verified email, then try again." : null);
   const sessionQuery = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
@@ -44,6 +45,10 @@ export function ProfileSettings() {
     mutationFn: () => authApi.linkAuthentik(window.location.pathname),
     onSuccess: (url) => navigateTopLevel(url),
     onError: (error) => setActionError(error instanceof Error ? error.message : "Unable to link staff sign-in"),
+  });
+  const linkedProvidersQuery = useQuery({
+    queryKey: ["auth", "linked-providers"], queryFn: authApi.getLinkedProviders, retry: false,
+    enabled: Boolean(sessionQuery.data && providersQuery.data?.providers.length),
   });
 
   useEffect(() => {
@@ -169,11 +174,14 @@ export function ProfileSettings() {
         </div>
       ) : null}
 
-      {providersQuery.data?.passwordSignInEnabled && providersQuery.data.providers.length > 0 ? (
+      {providersQuery.data?.providers.length ? (
         <Card className="p-5 space-y-3">
           <h2 className="font-medium">Staff sign-in</h2>
-          <p className="text-sm text-muted-foreground">Connect this existing profile to your staff identity. Both email addresses must match.</p>
-          <Button onClick={() => staffLink.mutate()} disabled={staffLink.isPending}>Connect staff SSO</Button>
+          {linkedProvidersQuery.data?.includes("authentik") ? <p>Staff SSO is connected to this profile.</p> : <>
+            <p className="text-sm text-muted-foreground">Connect this existing profile to your staff identity. Both email addresses must match.</p>
+            {providersQuery.data.passwordSignInEnabled ? <Button onClick={() => staffLink.mutate()} disabled={staffLink.isPending}>Connect staff SSO</Button> : null}
+          </>}
+          {linkedProvidersQuery.error ? <p role="alert">Unable to confirm linked staff sign-in. Refresh and try again.</p> : null}
         </Card>
       ) : null}
       <section className="space-y-8">

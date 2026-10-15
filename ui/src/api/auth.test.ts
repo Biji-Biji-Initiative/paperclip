@@ -49,6 +49,10 @@ describe("authApi.getSession", () => {
 });
 
 describe("authApi.signOut", () => {
+  it.each([null, {}, { success: false }, "unexpected"])("rejects unconfirmed logout responses (%s)", async (body) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(body)));
+    await expect(authApi.signOut()).rejects.toThrow(/revocation could not be confirmed/);
+  });
   it("returns the managed deployment redirect from the response", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ success: true, redirectTo: "/cloud/logout" }), {

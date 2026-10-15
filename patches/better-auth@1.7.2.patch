@@ -1,0 +1,56 @@
+diff --git a/dist/api/routes/sign-out.mjs b/dist/api/routes/sign-out.mjs
+index 1dc87c3dd75fb690bb2f04dbec5f34647dfe27a7..cc0c42fd274d9f4aee2e3637ef38d99ac508307e 100644
+--- a/dist/api/routes/sign-out.mjs
++++ b/dist/api/routes/sign-out.mjs
+@@ -1,4 +1,5 @@
+ import { deleteSessionCookie } from "../../cookies/index.mjs";
++import { APIError } from "@better-auth/core/error";
+ import { createAuthEndpoint } from "@better-auth/core/api";
+ import * as z from "zod";
+ //#region src/api/routes/sign-out.ts
+@@ -46,12 +47,15 @@ const signOut = createAuthEndpoint("/sign-out", {
+ 	} catch (e) {
+ 		ctx.context.logger.error("Failed to read session from database", e);
+ 	}
++	let revocationFailed = false;
+ 	if (sessionCookieToken) try {
+ 		await ctx.context.internalAdapter.deleteSession(sessionCookieToken);
+ 	} catch (e) {
++		revocationFailed = true;
+ 		ctx.context.logger.error("Failed to delete session from database", e);
+ 	}
+ 	deleteSessionCookie(ctx);
++	if (revocationFailed) throw new APIError("INTERNAL_SERVER_ERROR", { code: "SESSION_REVOCATION_UNCONFIRMED", message: "Session revocation could not be confirmed" });
+ 	const providerLogoutResult = await (async () => {
+ 		try {
+ 			if (!currentSession) return null;
+diff --git a/dist/plugins/generic-oauth/index.mjs b/dist/plugins/generic-oauth/index.mjs
+index 1d15faae623a1af54423abac6adad840d175d01f..f942a6de27ab975ce50f56d492f1f687d1bf74d4 100644
+--- a/dist/plugins/generic-oauth/index.mjs
++++ b/dist/plugins/generic-oauth/index.mjs
+@@ -93,6 +93,17 @@ const genericOAuth = (options) => {
+ 						return null;
+ 					});
+ 					if (discovered) {
++						// Factory's pinned OIDC consumer binds the metadata actually used.
++						if (c.providerId === "authentik") {
++							const expected = c.discoveryUrl.replace(/\.well-known\/openid-configuration$/, "");
++							if (discovered.issuer !== expected) throw new Error("Authentik discovery issuer mismatch");
++							for (const key of ["authorization_endpoint", "token_endpoint", "jwks_uri", "userinfo_endpoint", "end_session_endpoint"]) {
++								if (!discovered[key] && (key === "userinfo_endpoint" || key === "end_session_endpoint")) continue;
++								const endpoint = new URL(discovered[key]);
++								if (endpoint.protocol !== "https:" || endpoint.origin !== new URL(expected).origin || endpoint.username || endpoint.password || endpoint.hash) throw new Error("Authentik discovery endpoint authority mismatch");
++							}
++						}
++
+ 						if (!discovered.issuer && !c.accountIssuer) throw new Error(`Provider "${c.providerId}": discovery did not return an issuer. Configure accountIssuer explicitly to establish a stable account namespace.`);
+ 						authorizationUrl ??= discovered.authorization_endpoint;
+ 						tokenUrl ??= discovered.token_endpoint;
+@@ -214,6 +225,7 @@ const genericOAuth = (options) => {
+ 					},
+ 					async getUserInfo(tokens) {
+ 						const { expectedIdTokenNonce, ...oauthTokens } = tokens;
++						if (c.providerId === "authentik" && !oauthTokens.idToken) return null;
+ 						if (oauthTokens.idToken && provider.idToken) {
+ 							if (!await verifyProviderIdToken(provider, oauthTokens.idToken, expectedIdTokenNonce)) {
+ 								ctx.logger.error(`Provider "${c.providerId}": id_token failed verification against the discovery JWKS or expected nonce`);

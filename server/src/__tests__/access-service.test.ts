@@ -923,7 +923,7 @@ describeEmbeddedPostgres("access service", () => {
     await expect(access.canUser(company.id, viewer.principalId, "environments:manage")).resolves.toBe(false);
   });
 
-  it("backfills pre-upgrade human memberships with missing role grants without replacing custom grants", async () => {
+  it("preserves human grant removals across startup compatibility passes", async () => {
     const { company, owner } = await createCompanyWithOwner(db);
     const scopedEnvironmentGrant = { environmentId: "env-1" };
     const humanRows = await db
@@ -976,11 +976,14 @@ describeEmbeddedPostgres("access service", () => {
     const first = await backfillPrincipalAccessCompatibility(db);
     const second = await backfillPrincipalAccessCompatibility(db);
 
-    expect(first.humanGrantsInserted).toBeGreaterThan(0);
+    expect(first.humanGrantsInserted).toBe(0);
     expect(second.humanGrantsInserted).toBe(0);
-    await expect(accessService(db).canUser(company.id, admin.principalId, "environments:manage")).resolves.toBe(true);
-    await expect(accessService(db).canUser(company.id, operator.principalId, "tasks:assign")).resolves.toBe(true);
-    await expect(accessService(db).canUser(company.id, legacyMember.principalId, "tasks:assign")).resolves.toBe(true);
+    await expect(accessService(db).canUser(company.id, admin.principalId, "environments:manage")).resolves.toBe(false);
+    // Simple-mode task assignment has a separate upstream role/default policy;
+    // absence of a grant is not an explicit deny. Startup must not recreate rows.
+    expect(await db.select().from(principalPermissionGrants).where(inArray(
+      principalPermissionGrants.principalId, [operator.principalId, legacyMember.principalId],
+    ))).toHaveLength(0);
     await expect(accessService(db).canUser(company.id, viewer.principalId, "tasks:assign")).resolves.toBe(false);
 
     const ownerEnvironmentGrants = await db

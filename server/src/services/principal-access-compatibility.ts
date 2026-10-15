@@ -1,4 +1,4 @@
-import { and, eq, notInArray } from "drizzle-orm";
+import { notInArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, companyMemberships, principalPermissionGrants } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
@@ -110,32 +110,10 @@ export async function backfillPrincipalAccessCompatibility(
       .then((rows) => rows.length)
     : 0;
 
-  const activeHumanMemberships = await db
-    .select({
-      companyId: companyMemberships.companyId,
-      principalId: companyMemberships.principalId,
-      membershipRole: companyMemberships.membershipRole,
-    })
-    .from(companyMemberships)
-    .where(
-      and(
-        eq(companyMemberships.principalType, "user"),
-        eq(companyMemberships.status, "active"),
-      ),
-    );
-
-  let humanGrantsInserted = 0;
-  for (const membership of activeHumanMemberships) {
-    humanGrantsInserted += await ensureHumanRoleDefaultGrants(db, {
-      companyId: membership.companyId,
-      principalId: membership.principalId,
-      membershipRole: membership.membershipRole,
-      grantedByUserId: null,
-    });
-  }
-
+  // Missing human grants can be intentional revocations. Seed defaults only
+  // in explicit membership creation/role-change flows, never on every boot.
   return {
     agentMembershipsInserted,
-    humanGrantsInserted,
+    humanGrantsInserted: 0,
   };
 }

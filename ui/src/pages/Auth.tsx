@@ -21,6 +21,7 @@ export function AuthPage() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const unconfirmedLogout = searchParams.get("logout") === "unconfirmed";
   const [mode, setMode] = useState<AuthMode>("sign_in");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -46,11 +47,11 @@ export function AuthPage() {
   });
 
   useEffect(() => {
-    if (session) {
+    if (session && !unconfirmedLogout) {
       clearCloudSignInAttempt();
       navigate(nextPath, { replace: true });
     }
-  }, [session, navigate, nextPath]);
+  }, [session, navigate, nextPath, unconfirmedLogout]);
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -95,6 +96,12 @@ export function AuthPage() {
     email.trim().length > 0 &&
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
+
+  if (unconfirmedLogout) {
+    return <div role="alert" className="p-6"><p>This browser cleared its account view, but server sign-out could not be confirmed.</p>
+      <button className="underline" onClick={() => { void authApi.signOut().then(() => navigateTopLevel("/auth"), () => setError("Sign-out is still unconfirmed. Try again.")); }}>Retry sign out</button>
+      {error ? <p>{error}</p> : null}</div>;
+  }
 
   if (healthQuery.isLoading || providersQuery.isLoading || isSessionLoading || session) {
     return (
@@ -229,7 +236,7 @@ export function AuthPage() {
             </Button>
           </form>
 
-          <div className="mt-5 text-sm text-muted-foreground">
+          {providersQuery.data?.providers.length === 0 ? <div className="mt-5 text-sm text-muted-foreground">
             {mode === "sign_in" ? "Need an account?" : "Already have an account?"}{" "}
             <button
               type="button"
@@ -241,7 +248,7 @@ export function AuthPage() {
             >
               {mode === "sign_in" ? "Create one" : "Sign in"}
             </button>
-          </div>
+          </div> : null}
           </> : null}
         </div>
       </div>

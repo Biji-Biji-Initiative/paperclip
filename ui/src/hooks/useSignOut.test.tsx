@@ -78,8 +78,8 @@ describe("useSignOut", () => {
 
   it("keeps self-hosted sign-out pending until the local request finishes, then clears account caches", async () => {
     let resolveSignOut: (() => void) | undefined;
-    mockAuthApi.signOut.mockImplementation(() => new Promise<void>((resolve) => {
-      resolveSignOut = resolve;
+    mockAuthApi.signOut.mockImplementation(() => new Promise<{ success: true }>((resolve) => {
+      resolveSignOut = () => resolve({ success: true });
     }));
     queryClient.setQueryData(queryKeys.health, { status: "ok", deploymentMode: "authenticated" });
     queryClient.setQueryData(queryKeys.auth.session, { session: { id: "session-1" } });
@@ -134,7 +134,7 @@ describe("useSignOut", () => {
     // is final — and under `invalidateQueries` the observer would still be
     // holding A's list, which consumers read as "this account owns these
     // companies".
-    mockAuthApi.signOut.mockResolvedValue(undefined);
+    mockAuthApi.signOut.mockResolvedValue({ success: true });
     queryClient.setQueryData(queryKeys.health, { status: "ok", deploymentMode: "authenticated" });
 
     const companiesQueryFn = vi
@@ -194,7 +194,7 @@ describe("useSignOut", () => {
     });
   });
 
-  it("exposes a stable error without closing chrome or clearing caches", async () => {
+  it("clears account data and reports unconfirmed revocation on error", async () => {
     mockAuthApi.signOut.mockRejectedValue(new Error("Sign-out request failed"));
     queryClient.setQueryData(queryKeys.health, { status: "ok", deploymentMode: "authenticated" });
     queryClient.setQueryData(queryKeys.auth.session, { session: { id: "session-1" } });
@@ -210,14 +210,11 @@ describe("useSignOut", () => {
     await vi.waitFor(() => expect(captured?.error?.message).toBe("Sign-out request failed"));
     expect(captured?.isPending).toBe(false);
     expect(onSignedOut).not.toHaveBeenCalled();
-    // The account is still signed in, so its caches must survive intact —
-    // a failed sign-out must not blank the app the user is still using.
-    expect(queryClient.getQueryData(queryKeys.auth.session)).toEqual({ session: { id: "session-1" } });
-    expect(queryClient.getQueryData(queryKeys.companies.all)).toEqual({
-      companies: [{ id: "company-a", name: "Account A Co" }],
-      unauthorized: false,
-    });
-    expect(queryClient.getQueryState(queryKeys.auth.session)?.isInvalidated).toBe(false);
+    // Explicit logout intent clears private state even when the server may
+    // still hold a session. Navigation shows that uncertainty and a retry.
+    expect(queryClient.getQueryData(queryKeys.auth.session)).toBeUndefined();
+    expect(queryClient.getQueryData(queryKeys.companies.all)).toBeUndefined();
+    expect(mockNavigateTopLevel).toHaveBeenCalledWith("/auth?logout=unconfirmed");
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(false);
 
     flushSync(() => root.unmount());

@@ -1962,8 +1962,13 @@ their existing operator recovery requirements.
 An explicitly configured Authentik OIDC provider may authenticate staff while
 public password signup stays disabled. Verified provider exchanges provision
 only operator membership in one existing active company. Existing identities,
-roles, suspensions and removed grants must survive repeat login. Existing
-unverified local accounts require authenticated linking, never silent merging
-or a database verification override. Sessions expire after one hour without
+roles, suspensions and missing grant rows must survive repeat login and startup.
+Existing local accounts require authenticated linking, never silent mailbox
+merging or a database verification override. Only authorization-code exchanges
+with validated discovery and an ID token may create staff sessions. Password
+recovery is bounded to one operator and an expiry within one hour. Required SSO
+configuration must fail startup if its projection disappears. Sessions expire after one hour without
 sliding renewal; local logout and IdP logout are distinct acceptance checks.
+Old sessions must be revoked during enablement. Logout failures clear browser
+account state and report unconfirmed revocation rather than success.
 See [staff sign-in](AUTHENTIK.md) for configuration, ownership and proof limits.
