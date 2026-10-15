@@ -69,3 +69,11 @@ for old-session revocation and the remaining real staff acceptance gates.
 The image's global Codex CLI is pinned to the release-qualified 0.160.0,
 matching its native compatibility window; an unbounded latest CLI would make
 an otherwise identified image inherit an unsupported runtime.
+
+Factory Compose now builds the selected fork source instead of using the stock
+upstream image that lacks the integration. It requires SOURCE_COMMIT as the
+build stamp, exact existing external volumes, a pre-existing staff company and
+provider secret, required SSO, closed signup and disabled scheduled heartbeats.
+Recovery stays off by default. Coolify's source-commit build setting must be
+explicitly enabled, and the resulting image identity qualified before rollout.
+Compose rendering passes with fixture values and no daemon or deployment writes.

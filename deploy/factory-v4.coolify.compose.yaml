@@ -1,6 +1,7 @@
-# Paperclip Factory: upstream stable v2026.1012.0, preserving V4 state.
+# Paperclip Factory: v2026.1012.0 plus native staff SSO, preserving V4 state.
 #
-# Use the upstream release image by immutable digest. Database and instance
+# Build the selected, pinned fork commit; the stock release lacks staff SSO.
+# SOURCE_COMMIT must be available during the Coolify build. Database and instance
 # volumes retain their V4 identity across upgrades. Before changing versions,
 # prove a restore and run the new image against an isolated copy of that state.
 # Stop all old writers before starting the new image (workspace lock protocol).
@@ -27,7 +28,14 @@ services:
       - paperclip-factory-v4-r1-pgdata:/var/lib/postgresql/data
 
   server:
-    image: ghcr.io/paperclipai/paperclip:2026.1012.0@sha256:1661b3dd3fdf7a9b59542d1ced464c3faf9dc8309798b4d15a9923ed32795307
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        PAPERCLIP_BUILD_COMMIT: "${SOURCE_COMMIT:?SOURCE_COMMIT must identify the selected fork commit}"
+        PAPERCLIP_BUILD_VERSION: "2026.1012.0-factory-sso.2"
+        CLI_TOOLS_CACHE_EPOCH: "2026-W42"
     restart: unless-stopped
     depends_on:
       db:
@@ -51,6 +59,14 @@ services:
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
       PAPERCLIP_PUBLIC_URL: "https://factory.mereka.io"
       PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true"
+      PAPERCLIP_AUTHENTIK_REQUIRED: "true"
+      PAPERCLIP_AUTHENTIK_ISSUER: "https://auth0.mereka.io/application/o/factory/"
+      PAPERCLIP_AUTHENTIK_CLIENT_ID: "paperclip-factory"
+      PAPERCLIP_AUTHENTIK_CLIENT_SECRET: "${PAPERCLIP_AUTHENTIK_CLIENT_SECRET:?Staff provider secret must be projected}"
+      PAPERCLIP_AUTHENTIK_COMPANY_ID: "${PAPERCLIP_AUTHENTIK_COMPANY_ID:?Staff company must already exist}"
+      PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN: "${PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN:-false}"
+      PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL: "${PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL:-}"
+      PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL: "${PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL:-}"
       PAPERCLIP_ENABLE_COMPANY_DELETION: "false"
       PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
       HEARTBEAT_SCHEDULER_ENABLED: "false"
