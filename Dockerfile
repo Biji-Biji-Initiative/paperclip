@@ -51,6 +51,13 @@ COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
 RUN pnpm install --frozen-lockfile
 
+FROM deps AS production-deps
+# Reinstall into a fresh virtual store. Filtering an existing workspace install
+# removes dev links but leaves orphaned development binaries in node_modules.
+# This stage retains deps' offline content store and needs no new resolution.
+RUN find /app -type d -name node_modules -prune -exec rm -rf {} + \
+  && CI=true pnpm install --prod --frozen-lockfile --offline --ignore-scripts
+
 FROM base AS rust-toolchain
 ENV CARGO_BUILD_JOBS=4
 WORKDIR /app
@@ -163,7 +170,8 @@ RUN mkdir -p /provider-pack \
 # Keep the complete build tree for provider-pack generation and the cloud
 # plugin build. Only the app copied into production loses build dependencies.
 FROM build AS runtime-app
-RUN CI=true pnpm install --prod --frozen-lockfile --offline --ignore-scripts
+RUN find /app -type d -name node_modules -prune -exec rm -rf {} +
+COPY --from=production-deps /app/ /app/
 
 FROM base AS github-cli
 # Debian trixie's gh predates the token-disclosure and download fixes. Use
