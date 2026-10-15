@@ -426,13 +426,15 @@ export function Dashboard() {
             <MetricCard
               icon={DollarSign}
               value={formatCents(data.costs.monthSpendCents)}
-              label="Month Spend"
+              label="Recorded Month Spend"
               to="/costs"
               description={
                 <span>
-                  {data.costs.monthBudgetCents > 0
-                    ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} budget`
-                    : "Unlimited budget"}
+                  {data.costs.monthUnpricedEventCount > 0
+                    ? `${data.costs.monthUnpricedEventCount} unpriced events · total incomplete; budget cannot cap unpriced spend`
+                    : data.costs.monthBudgetCents > 0
+                      ? `${data.costs.monthUtilizationPercent}% of ${formatCents(data.costs.monthBudgetCents)} recorded-charge budget`
+                      : "No recorded-charge budget"}
                 </span>
               }
             />

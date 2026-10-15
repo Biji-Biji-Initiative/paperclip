@@ -87,9 +87,10 @@ export function dashboardService(db: Db) {
       const monthStart = getUtcMonthStart(now);
       const runActivityDays = getRecentUtcDateKeys(now, DASHBOARD_RUN_ACTIVITY_DAYS);
       const runActivityStart = new Date(`${runActivityDays[0]}T00:00:00.000Z`);
-      const [{ monthSpend }] = await retryIdempotentDatabaseOperation(() => db
+      const [{ monthSpend, monthUnpricedEventCount }] = await retryIdempotentDatabaseOperation(() => db
         .select({
           monthSpend: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+          monthUnpricedEventCount: sql<number>`count(*) filter (where ${costEvents.costStatus} = 'unpriced')::double precision`,
         })
         .from(costEvents)
         .where(
@@ -199,6 +200,7 @@ export function dashboardService(db: Db) {
         tasks: taskCounts,
         costs: {
           monthSpendCents,
+          monthUnpricedEventCount: Number(monthUnpricedEventCount),
           monthBudgetCents: company.budgetMonthlyCents,
           monthUtilizationPercent: Number(utilization.toFixed(2)),
         },

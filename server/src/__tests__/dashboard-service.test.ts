@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, companies, costEvents, createDb, heartbeatRuns } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -45,9 +45,10 @@ describeEmbeddedPostgres("dashboard service", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-dashboard-service-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, 60_000);
 
   afterEach(async () => {
+    await db.delete(costEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(companies);
@@ -55,6 +56,32 @@ describeEmbeddedPostgres("dashboard service", () => {
 
   afterAll(async () => {
     await tempDb?.cleanup();
+  });
+
+  it("separates unpriced monthly usage from recorded zero charges within the company", async () => {
+    const companyId = randomUUID();
+    const otherCompanyId = randomUUID();
+    const agentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const monthStart = getUtcMonthStart(new Date());
+    await db.insert(companies).values([
+      { id: companyId, name: "Cost disclosure", issuePrefix: "DISC", budgetMonthlyCents: 1000 },
+      { id: otherCompanyId, name: "Other costs", issuePrefix: "OTHR" },
+    ]);
+    await db.insert(agents).values([
+      { id: agentId, companyId, name: "Chief", role: "ceo", adapterType: "paperclip_runner" },
+      { id: otherAgentId, companyId: otherCompanyId, name: "Other chief", role: "ceo", adapterType: "paperclip_runner" },
+    ]);
+    const event = { companyId, agentId, provider: "openai", model: "gpt-6.1-sol", inputTokens: 100, outputTokens: 10, occurredAt: monthStart };
+    await db.insert(costEvents).values([
+      { ...event, costStatus: "reported", costCents: 0 },
+      { ...event, costStatus: "reported", costCents: 125 },
+      { ...event, costStatus: "unpriced", costCents: 0 },
+      { ...event, costStatus: "unpriced", costCents: 0, occurredAt: new Date(monthStart.getTime() - 1) },
+      { ...event, companyId: otherCompanyId, agentId: otherAgentId, costStatus: "unpriced", costCents: 0 },
+    ]);
+    const summary = await dashboardService(db).summary(companyId);
+    expect(summary.costs).toEqual({ monthSpendCents: 125, monthUnpricedEventCount: 1, monthBudgetCents: 1000, monthUtilizationPercent: 12.5 });
   });
 
   it("selects distinct task cards before limiting and keeps taskless runs separate", async () => {

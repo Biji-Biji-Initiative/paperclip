@@ -50,7 +50,7 @@ function fixture(failures: Error[] = [], options: {
             if (name === "agents") return [{ status: "idle", count: 2 }];
             if (name === "issues") return [{ status: "in_progress", count: 1 }];
             if (name === "approvals") return [{ count: 3 }];
-            if (name === "cost_events") return [{ monthSpend: 125 }];
+            if (name === "cost_events") return [{ monthSpend: 125, monthUnpricedEventCount: 2 }];
             throw new Error(`Unexpected dashboard read: ${name}`);
           }).then(resolve, reject);
         },
@@ -83,7 +83,7 @@ describe("dashboard read connection recovery", () => {
         companyId,
         agents: { active: 2 },
         tasks: { inProgress: 1 },
-        costs: { monthSpendCents: 125, monthBudgetCents: 10_000 },
+        costs: { monthSpendCents: 125, monthUnpricedEventCount: 2, monthBudgetCents: 10_000 },
         pendingApprovals: 3,
       });
       expect(test.companyParameters).toEqual([[companyId], [companyId]]);

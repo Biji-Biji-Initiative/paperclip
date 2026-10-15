@@ -4839,7 +4839,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#publish();
     this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
     await this.#waitCommand("run.prepare");
-    await this.#waitCommand("session.open");
+    // Opening can perform sequential initialize, thread/start and (on resume)
+    // thread/read requests, each bounded to 30 seconds by runner-core. Allow
+    // their combined budget and settlement so the controller cannot preempt
+    // valid startup or conceal the provider's more specific failure.
+    await this.#waitCommand("session.open", undefined, Date.now() + 120_000);
     await this.#waitForProviderIdentity();
     this.#startupComplete = true;
     this.#diagnostic("runnerd authenticated to the durable PRP control plane");

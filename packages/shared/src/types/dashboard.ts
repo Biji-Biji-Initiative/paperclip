@@ -40,6 +40,7 @@ export interface DashboardSummary {
   };
   costs: {
     monthSpendCents: number;
+    monthUnpricedEventCount: number;
     monthBudgetCents: number;
     monthUtilizationPercent: number;
   };

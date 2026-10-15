@@ -298,6 +298,7 @@ const dashboard: DashboardSummary = {
   },
   costs: {
     monthSpendCents: 900,
+    monthUnpricedEventCount: 0,
     monthBudgetCents: 1000,
     monthUtilizationPercent: 90,
   },
