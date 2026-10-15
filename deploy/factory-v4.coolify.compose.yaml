@@ -28,6 +28,11 @@ services:
       - paperclip-factory-v4-r1-pgdata:/var/lib/postgresql/data
 
   server:
+    # These bounds apply to the control plane and its native child processes.
+    # Qualify one real run before increasing execution concurrency.
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 512
     build:
       context: .
       dockerfile: Dockerfile
