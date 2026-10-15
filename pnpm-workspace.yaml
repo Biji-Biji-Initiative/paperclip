@@ -33,6 +33,7 @@ patchedDependencies:
 # Agent CLIs share the current runtime used by the native provider pack.
 # pnpm patches change package files, but overrides control dependency resolution.
 overrides:
+  "@modelcontextprotocol/sdk@^1.0.0": "1.31.0"
   "source-map-js@^1.0.0": "1.2.2"
   "js-yaml@^4.0.0": "4.3.2"
   "path-to-regexp@^8.0.0": "8.4.0"

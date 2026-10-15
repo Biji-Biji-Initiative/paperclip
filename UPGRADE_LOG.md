@@ -101,3 +101,20 @@ parser and rendered Markdown tests pass. The override stays within 4.x.
 The build pipeline's actual consumer rejects excessive indexed section offsets
 and retains normal source locations. Ten parser/Markdown tests and the full UI
 production build pass. The override stays within 1.x.
+
+## MCP SDK credential issuer binding
+
+`@modelcontextprotocol/sdk` 1.30.0 → 1.31.0 addresses
+[GHSA-6qxp-vccf-f47h](https://github.com/advisories/GHSA-6qxp-vccf-f47h)
+within its supported 1.x line. This application's production imports use the SDK
+server interfaces; its remote HTTP client is separate. No bundled SDK
+ClientCredentialsProvider/PrivateKeyJwtProvider configuration was found to require
+an additional expectedIssuer migration. No OAuth credential flow is claimed
+from a version bump alone.
+
+129 focused tests pass: public/remote MCP (76), Paperclip MCP tools (14), Sheets
+MCP (27) and demo MCP (12), including real loopback HTTP client/server exchanges.
+The Paperclip tools fixture omitted the shared input schema's pre-existing
+allowDuplicate=false default; its expected POST body now includes that safe
+default. This was an existing fixture mismatch, not a relaxation of duplicate
+protection. MCP package TypeScript checking passes.
