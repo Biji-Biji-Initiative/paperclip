@@ -33,6 +33,12 @@ services:
     mem_limit: 4g
     cpus: 2
     pids_limit: 512
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - "seccomp=${PAPERCLIP_NATIVE_SECCOMP_PATH:?Install the qualified worker seccomp policy first}"
+      - apparmor=factory-paperclip-native
     build:
       context: .
       dockerfile: Dockerfile

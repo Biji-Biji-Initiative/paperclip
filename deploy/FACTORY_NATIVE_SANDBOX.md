@@ -1,0 +1,11 @@
+# Factory native sandbox policies
+
+The Codex provider needs nested unprivileged user and mount namespaces. Docker's default seccomp/AppArmor policies block these on the Factory worker. Keep Codex filesystem sandboxing enabled.
+
+The accompanying seccomp policy is the OpenAI Codex Security example at commit `19d685863eea224633da2e60f3c159988110ad56`, `docker/codex-security-seccomp.json`. The AppArmor policy is its `docker/codex-security.apparmor`, with the profile and self-peer name changed to `factory-paperclip-native`. Source: https://github.com/openai/codex-security/tree/19d685863eea224633da2e60f3c159988110ad56/docker . Both retain explicit deny rules. The namespace syscalls rely on running as UID1000 with all capabilities dropped and no-new-privileges, as set in Factory Compose.
+
+Before deploying, copy the source-matched policies to the worker through the normal operator route. Validate the AppArmor syntax using `apparmor_parser --skip-kernel-load --skip-read-cache <profile>`, then install the dedicated profile at `/etc/apparmor.d/factory-paperclip-native` and load only that profile. Preserve any prior files and their checksums for rollback; reject an unexpected existing profile. Do not reload or replace Docker's default policy. Install seccomp at `/etc/paperclip/factory-native-seccomp.json` (root-owned,0644) and set `PAPERCLIP_NATIVE_SECCOMP_PATH` to that exact host path. The daemon reads it; it is not mounted into the app. Confirm the retained Paperclip volume is writable by1000:1000 before starting nonroot.
+
+Qualify the exact image in a network-disabled disposable container without credentials or state volumes: use the Compose user/capability/security options, override its entrypoint to `codex`, and run `sandbox -- /bin/true`. The default Docker-policy control should reproduce the namespace denial on this worker. This checks namespace compatibility only. Next prove a real private native task, a saved artifact, and denied filesystem access outside its assigned workspace. Record the image ID and policy hashes.
+
+Rollback the app through its normal stateful recovery procedure. If removing these policies, first stop all containers that use them; unload only `factory-paperclip-native` and restore/remove only the operator-owned policy files. Keep global user-namespace sysctls, Docker policies and the daemon unchanged.
