@@ -96,9 +96,11 @@ services:
 
 volumes:
   # Existing V4 volumes: fail instead of silently creating an empty replacement.
+  # Normal operation leaves the suffix empty. Recovery selects one independently
+  # restored database/state pair using the suffix in its verified restore receipt.
   paperclip-factory-v4-r1-pgdata:
     external: true
-    name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-pgdata
+    name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-pgdata${PAPERCLIP_FACTORY_RECOVERY_SUFFIX:-}
   paperclip-factory-v4-r1-data:
     external: true
-    name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-data
+    name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-data${PAPERCLIP_FACTORY_RECOVERY_SUFFIX:-}
