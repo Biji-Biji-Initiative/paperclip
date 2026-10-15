@@ -1,9 +1,9 @@
-# Paperclip Factory v4: fresh state on upstream stable v2026.722.0.
+# Paperclip Factory: upstream stable v2026.1012.0, preserving V4 state.
 #
-# The old factory experiment is intentionally not migrated. V4 starts with a
-# separate PostgreSQL/data plane, remains authenticated, and disables agent
-# execution until a dedicated policy and runner proof are complete. The source
-# branch is pinned to this release tag; Docker builds the matching source.
+# Use the upstream release image by immutable digest. Database and instance
+# volumes retain their V4 identity across upgrades. Before changing versions,
+# prove a restore and run the new image against an isolated copy of that state.
+# Stop all old writers before starting the new image (workspace lock protocol).
 #
 # Before provisioning, prove this source with:
 #   IMAGE_NAME=<locally-built-image> scripts/factory-v4-local-smoke.sh
@@ -27,10 +27,7 @@ services:
       - paperclip-factory-v4-r1-pgdata:/var/lib/postgresql/data
 
   server:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
+    image: ghcr.io/paperclipai/paperclip:2026.1012.0@sha256:1661b3dd3fdf7a9b59542d1ced464c3faf9dc8309798b4d15a9923ed32795307
     restart: unless-stopped
     depends_on:
       db:
