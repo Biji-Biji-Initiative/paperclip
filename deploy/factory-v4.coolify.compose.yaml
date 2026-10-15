@@ -1,7 +1,8 @@
 # Paperclip Factory: v2026.1012.0 plus native staff SSO, preserving V4 state.
 #
-# Build the selected, pinned fork commit; the stock release lacks staff SSO.
-# SOURCE_COMMIT must be available during the Coolify build. Database and instance
+# Deploy the qualified native image by its observed local sha256 ID. Warm and
+# inspect it on the worker before cutover; never rebuild during the outage.
+# The image build stamp records its source commit. Database and instance
 # volumes retain their V4 identity across upgrades. Before changing versions,
 # prove a restore and run the new image against an isolated copy of that state.
 # Stop all old writers before starting the new image (workspace lock protocol).
@@ -39,14 +40,8 @@ services:
       - no-new-privileges:true
       - "seccomp=${PAPERCLIP_NATIVE_SECCOMP_PATH:?Install the qualified worker seccomp policy first}"
       - apparmor=factory-paperclip-native
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-      args:
-        PAPERCLIP_BUILD_COMMIT: "${SOURCE_COMMIT:?SOURCE_COMMIT must identify the selected fork commit}"
-        PAPERCLIP_BUILD_VERSION: "2026.1012.0-factory-sso.2"
-        CLI_TOOLS_CACHE_EPOCH: "2026-W42"
+    image: "${PAPERCLIP_FACTORY_IMAGE:?Set the qualified worker sha256 image ID}"
+    pull_policy: never
     restart: unless-stopped
     depends_on:
       db:
