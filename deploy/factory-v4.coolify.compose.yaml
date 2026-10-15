@@ -12,7 +12,7 @@
 # attaching the canonical hostname.
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:979c4379dd698aba0b890599a6104e082035f98ef31d9b9291ec22f2b13059ca
     restart: unless-stopped
     environment:
       POSTGRES_USER: "${POSTGRES_USER:-paperclip}"
@@ -50,7 +50,7 @@ services:
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
       PAPERCLIP_PUBLIC_URL: "https://factory.mereka.io"
-      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "${PAPERCLIP_AUTH_DISABLE_SIGN_UP:?PAPERCLIP_AUTH_DISABLE_SIGN_UP must be set}"
+      PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true"
       PAPERCLIP_ENABLE_COMPANY_DELETION: "false"
       PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
       HEARTBEAT_SCHEDULER_ENABLED: "false"
@@ -73,5 +73,10 @@ services:
       - paperclip-factory-v4-r1-data:/paperclip
 
 volumes:
+  # Existing V4 volumes: fail instead of silently creating an empty replacement.
   paperclip-factory-v4-r1-pgdata:
+    external: true
+    name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-pgdata
   paperclip-factory-v4-r1-data:
+    external: true
+    name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-data
