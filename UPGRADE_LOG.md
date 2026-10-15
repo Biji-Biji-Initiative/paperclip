@@ -93,3 +93,11 @@ focused dependency, authentication-route and MCP HTTP tests pass.
 The editor's actual parser now counts empty merge sources against its work
 limit; ordinary proposal frontmatter still parses correctly. Nine focused
 parser and rendered Markdown tests pass. The override stays within 4.x.
+
+## Source-map offset validation
+
+`source-map-js` 1.2.1 → 1.2.2 addresses
+[GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q).
+The build pipeline's actual consumer rejects excessive indexed section offsets
+and retains normal source locations. Ten parser/Markdown tests and the full UI
+production build pass. The override stays within 1.x.

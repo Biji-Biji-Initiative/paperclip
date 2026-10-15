@@ -1,4 +1,19 @@
 import { describe, expect, it } from "vitest";
+import { createRequire } from "node:module";
+
+const buildRequire = createRequire(import.meta.resolve("vite"));
+const sourceMaps = createRequire(buildRequire.resolve("postcss"))("source-map-js") as {
+  SourceMapConsumer: new (map: unknown) => { originalPositionFor: (position: { line: number; column: number }) => unknown };
+};
+
+describe("source-map input limits", () => {
+  it("rejects excessive section offsets and preserves normal source locations", () => {
+    const map = { version: 3, sources: ["proposal.css"], names: [], mappings: "AAAA" };
+    expect(() => new sourceMaps.SourceMapConsumer({ version: 3, sections: [{ offset: { line: 1e13, column: 0 }, map }] })).toThrow(/offset line/);
+    const consumer = new sourceMaps.SourceMapConsumer(map);
+    expect(consumer.originalPositionFor({ line: 1, column: 0 })).toMatchObject({ source: "proposal.css", line: 1, column: 0 });
+  });
+});
 
 
 describe("editor YAML security dependency", () => {
