@@ -230,6 +230,9 @@ COPY --chown=node:node --from=runtime-app /app /app
 # Remove the vulnerable distribution package as well as replacing the binary;
 # package inventories must describe what the final filesystem actually uses.
 RUN apt-get purge -y gh openssh-client
+# The pinned Node image includes older npm transport/cache dependencies.
+# Update npm itself rather than editing its bundled dependency manifests.
+RUN npm install --global --omit=dev npm@12.2.0 && npm --version
 COPY --from=github-cli /usr/local/bin/gh /usr/local/bin/gh
 COPY --from=openssh-client-build /client-bin/ /usr/local/bin/
 COPY --from=openssh-client-build /client-libexec/ /usr/local/libexec/

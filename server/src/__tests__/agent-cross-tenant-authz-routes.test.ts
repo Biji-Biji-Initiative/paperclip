@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.unmock("http");
 vi.unmock("node:http");
@@ -344,6 +344,13 @@ function resetMockDefaults() {
 }
 
 describe("agent cross-tenant route authorization", () => {
+  // Cold route imports can exceed a request test's deadline on shared hosts.
+  // Load once before mocks are reset, so a timed-out import cannot resume
+  // an earlier test's requests while the next test is changing those mocks.
+  beforeAll(async () => {
+    await loadRouteModules();
+  }, 120_000);
+
   beforeEach(() => {
     resetMockDefaults();
   });
