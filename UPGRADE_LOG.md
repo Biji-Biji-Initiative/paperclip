@@ -85,3 +85,11 @@ Compose rendering passes with fixture values and no daemon or deployment writes.
 The actual Express router dependency now rejects 32 sequential optional groups
 before exponential expansion; normal company-scoped routes still match. Thirty
 focused dependency, authentication-route and MCP HTTP tests pass.
+
+## YAML merge-work bound
+
+`js-yaml` 4.3.1 → 4.3.2 fixes
+[GHSA-2883-xcg3-v3hh](https://github.com/advisories/GHSA-2883-xcg3-v3hh).
+The editor's actual parser now counts empty merge sources against its work
+limit; ordinary proposal frontmatter still parses correctly. Nine focused
+parser and rendered Markdown tests pass. The override stays within 4.x.
