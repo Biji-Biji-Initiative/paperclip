@@ -148,3 +148,17 @@ Browser console diagnostics now omit raw network errors and HTTP response bodies
 eleven focused auth API tests pass, including marker-based non-disclosure checks.
 The image built from the preceding source snapshot does not gain this frontend
 change without a subsequent identified rebuild.
+
+## Callback receipt route correction
+
+A stronger test suppressed the validation receipt on a real library callback.
+It reproduced a fail-open boundary: Better Auth dispatch names that endpoint
+`/callback/:id`, while the initial guard compared only the literal URL. The gate
+now recognizes the actual endpoint and Authentik provider parameter. The same
+negative flow is denied, no session or membership is issued, and all21 migrated
+PostgreSQL staff-auth tests pass. Server TypeScript checking passes. This is an
+internal missing-validation fault test, not a claim of a browser-forged receipt
+or a production incident; the native integration remains unenabled in production.
+UBS scanned the auth module: its three critical reports are boolean recovery
+option comparisons labelled as secret comparisons. They compare true/false
+configuration values, not credentials; no scanner rule was disabled.

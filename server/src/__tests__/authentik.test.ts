@@ -242,6 +242,19 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
     if (!before) throw new Error("Missing staff session gate");
     await expect(before({ userId: "unverified-context" } as never, { path: "/callback/authentik" } as never)).rejects.toThrow(/receipt/);
   });
+  it("requires the receipt on the real library callback route", async () => {
+    const context = await auth.$context;
+    if (!context.options.user?.validateUserInfo) throw new Error("Missing staff identity validator");
+    const missingReceipt = vi.spyOn(context.options.user, "validateUserInfo").mockImplementation(() => undefined);
+    try {
+      expect((await login("missing-receipt@mereka.my")).status).toBe(401);
+      const [user] = await db.select().from(authUsers).where(eq(authUsers.email, "missing-receipt@mereka.my"));
+      if (user) {
+        expect(await db.select().from(authSessions).where(eq(authSessions.userId, user.id))).toHaveLength(0);
+        expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id))).toHaveLength(0);
+      }
+    } finally { missingReceipt.mockRestore(); }
+  });
 
   it("rolls membership, initial grant and audit back together when audit persistence fails", async () => {
     const userId = "audit-rollback-user";

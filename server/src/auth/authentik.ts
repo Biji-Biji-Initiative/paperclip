@@ -91,8 +91,9 @@ export function authentikAuthOptions(db: Db, publicUrl: string | undefined, env:
   return {
     hooks: { before: createAuthMiddleware(async (context) => {
       if (context.path === "/sign-in/email" || context.path === "/sign-up/email") {
+        const email = typeof context.body?.email === "string" ? context.body.email.trim().toLowerCase() : null;
         if (!config.allowPasswordLogin || Date.now() >= config.recoveryUntil ||
-            context.body?.email?.trim().toLowerCase() !== config.recoveryEmail) {
+            email !== config.recoveryEmail) {
           throw new APIError("FORBIDDEN", { message: "Password recovery is unavailable for this identity" });
         }
       }
@@ -124,7 +125,9 @@ export function authentikAuthOptions(db: Db, publicUrl: string | undefined, env:
       session: { create: { before: async (session, context) => {
         const receipt = context ? verifiedContexts.get(context) : undefined;
         if (context) verifiedContexts.delete(context);
-        if (context?.path === "/callback/authentik" && !receipt) {
+        const staffCallback = context?.path === "/callback/authentik" ||
+          (context?.path === "/callback/:id" && context.params?.id === "authentik");
+        if (staffCallback && !receipt) {
           throw new APIError("FORBIDDEN", { message: "Verified staff identity receipt is required" });
         }
         if (receipt) {
