@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, it } from "vitest";
@@ -69,3 +69,38 @@ input.on('close',()=>process.exit(0));
     await rm(root, { recursive: true, force: true });
   }
 }, 30_000);
+
+it("bounds a provider that never opens without a turn or duplicate launch", async () => {
+  const root = await mkdtemp(join(tmpdir(), "runner-startup-hang-"));
+  const provider = join(root, "hanging-provider.cjs");
+  const calls = join(root, "calls.log");
+  const pidFile = join(root, "provider.pid");
+  await writeFile(provider, `#!/usr/bin/env node
+const fs=require('node:fs');
+const readline=require('node:readline');
+fs.writeFileSync(${JSON.stringify(pidFile)},String(process.pid));
+fs.appendFileSync(${JSON.stringify(calls)},'spawn\\n');
+readline.createInterface({input:process.stdin}).on('line',line=>{
+  fs.appendFileSync(${JSON.stringify(calls)},JSON.parse(line).method+'\\n');
+});
+`);
+  await chmod(provider, 0o755);
+  const bundle = createCapabilityRunnerdCodexTransport({
+    runnerBinary: process.env.PAPERCLIP_ATTACH_TRANSITION_RUNNER ?? defaultCapabilityRunnerdBinary(),
+    stateDirectory: root, codexCommand: provider, codexArgs: [],
+  });
+  try {
+    await expect(bundle.transport.request("thread/start", { cwd: root, dynamicTools: [] }))
+      .rejects.toThrow("initialize response timed out");
+    expect((await readFile(calls, "utf8")).trim().split("\n")).toEqual(["spawn", "initialize"]);
+    const providerPid = Number(await readFile(pidFile, "utf8"));
+    expect(providerPid).toBeGreaterThan(0);
+    expect(() => process.kill(providerPid, 0)).toThrow();
+  } finally {
+    const runnerPid = bundle.evidence().runnerPid;
+    await expect(bundle.transport.close()).rejects.toBeInstanceOf(NativeSessionCloseUnrecoverableError);
+    expect(runnerPid).toBeGreaterThan(0);
+    expect(() => process.kill(runnerPid!, 0)).toThrow();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 75_000);

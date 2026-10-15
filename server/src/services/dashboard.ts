@@ -1,4 +1,4 @@
-import { and, eq, gte, sql } from "drizzle-orm";
+import { and, eq, gte, lt, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, approvals, companies, costEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { notFound } from "../errors.js";
@@ -85,6 +85,7 @@ export function dashboardService(db: Db) {
 
       const now = new Date();
       const monthStart = getUtcMonthStart(now);
+      const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
       const runActivityDays = getRecentUtcDateKeys(now, DASHBOARD_RUN_ACTIVITY_DAYS);
       const runActivityStart = new Date(`${runActivityDays[0]}T00:00:00.000Z`);
       const [{ monthSpend, monthUnpricedEventCount }] = await retryIdempotentDatabaseOperation(() => db
@@ -97,6 +98,7 @@ export function dashboardService(db: Db) {
           and(
             eq(costEvents.companyId, companyId),
             gte(costEvents.occurredAt, monthStart),
+            lt(costEvents.occurredAt, monthEnd),
           ),
         ));
 

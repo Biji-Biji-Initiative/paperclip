@@ -64,6 +64,7 @@ describeEmbeddedPostgres("dashboard service", () => {
     const agentId = randomUUID();
     const otherAgentId = randomUUID();
     const monthStart = getUtcMonthStart(new Date());
+    const monthEnd = new Date(Date.UTC(monthStart.getUTCFullYear(), monthStart.getUTCMonth() + 1, 1));
     await db.insert(companies).values([
       { id: companyId, name: "Cost disclosure", issuePrefix: "DISC", budgetMonthlyCents: 1000 },
       { id: otherCompanyId, name: "Other costs", issuePrefix: "OTHR" },
@@ -78,6 +79,8 @@ describeEmbeddedPostgres("dashboard service", () => {
       { ...event, costStatus: "reported", costCents: 125 },
       { ...event, costStatus: "unpriced", costCents: 0 },
       { ...event, costStatus: "unpriced", costCents: 0, occurredAt: new Date(monthStart.getTime() - 1) },
+      { ...event, costStatus: "unpriced", costCents: 0, occurredAt: monthEnd },
+      { ...event, costStatus: "reported", costCents: 999, occurredAt: new Date(monthEnd.getTime() + 1) },
       { ...event, companyId: otherCompanyId, agentId: otherAgentId, costStatus: "unpriced", costCents: 0 },
     ]);
     const summary = await dashboardService(db).summary(companyId);

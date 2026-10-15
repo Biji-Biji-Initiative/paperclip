@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { approvalService } from "../services/approvals.ts";
+import { agents } from "@paperclipai/db";
+
+const targetAgentId = "00000000-0000-4000-8000-000000000001";
 
 const mockAgentService = vi.hoisted(() => ({
   activatePendingApproval: vi.fn(),
@@ -32,7 +35,7 @@ function createApproval(status: string): ApprovalRecord {
     companyId: "company-1",
     type: "hire_agent",
     status,
-    payload: { agentId: "agent-1" },
+    payload: { agentId: targetAgentId },
     requestedByAgentId: "requester-1",
   };
 }
@@ -40,7 +43,9 @@ function createApproval(status: string): ApprovalRecord {
 function createDbStub(selectResults: ApprovalRecord[][], updateResults: ApprovalRecord[]) {
   const pendingSelectResults = [...selectResults];
   const selectWhere = vi.fn(async () => pendingSelectResults.shift() ?? []);
-  const from = vi.fn(() => ({ where: selectWhere }));
+  const from = vi.fn((table: unknown) => table === agents
+    ? { where: () => ({ for: async () => [{ status: "pending_approval" }] }) }
+    : { where: selectWhere });
   const select = vi.fn(() => ({ from }));
 
   const returning = vi.fn(async () => updateResults);
@@ -101,7 +106,7 @@ describe("approvalService resolution idempotency", () => {
     const result = await svc.approve("approval-1", "board", "ship it");
 
     expect(result.applied).toBe(true);
-    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith("agent-1", approved.payload);
+    expect(mockAgentService.activatePendingApproval).toHaveBeenCalledWith(targetAgentId, approved.payload);
     expect(mockNotifyHireApproved).toHaveBeenCalledTimes(1);
   });
 

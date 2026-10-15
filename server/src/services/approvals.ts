@@ -1,7 +1,7 @@
-import { agentAppearanceSchema } from "@paperclipai/shared";
+import { agentAppearanceSchema, isUuidLike } from "@paperclipai/shared";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { approvalComments, approvals } from "@paperclipai/db";
+import { agents, approvalComments, approvals } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { agentService } from "./agents.js";
@@ -15,6 +15,21 @@ export function approvalService(db: Db) {
   const resolvableStatuses = Array.from(canResolveStatuses);
   type ApprovalRecord = typeof approvals.$inferSelect;
   type ResolutionResult = { approval: ApprovalRecord; applied: boolean };
+
+  async function assertPendingHireTarget(database: Db, approval: ApprovalRecord) {
+    const agentId = approval.payload.agentId;
+    if (agentId === undefined || agentId === null) return;
+    if (typeof agentId !== "string" || !isUuidLike(agentId)) {
+      throw unprocessable("Invalid hire target");
+    }
+    const [target] = await database.select({ status: agents.status }).from(agents)
+      .where(and(eq(agents.id, agentId), eq(agents.companyId, approval.companyId)))
+      .for("update");
+    if (!target) throw notFound("Hire target not found");
+    if (target.status !== "pending_approval") {
+      throw unprocessable("Hire target is not awaiting approval");
+    }
+  }
 
   function redactApprovalComment<T extends { body: string }>(comment: T, censorUsernameInLogs: boolean): T {
     return {
@@ -156,6 +171,7 @@ export function approvalService(db: Db) {
 
         let hireApprovedAgentId: string | null = null;
         if (applied && updated.type === "hire_agent") {
+          await assertPendingHireTarget(txDb, updated);
           const payload = updated.payload as Record<string, unknown>;
           const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
           if (payloadAgentId) {
@@ -233,6 +249,7 @@ export function approvalService(db: Db) {
         );
 
         if (applied && updated.type === "hire_agent") {
+          await assertPendingHireTarget(txDb, updated);
           const payload = updated.payload as Record<string, unknown>;
           const payloadAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
           if (payloadAgentId) {
