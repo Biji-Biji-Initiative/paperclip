@@ -7,8 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sanitizeAssetNamespace } from "@paperclipai/shared";
 import { ProfileSettings } from "./ProfileSettings";
 
+const mockNavigate = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/browserNavigation", () => ({ navigateTopLevel: (url: string) => mockNavigate(url) }));
+
 const mockAuthApi = vi.hoisted(() => ({
-  getSession: vi.fn(),
+  getSession: vi.fn(), getProviders: vi.fn(), linkAuthentik: vi.fn(),
   signInEmail: vi.fn(),
   signUpEmail: vi.fn(),
   getProfile: vi.fn(),
@@ -57,10 +60,25 @@ async function flushReact() {
 describe("ProfileSettings", () => {
   let container: HTMLDivElement;
 
+  it("offers authenticated profile linking during controlled password recovery", async () => {
+    mockAuthApi.getProviders.mockResolvedValue({ providers: [{ id: "authentik", name: "Staff SSO" }], passwordSignInEnabled: true });
+    mockAuthApi.linkAuthentik.mockResolvedValue("https://authentik.fixture/authorize");
+    const root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => root.render(<QueryClientProvider client={queryClient}><ProfileSettings /></QueryClientProvider>));
+    await vi.waitFor(() => expect(container.textContent).toContain("Connect staff SSO"));
+    const button = Array.from(container.querySelectorAll("button")).find((b) => b.textContent === "Connect staff SSO");
+    await act(async () => { button?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await vi.waitFor(() => expect(mockNavigate).toHaveBeenCalledWith("https://authentik.fixture/authorize"));
+    expect(mockAuthApi.linkAuthentik).toHaveBeenCalledWith(window.location.pathname);
+    await act(async () => root.unmount());
+  });
+
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
 
+    mockAuthApi.getProviders.mockResolvedValue({ providers: [], passwordSignInEnabled: true });
     mockAuthApi.getSession.mockResolvedValue({
       session: { id: "session-1", userId: "user-1" },
       user: {

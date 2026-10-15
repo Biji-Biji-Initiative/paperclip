@@ -1,5 +1,6 @@
 import {
   authSessionSchema,
+  authProvidersSchema,
   currentUserProfileSchema,
   type AuthSession,
   type CurrentUserProfile,
@@ -20,6 +21,7 @@ type AuthErrorBody =
 export interface SignOutResult {
   success?: boolean;
   redirectTo?: string;
+  providerLogoutUrl?: string;
 }
 
 export class AuthApiError extends Error {
@@ -151,7 +153,27 @@ async function authPatch<T>(path: string, body: Record<string, unknown>, parse: 
   return parse(payload);
 }
 
+async function staffAuthorization(path: string, callbackURL: string): Promise<string> {
+  const payload = await authPost(path, { provider: "authentik", callbackURL, errorCallbackURL: "/auth?next=" + encodeURIComponent(callbackURL), disableRedirect: true });
+  const url = payload && typeof payload === "object" ? (payload as Record<string, unknown>).url : null;
+  if (typeof url !== "string") throw new Error("Staff sign-in did not return a secure authorization URL");
+  const target = new URL(url);
+  if (target.protocol !== "https:" || target.username || target.password) {
+    throw new Error("Staff sign-in did not return a secure authorization URL");
+  }
+  return target.href;
+}
+
 export const authApi = {
+  getProviders: async () => {
+    const response = await fetch("/api/auth/providers", { cache: "no-store" });
+    if (!response.ok) throw new Error("Unable to check staff sign-in");
+    return authProvidersSchema.parse(await response.json());
+  },
+
+  signInAuthentik: (callbackURL: string) => staffAuthorization("/sign-in/social", callbackURL),
+  linkAuthentik: (callbackURL: string) => staffAuthorization("/link-social", callbackURL),
+
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
       credentials: "include",
@@ -201,7 +223,15 @@ export const authApi = {
     if (!payload || typeof payload !== "object") return null;
 
     const result = payload as Record<string, unknown>;
+    let providerLogoutUrl: string | undefined;
+    if (typeof result.url === "string") {
+      try {
+        const target = new URL(result.url);
+        if (target.protocol === "https:" && !target.username && !target.password) providerLogoutUrl = target.href;
+      } catch { /* Local logout still completes if the IdP URL is malformed. */ }
+    }
     return {
+      ...(providerLogoutUrl ? { providerLogoutUrl } : {}),
       ...(typeof result.success === "boolean" ? { success: result.success } : {}),
       ...(typeof result.redirectTo === "string" ? { redirectTo: result.redirectTo } : {}),
     };

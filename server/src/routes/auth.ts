@@ -1,9 +1,11 @@
+import { authentikConfiguration } from "../auth/authentik.js";
 import { Router } from "express";
 import { eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { authUsers } from "@paperclipai/db";
 import {
   authSessionSchema,
+  authProvidersSchema,
   currentUserProfileSchema,
   updateCurrentUserProfileSchema,
 } from "@paperclipai/shared";
@@ -37,6 +39,15 @@ async function loadCurrentUserProfile(db: Db, userId: string) {
 
 export function authRoutes(db: Db) {
   const router = Router();
+
+  router.get("/providers", (_req, res) => {
+    const sso = authentikConfiguration();
+    res.setHeader("Cache-Control", "no-store");
+    res.json(authProvidersSchema.parse({
+      providers: sso ? [{ id: "authentik", name: "Staff SSO" }] : [],
+      passwordSignInEnabled: !sso || sso.allowPasswordLogin,
+    }));
+  });
 
   router.get("/get-session", async (req, res) => {
     if (req.actor.type !== "board" || !req.actor.userId) {

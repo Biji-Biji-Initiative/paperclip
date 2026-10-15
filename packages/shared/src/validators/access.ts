@@ -220,3 +220,8 @@ export const updateCurrentUserProfileSchema = z.object({
 });
 
 export type UpdateCurrentUserProfile = z.infer<typeof updateCurrentUserProfileSchema>;
+
+export const authProvidersSchema = z.object({
+  providers: z.array(z.object({ id: z.literal("authentik"), name: z.string().min(1) })),
+  passwordSignInEnabled: z.boolean(),
+});

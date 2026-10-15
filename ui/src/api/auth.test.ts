@@ -70,3 +70,19 @@ describe("authApi.signOut", () => {
     });
   });
 });
+
+
+describe("authApi staff identity provider navigation", () => {
+  it("retains the native provider logout URL without treating it as a Cloud redirect", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ success: true, url: "https://authentik.fixture/end-session" })));
+    await expect(authApi.signOut()).resolves.toEqual({ success: true, providerLogoutUrl: "https://authentik.fixture/end-session" });
+  });
+  it("ignores an unsafe provider logout URL while completing local logout", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ success: true, url: "javascript:alert(1)" })));
+    await expect(authApi.signOut()).resolves.toEqual({ success: true });
+  });
+  it("rejects an unsafe authorization URL", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ url: "javascript:alert(1)" })));
+    await expect(authApi.signInAuthentik("/")).rejects.toThrow(/secure authorization/);
+  });
+});

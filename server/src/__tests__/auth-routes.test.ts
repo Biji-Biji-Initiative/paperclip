@@ -72,6 +72,17 @@ describe("auth routes", () => {
     else process.env.SENTRY_DSN_BACKEND = originalSentryDsnBackend;
   });
 
+  it("advertises configured staff sign-in without exposing credentials or company identity", async () => {
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ISSUER", "https://authentik.fixture/application/o/factory/");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_CLIENT_ID", "fixture-client");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_CLIENT_SECRET", "fixture-value-never-returned");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_COMPANY_ID", "0da2d522-a3c2-4658-87e9-c089698fc111");
+    const response = await request(createApp({ type: "none" }, baseUser)).get("/api/auth/providers");
+    expect(response.status).toBe(200);
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.body).toEqual({ providers: [{ id: "authentik", name: "Staff SSO" }], passwordSignInEnabled: false });
+  });
+
   it("returns the persisted user profile in the session payload", async () => {
     vi.stubEnv("SENTRY_ENVIRONMENT", undefined);
     delete process.env.SENTRY_DSN;

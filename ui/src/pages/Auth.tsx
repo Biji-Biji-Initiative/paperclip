@@ -11,6 +11,7 @@ import { getRememberedInvitePath } from "../lib/invite-memory";
 import { Button } from "@/components/ui/button";
 import { AsciiArtAnimation } from "@/components/AsciiArtAnimation";
 import { PaperclipLoading } from "@/components/AnimatedPaperclipIcon";
+import { navigateTopLevel } from "@/lib/browserNavigation";
 import { ThemeToggle } from "@/components/ThemeToggle";
 import { PaperclipLockup } from "../components/PaperclipLockup";
 
@@ -24,7 +25,9 @@ export function AuthPage() {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(() => searchParams.has("error")
+    ? "Staff sign-in could not be completed. Check your staff access or try again."
+    : null);
   const errorId = "auth-error";
 
   const nextPath = useMemo(
@@ -77,12 +80,23 @@ export function AuthPage() {
     },
   });
 
+  const providersQuery = useQuery({
+    queryKey: ["auth", "providers"], queryFn: authApi.getProviders, retry: false,
+    enabled: Boolean(healthQuery.data && !healthQuery.data.cloud && !session && !isSessionLoading),
+  });
+  const staffSignIn = useMutation({
+    mutationFn: () => authApi.signInAuthentik(nextPath),
+    onMutate: () => setError(null),
+    onSuccess: (url) => navigateTopLevel(url),
+    onError: (err) => setError(err instanceof Error ? err.message : "Staff sign-in failed"),
+  });
+
   const canSubmit =
     email.trim().length > 0 &&
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
 
-  if (healthQuery.isLoading || isSessionLoading || session) {
+  if (healthQuery.isLoading || providersQuery.isLoading || isSessionLoading || session) {
     return (
       <div className="fixed inset-0 flex items-center justify-center">
         <PaperclipLoading className="min-h-0" />
@@ -91,7 +105,7 @@ export function AuthPage() {
   }
 
   // A health/session failure must not be mistaken for a self-hosted instance.
-  if (healthQuery.error || sessionError) {
+  if (healthQuery.error || providersQuery.error || sessionError) {
     return <p role="alert" className="p-6 text-sm text-destructive">Unable to check sign-in. Refresh and try again.</p>;
   }
 
@@ -111,6 +125,17 @@ export function AuthPage() {
             <PaperclipLockup className="h-5 w-auto" />
           </div>
 
+          {providersQuery.data?.providers.length ? (
+            <div className="mb-6">
+              <h1 className="text-xl font-semibold">Staff sign-in</h1>
+              <p className="mt-2 mb-4 text-sm text-muted-foreground">Use your Biji-Biji or Mereka staff account.</p>
+              <Button className="w-full" onClick={() => staffSignIn.mutate()} disabled={staffSignIn.isPending}>
+                {staffSignIn.isPending ? "Opening staff sign-in…" : "Continue with Staff SSO"}
+              </Button>
+              {!providersQuery.data.passwordSignInEnabled && error ? <p role="alert" className="mt-3 text-sm text-destructive">{error}</p> : null}
+            </div>
+          ) : null}
+          {providersQuery.data?.passwordSignInEnabled ? <>
           <h1 className="text-xl font-semibold">
             {mode === "sign_in" ? "Sign in to Paperclip" : "Create your Paperclip account"}
           </h1>
@@ -217,6 +242,7 @@ export function AuthPage() {
               {mode === "sign_in" ? "Create one" : "Sign in"}
             </button>
           </div>
+          </> : null}
         </div>
       </div>
 

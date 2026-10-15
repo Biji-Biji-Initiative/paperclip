@@ -52,8 +52,8 @@ export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
         return "cloud" as const;
       }
 
-      await authApi.signOut();
-      return "self-hosted" as const;
+      const result = await authApi.signOut();
+      return result?.providerLogoutUrl ?? "self-hosted";
     },
     onSuccess: async (target) => {
       if (target === "cloud") return;
@@ -107,7 +107,12 @@ export function useSignOut({ onSignedOut }: UseSignOutOptions = {}) {
 
       // Instance-scoped, so refreshed in place rather than dropped — see
       // INSTANCE_SCOPED_QUERY_ROOTS.
-      await queryClient.invalidateQueries({ queryKey: queryKeys.health });
+      const refresh = queryClient.invalidateQueries({ queryKey: queryKeys.health });
+      if (target !== "self-hosted") {
+        navigateTopLevel(target);
+        return;
+      }
+      await refresh;
     },
   });
 }

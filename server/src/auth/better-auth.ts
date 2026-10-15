@@ -1,6 +1,7 @@
 import type { Request, RequestHandler } from "express";
 import type { IncomingHttpHeaders } from "node:http";
-import { betterAuth, type Auth } from "better-auth";
+import { betterAuth, type Auth, type BetterAuthOptions } from "better-auth";
+import { authentikAuthOptions, authentikConfiguration } from "./authentik.js";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { toNodeHandler } from "better-auth/node";
 import type { Db } from "@paperclipai/db";
@@ -257,7 +258,10 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
-  const authConfig = {
+  const ssoOptions = authentikAuthOptions(db, baseUrl);
+  const sso = authentikConfiguration();
+  const authConfig: BetterAuthOptions = {
+    ...ssoOptions,
     baseURL: baseUrl,
     secret,
     trustedOrigins,
@@ -271,7 +275,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       },
     }),
     emailAndPassword: {
-      enabled: true,
+      enabled: !sso || sso.allowPasswordLogin,
       requireEmailVerification: false,
       disableSignUp: config.authDisableSignUp,
     },
@@ -287,6 +291,7 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     ...(resolveWorkspaceHandoffIdentity(config)
       ? {
           plugins: [
+            ...(ssoOptions.plugins ?? []),
             workspaceLoginHandoffPlugin({
               db,
               // Re-resolved per exchange so a hot restart cannot keep validating

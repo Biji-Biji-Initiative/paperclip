@@ -1956,3 +1956,14 @@ and honor current ownership, review, governance, pause, dependency, budget, and
 cleanup gates. Restart or duplicate finalization must not create another
 successor. Permanent model/auth incompatibility and usage-limit exhaustion retain
 their existing operator recovery requirements.
+
+### Optional Authentik staff sign-in
+
+An explicitly configured Authentik OIDC provider may authenticate staff while
+public password signup stays disabled. Verified provider exchanges provision
+only operator membership in one existing active company. Existing identities,
+roles, suspensions and removed grants must survive repeat login. Existing
+unverified local accounts require authenticated linking, never silent merging
+or a database verification override. Sessions expire after one hour without
+sliding renewal; local logout and IdP logout are distinct acceptance checks.
+See [staff sign-in](AUTHENTIK.md) for configuration, ownership and proof limits.

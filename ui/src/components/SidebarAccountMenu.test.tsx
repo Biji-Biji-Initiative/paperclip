@@ -362,7 +362,8 @@ describe("SidebarAccountMenu", () => {
     await act(async () => root.unmount());
   });
 
-  it("keeps authenticated self-hosted sign-out on the local auth flow", async () => {
+  it.each([undefined, "https://authentik.fixture/end-session"])("clears self-hosted account state and follows a provider logout when present (%s)", async (providerLogoutUrl) => {
+    if (providerLogoutUrl) mockAuthApi.signOut.mockResolvedValue({ success: true, providerLogoutUrl });
     const root = createRoot(container);
     const queryClient = new QueryClient({
       defaultOptions: { queries: { retry: false } },
@@ -464,7 +465,8 @@ describe("SidebarAccountMenu", () => {
     await flushReact();
 
     expect(mockAuthApi.signOut).toHaveBeenCalledOnce();
-    expect(mockNavigateTopLevel).not.toHaveBeenCalled();
+    if (providerLogoutUrl) expect(mockNavigateTopLevel).toHaveBeenCalledWith(providerLogoutUrl);
+    else expect(mockNavigateTopLevel).not.toHaveBeenCalled();
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
 
     await act(async () => {

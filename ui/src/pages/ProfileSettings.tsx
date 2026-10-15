@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Camera, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
 import type { AuthSession, CurrentUserProfile, UpdateCurrentUserProfile } from "@paperclipai/shared";
+import { navigateTopLevel } from "@/lib/browserNavigation";
 import { authApi } from "@/api/auth";
 import { assetsApi } from "@/api/assets";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -33,6 +34,16 @@ export function ProfileSettings() {
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),
     retry: false,
+  });
+
+  const providersQuery = useQuery({
+    queryKey: ["auth", "providers"], queryFn: authApi.getProviders, retry: false,
+    enabled: Boolean(sessionQuery.data),
+  });
+  const staffLink = useMutation({
+    mutationFn: () => authApi.linkAuthentik(window.location.pathname),
+    onSuccess: (url) => navigateTopLevel(url),
+    onError: (error) => setActionError(error instanceof Error ? error.message : "Unable to link staff sign-in"),
   });
 
   useEffect(() => {
@@ -151,12 +162,20 @@ export function ProfileSettings() {
         </p>
       </div>
 
+      {providersQuery.error ? <p role="alert" className="text-sm text-destructive">Staff sign-in options could not be loaded.</p> : null}
       {actionError ? (
         <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
           {actionError}
         </div>
       ) : null}
 
+      {providersQuery.data?.passwordSignInEnabled && providersQuery.data.providers.length > 0 ? (
+        <Card className="p-5 space-y-3">
+          <h2 className="font-medium">Staff sign-in</h2>
+          <p className="text-sm text-muted-foreground">Connect this existing profile to your staff identity. Both email addresses must match.</p>
+          <Button onClick={() => staffLink.mutate()} disabled={staffLink.isPending}>Connect staff SSO</Button>
+        </Card>
+      ) : null}
       <section className="space-y-8">
         <Card className="block relative overflow-hidden rounded-(--rad-28) border-border/70">
           <div className="absolute inset-x-0 top-0 h-32 bg-(image:--gradient-extract-26)" />

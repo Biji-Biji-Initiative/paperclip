@@ -8,6 +8,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "../lib/queryKeys";
 import { AuthPage } from "./Auth";
 
+const getProvidersMock = vi.hoisted(() => vi.fn());
+const staffSignInMock = vi.hoisted(() => vi.fn());
+const navigateTopLevelMock = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/browserNavigation", () => ({ navigateTopLevel: (url: string) => navigateTopLevelMock(url) }));
+
 const getSessionMock = vi.hoisted(() => vi.fn());
 const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
@@ -22,6 +27,8 @@ vi.mock("@/lib/cloud-sign-in", () => ({
 
 vi.mock("../api/auth", () => ({
   authApi: {
+    getProviders: () => getProvidersMock(),
+    signInAuthentik: (path: string) => staffSignInMock(path),
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
@@ -94,6 +101,8 @@ describe("AuthPage", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     getSessionMock.mockResolvedValue(null);
+    getProvidersMock.mockResolvedValue({ providers: [], passwordSignInEnabled: true });
+    staffSignInMock.mockResolvedValue("https://authentik.fixture/authorize");
     healthMock.mockResolvedValue({ status: "ok", deploymentMode: "authenticated" });
     beginCloudSignInMock.mockReturnValue(true);
     signInEmailMock.mockResolvedValue(undefined);
@@ -123,6 +132,18 @@ describe("AuthPage", () => {
     await flushReact();
     return { root, queryClient };
   }
+
+  it("offers staff SSO without a password form and preserves the internal destination", async () => {
+    getProvidersMock.mockResolvedValue({ providers: [{ id: "authentik", name: "Staff SSO" }], passwordSignInEnabled: false });
+    const { root } = await mount("/auth?next=%2FSSO%2Fissues");
+    await vi.waitFor(() => expect(container.textContent).toContain("Continue with Staff SSO"));
+    expect(container.querySelector("form")).toBeNull();
+    const button = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Continue with Staff SSO"));
+    await act(async () => { button?.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    await vi.waitFor(() => expect(navigateTopLevelMock).toHaveBeenCalledWith("https://authentik.fixture/authorize"));
+    expect(staffSignInMock).toHaveBeenCalledWith("/SSO/issues");
+    await act(async () => root.unmount());
+  });
 
   it.each(["https://my.paperclip.app", "https://my-staging.paperclip.app"])("recovers Cloud auth through %s without rendering an instance form", async (origin) => {
     healthMock.mockResolvedValue({ cloud: { managed: true, managedBy: "paperclip-cloud", cloudBaseUrl: origin, stackSlug: "team" } });
