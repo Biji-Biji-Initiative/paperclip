@@ -1,6 +1,9 @@
 .git
 .github
 .paperclip
+.env
+.env.*
+.beads
 .pnpm-store
 node_modules
 **/node_modules

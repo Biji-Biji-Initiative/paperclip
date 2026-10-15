@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.20
-FROM node:24-trixie-slim AS base
+FROM node:24-trixie-slim@sha256:7f486cabe892bff8fef04c0f7da8dba84a560be3e4e2740b7a86afc57ebec315 AS base
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN apt-get update \
@@ -52,6 +52,7 @@ COPY scripts/link-plugin-dev-sdk.mjs scripts/
 RUN pnpm install --frozen-lockfile
 
 FROM base AS rust-toolchain
+ENV CARGO_BUILD_JOBS=4
 WORKDIR /app
 # Debian's packaged rust lags the ecosystem (trixie ships 1.85) and the
 # runner's dependency tree now requires a newer rustc. Install rustup from a

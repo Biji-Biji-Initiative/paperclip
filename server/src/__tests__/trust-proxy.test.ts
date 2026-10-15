@@ -9,6 +9,14 @@ function appWithEnv(raw: string | undefined): express.Express {
 }
 
 describe("parseTrustProxyEnv", () => {
+  it("does not trust arbitrary IPv4 peers through a broad IPv6 trust subnet", () => {
+    const app = appWithEnv("::/1");
+    const trusts = app.get("trust proxy fn") as (address: string, hop: number) => boolean;
+    expect(trusts("203.0.113.10", 0)).toBe(false);
+    const valid = appWithEnv("10.0.0.0/8").get("trust proxy fn") as typeof trusts;
+    expect(valid("10.1.2.3", 0)).toBe(true);
+    expect(valid("203.0.113.10", 0)).toBe(false);
+  });
   it("unset leaves Express at its safe default (trust nothing)", () => {
     // Express's default trust-proxy setting is `false`. We verify the
     // setting is unchanged by comparing against a vanilla express()
