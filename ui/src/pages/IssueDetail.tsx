@@ -2809,7 +2809,7 @@ function IssueDetailActivityTab({
               {hasIssueTreeCost && issueTreeCostSummary ? (
                 <div className="flex flex-wrap gap-3">
                   <span className="font-medium text-foreground">
-                    Including sub-tasks{" "}
+                    Including sub-tasks · recorded charges{" "}
                     {(issueTreeCostSummary.costCents / 100).toLocaleString(
                       undefined,
                       {
@@ -2820,6 +2820,11 @@ function IssueDetailActivityTab({
                       },
                     )}
                   </span>
+                  {issueTreeCostSummary.unpricedEventCount > 0 ? (
+                    <span>
+                      Unpriced usage: {issueTreeCostSummary.unpricedEventCount} events without a reported dollar charge
+                    </span>
+                  ) : null}
                   <span>
                     Tokens {formatTokens(issueTreeCostTokens)}
                     {issueTreeCostSummary.cachedInputTokens > 0

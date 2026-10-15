@@ -471,6 +471,16 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(event.inputTokens).toBe(2_732_577);
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(agent?.spentMonthlyCents).toBe(0);
+
+    // A reported zero charge is different from a missing price. Mixed totals
+    // must retain that distinction and apply the same selected date range.
+    await db.insert(costEvents).values([
+      { ...event, id: randomUUID(), costStatus: "reported", costCents: 0 },
+      { ...event, id: randomUUID(), costStatus: "reported", costCents: 125 },
+    ]);
+    expect(await costs.summary(companyId)).toMatchObject({ spendCents: 125, unpricedEventCount: 1 });
+    expect(await costs.summary(companyId, { to: new Date("2026-07-12T00:00:00.000Z") }))
+      .toMatchObject({ spendCents: 0, unpricedEventCount: 0 });
   });
 
   it("aggregates cost event sums above int32 without raising Postgres integer overflow", async () => {
@@ -685,6 +695,12 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       },
     ]);
 
+    await db.insert(costEvents).values({
+      companyId, agentId, issueId: childIssueId, provider: "openai", biller: "openai",
+      billingType: "metered_api", costStatus: "unpriced", model: "gpt-5",
+      inputTokens: 7, cachedInputTokens: 0, outputTokens: 0, costCents: 0,
+      occurredAt: new Date("2026-04-10T00:04:00.000Z"),
+    });
     const summary = await costs.issueTreeSummary(companyId, rootIssueId);
 
     expect(summary).toEqual({
@@ -692,7 +708,8 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       issueCount: 3,
       includeDescendants: true,
       costCents: 600,
-      inputTokens: 60,
+      unpricedEventCount: 1,
+      inputTokens: 67,
       cachedInputTokens: 6,
       outputTokens: 12,
       runCount: 0,

@@ -26,6 +26,7 @@ export interface CostEvent {
 export interface CostSummary {
   companyId: string;
   spendCents: number;
+  unpricedEventCount: number;
   budgetCents: number;
   utilizationPercent: number;
 }
@@ -35,6 +36,7 @@ export interface IssueCostSummary {
   issueCount: number;
   includeDescendants: boolean;
   costCents: number;
+  unpricedEventCount: number;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;

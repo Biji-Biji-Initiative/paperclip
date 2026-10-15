@@ -608,9 +608,9 @@ export function Costs({
 
           <div className="grid gap-3 lg:grid-cols-4">
             <MetricTile
-              label="Inference spend"
+              label="Recorded inference spend"
               value={formatCents(spendData?.summary.spendCents ?? 0)}
-              subtitle={`${formatTokens(inferenceTokenTotal)} tokens across request-scoped events`}
+              subtitle={`${formatTokens(inferenceTokenTotal)} tokens · ${spendData?.summary.unpricedEventCount ?? 0} unpriced events`}
               icon={DollarSign}
             />
             <MetricTile
@@ -689,10 +689,16 @@ export function Costs({
                   <CardHeader className="px-5 pt-5 pb-2">
                     <CardTitle className="text-base">Inference ledger</CardTitle>
                     <CardDescription>
-                      Request-scoped inference spend for the selected period.
+                      Recorded charges for the selected period. Unpriced usage is excluded from dollar totals.
                     </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-4 px-5 pb-5 pt-2">
+                    {(spendData?.summary.unpricedEventCount ?? 0) > 0 ? (
+                      <p className="text-sm text-muted-foreground">
+                        Unpriced usage: {spendData?.summary.unpricedEventCount} events have no reported dollar charge.
+                        {" "}The recorded total is incomplete; these budgets cannot cap unpriced provider spending.
+                      </p>
+                    ) : null}
                     <div className="flex flex-wrap items-end justify-between gap-3">
                       <div>
                         <div className="text-3xl font-semibold tabular-nums">

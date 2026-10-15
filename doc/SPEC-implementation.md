@@ -323,6 +323,7 @@ Invariants:
 - `provider` text not null
 - `model` text not null
 - `cost_status` text not null default `reported`; `unpriced` when usage exists but no price was reported
+- Company and issue-tree summaries include `unpricedEventCount` under the same company, date-range and issue-visibility filters as their totals. Board cost screens identify recorded charges and show missing-price usage explicitly; dollar totals and recorded-charge budget thresholds do not cap unpriced provider spending.
 - `input_tokens` int not null default 0
 - `output_tokens` int not null default 0
 - `cost_cents` int not null
