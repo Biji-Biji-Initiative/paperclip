@@ -139,6 +139,10 @@ RUN find packages/paperclip-runner/runner packages/paperclip-runner/protocol -ty
 # Both the browser bundle and server stamp need the source commit. Declare it
 # after the stable dependency layers, before either application build.
 ARG PAPERCLIP_BUILD_COMMIT=""
+ARG PAPERCLIP_BUILD_VERSION=""
+RUN if [ -n "${PAPERCLIP_BUILD_VERSION}" ] && [ -n "${PAPERCLIP_BUILD_COMMIT}" ]; then \
+      node scripts/stamp-runtime-package-versions.mjs "${PAPERCLIP_BUILD_VERSION}" "${PAPERCLIP_BUILD_COMMIT}"; \
+    fi
 RUN pnpm --filter @paperclipai/ui build
 RUN pnpm --filter @paperclipai/plugin-sdk build
 # The server build runs scripts/write-build-stamp.mjs, which stamps the built
@@ -172,6 +176,11 @@ RUN mkdir -p /provider-pack \
 FROM build AS runtime-app
 RUN find /app -type d -name node_modules -prune -exec rm -rf {} +
 COPY --from=production-deps /app/ /app/
+# The fresh dependency stage contains unstamped manifests. Restore the actual
+# release identities after copying it, without changing the installed graph.
+RUN if [ -n "${PAPERCLIP_BUILD_VERSION}" ] && [ -n "${PAPERCLIP_BUILD_COMMIT}" ]; then \
+      node scripts/stamp-runtime-package-versions.mjs "${PAPERCLIP_BUILD_VERSION}" "${PAPERCLIP_BUILD_COMMIT}"; \
+    fi
 
 FROM base AS github-cli
 # Debian trixie's gh predates the token-disclosure and download fixes. Use
