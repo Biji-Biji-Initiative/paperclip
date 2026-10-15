@@ -1049,6 +1049,9 @@ importers:
       svix:
         specifier: 1.76.1
         version: 1.76.1
+      tsx:
+        specifier: ^4.23.15
+        version: 4.23.15
       ws:
         specifier: ^8.21.3
         version: 8.21.3
@@ -1089,9 +1092,6 @@ importers:
       supertest:
         specifier: ^7.0.0
         version: 7.2.2
-      tsx:
-        specifier: ^4.23.15
-        version: 4.23.15
       typescript:
         specifier: ^7.0.2
         version: 7.0.2

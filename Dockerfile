@@ -160,6 +160,49 @@ RUN mkdir -p /provider-pack \
     echo "Skipping remote provider pack: supply a full PAPERCLIP_BUILD_COMMIT to enable remote OpenCode/ACPX execution"; \
   fi
 
+# Keep the complete build tree for provider-pack generation and the cloud
+# plugin build. Only the app copied into production loses build dependencies.
+FROM build AS runtime-app
+RUN CI=true pnpm install --prod --frozen-lockfile --offline --ignore-scripts
+
+FROM base AS github-cli
+# Debian trixie's gh predates the token-disclosure and download fixes. Use
+# the upstream release, with architecture-specific publisher checksums.
+ARG GH_VERSION=2.102.0
+ARG GH_SHA256_AMD64=bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386
+ARG GH_SHA256_ARM64=7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha256="$GH_SHA256_AMD64" ;; \
+      arm64) sha256="$GH_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /tmp/gh.tar.gz "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+    echo "${sha256}  /tmp/gh.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+    /usr/local/bin/gh --version
+
+FROM base AS openssh-client-build
+# Stable Debian has no fix for CVE-2026-60002 yet. Build the upstream client
+# tools against the same distribution libraries; never ship sshd or a compiler.
+ARG OPENSSH_VERSION=10.6p1
+ARG OPENSSH_SHA256=a9dc9565dffe8640f64d863cd29a32bc4a3dbdec0566a7fc44c5d6ee767d5f39
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends gcc make libc6-dev libssl-dev zlib1g-dev \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /tmp/openssh
+RUN curl -fsSLo source.tar.gz "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-${OPENSSH_VERSION}.tar.gz" \
+  && echo "${OPENSSH_SHA256}  source.tar.gz" | sha256sum -c - \
+  && tar -xzf source.tar.gz --strip-components=1 \
+  && ./configure --prefix=/usr/local --sysconfdir=/etc/ssh --without-pam --without-selinux \
+  && make -j4 ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan ssh-pkcs11-helper ssh-sk-helper \
+  && mkdir -p /client-bin /client-libexec \
+  && install -m 0755 ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan /client-bin/ \
+  && install -m 0755 ssh-pkcs11-helper ssh-sk-helper /client-libexec/ \
+  && /client-bin/ssh -V
+
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
@@ -183,7 +226,14 @@ RUN echo "cli-tools-epoch: ${CLI_TOOLS_CACHE_EPOCH}" \
 COPY scripts/docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-COPY --chown=node:node --from=build /app /app
+COPY --chown=node:node --from=runtime-app /app /app
+# Remove the vulnerable distribution package as well as replacing the binary;
+# package inventories must describe what the final filesystem actually uses.
+RUN apt-get purge -y gh openssh-client
+COPY --from=github-cli /usr/local/bin/gh /usr/local/bin/gh
+COPY --from=openssh-client-build /client-bin/ /usr/local/bin/
+COPY --from=openssh-client-build /client-libexec/ /usr/local/libexec/
+RUN ssh -V && gh --version && ssh -G github.com > /dev/null
 
 COPY --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
 # Managed deployments can remap node's UID at startup. This immutable pack
