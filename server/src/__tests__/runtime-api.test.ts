@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildRuntimeApiCandidateUrls,
   choosePrimaryRuntimeApiUrl,
+  chooseLocalRunnerApiUrl,
   collectReachableInterfaceHosts,
 } from "../runtime-api.js";
 
@@ -154,5 +155,18 @@ describe("runtime API discovery", () => {
       "192.168.6.178",
       "fd7a:115c:a1e0::8a3a:a11d",
     ]);
+  });
+});
+
+// Local PRP must reach this listener even when board and remote-agent APIs use a public ingress.
+describe("local runner API discovery", () => {
+  it.each([
+    ["0.0.0.0", "http://127.0.0.1:3102"],
+    ["::", "http://[::1]:3102"],
+    ["::1", "http://[::1]:3102"],
+    ["127.0.0.1", "http://127.0.0.1:3102"],
+    ["192.168.1.20", "http://192.168.1.20:3102"],
+  ])("uses the bound listener for %s", (bindHost, expected) => {
+    expect(chooseLocalRunnerApiUrl({ bindHost, port: 3102 })).toBe(expected);
   });
 });

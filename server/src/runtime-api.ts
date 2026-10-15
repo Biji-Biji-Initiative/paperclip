@@ -46,6 +46,15 @@ function pushCandidate(
   }
 }
 
+// Same-process runners use the bound listener, independently of the public
+// origin chosen for board links and remote agents.
+export function chooseLocalRunnerApiUrl(input: { bindHost: string; port: number }): string {
+  const bindHost = normalizeHost(input.bindHost);
+  const host = bindHost === "::" ? "::1"
+    : !bindHost || bindHost === "0.0.0.0" ? "127.0.0.1" : bindHost;
+  return formatOrigin("http:", host, input.port);
+}
+
 export function choosePrimaryRuntimeApiUrl(input: {
   authPublicBaseUrl?: string | null;
   allowedHostnames: string[];

@@ -178,3 +178,7 @@ retained only for earlier-image rehearsal until an identified rebuild qualifies.
 Server TypeScript checking passes. UBS directly scanned the auth module and
 retains the same three boolean-comparison false positives described above,
 with zero warnings and17 informational items.
+
+### Local runner control-plane origin
+
+A private native proposal rehearsal reached neither the AI provider nor a saved artifact: local PRP commands timed out while the runner repeatedly received WebSocket HTTP 502 responses from the public ingress. The registered local authority had zero connections and all commands remained pending. Startup had incorrectly reused the public/remote-agent API origin for same-process runner control. The PRP listener now derives its local URL from the actual bind host and selected port, including IPv6-only listeners. Board and remote-agent API discovery retain their existing public origin. Focused runtime URL and PRP route tests cover the listener mapping; a live private rerun is required before this change qualifies for production.
