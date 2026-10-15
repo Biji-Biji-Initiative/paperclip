@@ -9304,6 +9304,10 @@ export function nativeUsageCostUsd(
   // reports actual cost cumulatively. Until it carries an authoritative run
   // delta with provenance, neither value is a candidate's billed USD receipt.
   if (provider?.kind === "acpx" && ["cursor", "copilot", "pi"].includes(provider.agent)) return undefined;
+  // Codex reports token usage, not an authoritative billed-USD receipt. The
+  // normalized PRP projection fills absent cost with zero; treating it as a
+  // receipt would label a paid API run free and defeat billed-cent budgets.
+  if (provider?.kind === "codex") return undefined;
   if (!usage) return undefined;
   const measurement = nativeUsageMeasurement(usage);
   const direct =

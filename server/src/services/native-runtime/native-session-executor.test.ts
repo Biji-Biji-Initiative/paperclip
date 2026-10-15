@@ -978,6 +978,13 @@ describe("native incomplete-bootstrap evidence", () => {
 });
 
 describe("native provider usage normalization", () => {
+  it("keeps normalized Codex cost unknown when tokens were billed without a USD receipt", () => {
+    const provider = { kind: "codex", model: "gpt-6.1-sol" } as NativeExecutionInput["provider"];
+    const usage = { inputTokens: 258693, cachedInputTokens: 227658, outputTokens: 2612, costUsd: 0 };
+    expect(normalizeNativeUsage(usage)).toMatchObject({ inputTokens: 258693, outputTokens: 2612 });
+    expect(nativeUsageCostUsd(usage, provider)).toBeUndefined();
+  });
+
   it.each([["cursor", "cursor"], ["copilot", "github"], ["pi", "openrouter"]] as const)("keeps %s cost unknown and attributes its actual biller", (agent, biller) => {
     const provider = { kind: "acpx", agent, model: "exact-model" } as NativeExecutionInput["provider"];
     expect(nativeUsageBiller(provider)).toBe(biller);
