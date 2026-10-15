@@ -77,3 +77,11 @@ provider secret, required SSO, closed signup and disabled scheduled heartbeats.
 Recovery stays off by default. Coolify's source-commit build setting must be
 explicitly enabled, and the resulting image identity qualified before rollout.
 Compose rendering passes with fixture values and no daemon or deployment writes.
+
+## Express route-pattern bound
+
+`path-to-regexp` 8.3.0 → 8.4.0 is restricted to 8.x and addresses
+[GHSA-j3q9-mxjg-w52f](https://github.com/advisories/GHSA-j3q9-mxjg-w52f).
+The actual Express router dependency now rejects 32 sequential optional groups
+before exponential expansion; normal company-scoped routes still match. Thirty
+focused dependency, authentication-route and MCP HTTP tests pass.
