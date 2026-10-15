@@ -39,3 +39,13 @@ BalancedPool TLS and cache-origin isolation. The override is restricted to 8.x;
 no untested cross-major upgrade is applied to the older Cursor SDK transport.
 The application's jsdom consumers pass all 57 targeted UI tests. The production
 source audit now reports **0 critical and 10 high** advisories (6 low, 28 moderate).
+
+## Sharp native image security patch
+
+`sharp` 0.35.4 → 0.35.5 includes librsvg 2.63.2 for
+[GHSA-wq5f-xc86-pv6w](https://github.com/advisories/GHSA-wq5f-xc86-pv6w).
+The installed native library reports Sharp 0.35.5, librsvg 2.63.2 and
+libvips 8.18.7. Avatar, Telegram photo and Teams inline-image tests pass
+(58 tests). The production source audit reports 0 critical, 9 high,
+28 moderate and 6 low advisories. The pending image build predates this patch;
+only a subsequent identified rebuild will include it.
