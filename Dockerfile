@@ -56,8 +56,10 @@ FROM deps AS production-deps
 # Reinstall into a fresh virtual store. Filtering an existing workspace install
 # removes dev links but leaves orphaned development binaries in node_modules.
 # This stage retains deps' offline content store and needs no new resolution.
+# The UI is already a compiled static bundle. Its editor's optional compiler
+# peers belong in the build stage; all other runtime workspace roots remain.
 RUN find /app -type d -name node_modules -prune -exec rm -rf {} + \
-  && CI=true pnpm install --prod --frozen-lockfile --offline --ignore-scripts
+  && CI=true pnpm --filter '!@paperclipai/ui' install --prod --frozen-lockfile --offline --ignore-scripts
 
 FROM base AS rust-toolchain
 ENV CARGO_BUILD_JOBS=4
