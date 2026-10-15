@@ -118,3 +118,19 @@ The Paperclip tools fixture omitted the shared input schema's pre-existing
 allowDuplicate=false default; its expected POST body now includes that safe
 default. This was an existing fixture mismatch, not a relaxation of duplicate
 protection. MCP package TypeScript checking passes.
+
+## Cursor SDK transport update and current audit
+
+`@cursor/sdk` 1.0.28 → 1.0.37 is the current stable patch on the same 1.0 line.
+The upstream package metadata removes @connectrpc/connect-node, eliminating its
+old Undici 5.x / busboy transport chain instead of forcing a cross-major
+transitive override. The Node requirement remains >=22.13 (image runtime:24).
+The actual SDK exports used by the adapter load successfully with network access
+disabled. All21 focused Cursor Cloud adapter tests and its TypeScript check pass.
+These are compatibility checks, not an authenticated Cursor Cloud run.
+
+The final production source audit now reports **0critical, 0high, 19moderate and
+3low** advisories. This describes the resolved source graph, not the older running
+image or every globally installed CLI/OS package. Remaining findings and actual
+image/runtime qualification are separate work. A frozen install and final
+self-hosted image rehearsal remain required before rollout.
