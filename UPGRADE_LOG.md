@@ -134,3 +134,17 @@ The final production source audit now reports **0critical, 0high, 19moderate and
 image or every globally installed CLI/OS package. Remaining findings and actual
 image/runtime qualification are separate work. A frozen install and final
 self-hosted image rehearsal remain required before rollout.
+
+## Failure-path release qualification
+
+The signed OIDC fixture now enforces the submitted PKCE verifier and consumes
+codes once. Twenty PostgreSQL/auth tests pass with
+PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS=true (unsupported PostgreSQL is a hard
+failure for this gate). Negative/transition cases include invalid signature,
+expiry, nonce/state/cookies, non-boolean verification claims, direct-token and
+callback replay, concurrent identities, transactional audit failure, session
+persistence failure with idempotent retry, and copied-cookie expiry/revocation.
+Browser console diagnostics now omit raw network errors and HTTP response bodies;
+eleven focused auth API tests pass, including marker-based non-disclosure checks.
+The image built from the preceding source snapshot does not gain this frontend
+change without a subsequent identified rebuild.

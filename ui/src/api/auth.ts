@@ -92,9 +92,8 @@ function logAuthNetworkFailure(method: string, path: string, error: unknown) {
     pageHref: typeof window !== "undefined" ? redactUrlSecrets(window.location.href) : "(no window)",
     credentials: "include",
     online: typeof navigator !== "undefined" ? navigator.onLine : "(no navigator)",
-    errorName: error instanceof Error ? error.name : typeof error,
-    errorMessage: error instanceof Error ? error.message : String(error),
-    error,
+    errorName: error instanceof TypeError ? "TypeError"
+      : error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name) ? error.name : "NetworkError",
     hint:
       "This means the browser never got a response from the server. Common causes: " +
       "the page origin differs from the API host (mixed http/https, wrong hostname/port, " +
@@ -103,14 +102,12 @@ function logAuthNetworkFailure(method: string, path: string, error: unknown) {
   });
 }
 
-function logAuthHttpError(method: string, path: string, status: number, statusText: string, body: unknown) {
+function logAuthHttpError(method: string, path: string, status: number) {
   // eslint-disable-next-line no-console
   console.error("[auth] request returned an error status", {
     method,
     requestUrl: resolveAuthUrl(path),
     status,
-    statusText,
-    body,
   });
 }
 
@@ -131,7 +128,7 @@ async function authPost(path: string, body: Record<string, unknown>): Promise<un
   if (!res.ok) {
     const recovery = tenantSessionRecovery.recoverIfNeeded(res.status, payload);
     if (recovery) return recovery;
-    logAuthHttpError("POST", path, res.status, res.statusText, payload);
+    logAuthHttpError("POST", path, res.status);
     throw extractAuthError(payload as AuthErrorBody, res.status);
   }
   return payload;

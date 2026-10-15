@@ -1,7 +1,7 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
-import { authAccounts, authSessions, authUsers, companies, companyMemberships, createDb, instanceUserRoles, principalPermissionGrants } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { activityLog, authAccounts, authSessions, authUsers, companies, companyMemberships, createDb, instanceUserRoles, principalPermissionGrants } from "@paperclipai/db";
 import { authentikAuthOptions, authentikConfiguration } from "../auth/authentik.js";
 import { createBetterAuthInstance } from "../auth/better-auth.js";
 import type { Config } from "../config.js";
@@ -30,6 +30,7 @@ describe("Authentik configuration", () => {
 });
 
 const support = await getEmbeddedPostgresTestSupport();
+if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS === "true") throw new Error("Release qualification requires migrated PostgreSQL tests");
 (support.supported ? describe : describe.skip)("Authentik with real auth library and migrated PostgreSQL", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
@@ -38,20 +39,24 @@ const support = await getEmbeddedPostgresTestSupport();
   const jwk = { ...keys.publicKey.export({ format: "jwk" }), kid: "fixture-key", alg: "RS256", use: "sig" };
   let discoveryOverride: Record<string, unknown> = {};
   let omitIdToken = false;
-  const exchanges = new Map<string, { email: string; verified: boolean; claims: Record<string, unknown>; nonce: string }>();
+  const exchanges = new Map<string, { email: string; verified: boolean; claims: Record<string, unknown>; nonce: string; challenge: string; corruptVerifier: boolean }>();
+  let exchangeCounter = 0;
   const subjects = new Map<string, string>();
   function subjectFor(email: string) {
     if (!subjects.has(email)) subjects.set(email, randomUUID());
     return subjects.get(email)!;
   }
   function tokenFor(email: string, verified = true, extra: Record<string, unknown> = {}) {
+    const { fixtureBadSignature, ...claimsExtra } = extra;
     const header = Buffer.from(JSON.stringify({ alg: "RS256", kid: "fixture-key" })).toString("base64url");
     const claims = Buffer.from(JSON.stringify({ iss: issuer, aud: "factory-fixture", sub: subjectFor(email), email,
-      email_verified: verified, name: "Fixture Staff", iat: Math.floor(Date.now()/1000), exp: Math.floor(Date.now()/1000)+120, ...extra })).toString("base64url");
+      email_verified: verified, name: "Fixture Staff", iat: Math.floor(Date.now()/1000), exp: Math.floor(Date.now()/1000)+120, ...claimsExtra })).toString("base64url");
     const data = header + "." + claims;
-    return data + "." + sign("RSA-SHA256", Buffer.from(data), keys.privateKey).toString("base64url");
+    const signature = sign("RSA-SHA256", Buffer.from(data), keys.privateKey);
+    if (fixtureBadSignature) signature[0] ^= 1;
+    return data + "." + signature.toString("base64url");
   }
-  async function login(email: string, verified = true, claims: Record<string, unknown> = {}, instance = auth, linkingCookie?: string) {
+  async function login(email: string, verified = true, claims: Record<string, unknown> = {}, instance = auth, linkingCookie?: string, flow: { state?: string; omitCookie?: boolean; corruptVerifier?: boolean; replay?: boolean } = {}) {
     const start = await instance.handler(new Request(origin + "/api/auth/" + (linkingCookie ? "link-social" : "sign-in/social"), {
       method: "POST", headers: { "Content-Type": "application/json", Origin: origin, ...(linkingCookie ? { Cookie: linkingCookie } : {}) },
       body: JSON.stringify({ provider: "authentik", callbackURL: "/SSO/issues", errorCallbackURL: "/auth", disableRedirect: true }),
@@ -62,14 +67,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(nonce).toBeTruthy();
     expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
     expect(authorize.searchParams.get("code_challenge")).toBeTruthy();
-    const code = "exchange-" + exchanges.size;
-    exchanges.set(code, { email, verified, claims, nonce: nonce ?? "" });
+    const code = "exchange-" + exchangeCounter++;
+    exchanges.set(code, { email, verified, claims, nonce: nonce ?? "", challenge: authorize.searchParams.get("code_challenge") ?? "", corruptVerifier: flow.corruptVerifier ?? false });
     const cookie = start.headers.getSetCookie().map((v) => v.split(";")[0]).join("; ");
-    const callback = await instance.handler(new Request(origin + "/api/auth/callback/authentik?code=" + code + "&state=" + encodeURIComponent(authorize.searchParams.get("state") ?? ""), { headers: { Cookie: cookie + (linkingCookie ? "; " + linkingCookie : "") } }));
+    const callbackUrl = origin + "/api/auth/callback/authentik?code=" + code + "&state=" + encodeURIComponent(flow.state ?? authorize.searchParams.get("state") ?? "");
+    const headers = { Cookie: flow.omitCookie ? "" : cookie + (linkingCookie ? "; " + linkingCookie : "") };
+    let callback = await instance.handler(new Request(callbackUrl, { headers }));
+    if (flow.replay) callback = await instance.handler(new Request(callbackUrl, { headers }));
     const location = new URL(callback.headers.get("location") ?? "/auth?error=missing_redirect", origin);
     // Preserve the actual callback cookies, but make failed redirects explicit
     // to each assertion rather than treating every HTTP302 as authentication.
     return new Response(null, { headers: callback.headers, status: location.searchParams.has("error") ? 401 : callback.status });
+  }
+  async function seedBoundIdentity(userId: string, email: string) {
+    const now = new Date();
+    await db.insert(authUsers).values({ id: userId, email, name: "Bound fixture", emailVerified: true, createdAt: now, updatedAt: now });
+    await db.insert(authAccounts).values({ id: randomUUID(), userId, providerId: "authentik", accountId: subjectFor(email), issuer, createdAt: now, updatedAt: now });
   }
   beforeAll(async () => {
     for (const [key, value] of Object.entries(settings)) vi.stubEnv(key, value);
@@ -83,7 +96,12 @@ const support = await getEmbeddedPostgresTestSupport();
       if (url === issuer + "token") {
         const params = new URLSearchParams(String(init?.body ?? ""));
         const exchange = exchanges.get(params.get("code") ?? "");
-        if (!exchange) throw new Error("Unknown fixture code");
+        if (!exchange) return Response.json({ error: "invalid_grant" }, { status: 400 });
+        exchanges.delete(params.get("code") ?? "");
+        const verifier = exchange.corruptVerifier ? "incorrect-verifier" : params.get("code_verifier");
+        if (!verifier || createHash("sha256").update(verifier).digest("base64url") !== exchange.challenge) {
+          return Response.json({ error: "invalid_grant" }, { status: 400 });
+        }
         return Response.json({ access_token: "fixture-access", token_type: "Bearer", expires_in: 120,
           ...(omitIdToken ? {} : { id_token: tokenFor(exchange.email, exchange.verified, { nonce: exchange.nonce, ...exchange.claims }) }) });
       }
@@ -112,6 +130,38 @@ const support = await getEmbeddedPostgresTestSupport();
     for (const [email, verified, claims] of [["unverified@mereka.my", false, {}], ["wrong-issuer@mereka.my", true, { iss: "https://wrong.fixture/" }], ["wrong-audience@mereka.my", true, { aud: "another-app" }]] as const) {
       expect((await login(email, verified, claims)).status).toBeGreaterThanOrEqual(400);
       expect(await db.select().from(authUsers).where(eq(authUsers.email, email))).toHaveLength(0);
+    }
+  });
+  it("rejects invalid signatures, expiry, nonce and non-boolean verification claims", async () => {
+    const cases = [{ fixtureBadSignature: true }, { exp: Math.floor(Date.now()/1000)-30 }, { nonce: "incorrect-nonce" },
+      { email_verified: undefined }, { email_verified: "true" }, { email_verified: 1 }, { sub: undefined }];
+    for (const [index, claims] of cases.entries()) {
+      const email = "invalid-claims-" + index + "@mereka.my";
+      expect((await login(email, true, claims)).status).toBe(401);
+      expect(await db.select().from(authUsers).where(eq(authUsers.email, email))).toHaveLength(0);
+    }
+  });
+  it("rejects absent/wrong state and PKCE mismatches without provisioning", async () => {
+    for (const [index, flow] of [{ state: "incorrect-state" }, { omitCookie: true }, { corruptVerifier: true }].entries()) {
+      const email = "invalid-flow-" + index + "@mereka.my";
+      expect((await login(email, true, {}, auth, undefined, flow)).status).toBe(401);
+      expect(await db.select().from(authUsers).where(eq(authUsers.email, email))).toHaveLength(0);
+    }
+  });
+  it("does not issue a second session when an authorization callback is replayed", async () => {
+    expect((await login("state-replay@mereka.my", true, {}, auth, undefined, { replay: true })).status).toBe(401);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, "state-replay@mereka.my"));
+    expect(await db.select().from(authSessions).where(eq(authSessions.userId, user.id))).toHaveLength(1);
+  });
+  it("keeps concurrent callback identities isolated", async () => {
+    const emails = ["parallel-a@mereka.my", "parallel-b@mereka.my"];
+    expect((await Promise.all(emails.map((email) => login(email)))).map((result) => result.status)).toEqual([302, 302]);
+    for (const email of emails) {
+      const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+      const [account] = await db.select().from(authAccounts).where(eq(authAccounts.userId, user.id));
+      const [membership] = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id));
+      expect(account.accountId).toBe(subjectFor(email));
+      expect(membership.companyId).toBe(companyId);
     }
   });
   it("completes the code flow with PKCE/nonce and invalidates the session on logout", async () => {
@@ -191,6 +241,52 @@ const support = await getEmbeddedPostgresTestSupport();
     const before = authentikAuthOptions(db, origin, settings).databaseHooks?.session?.create?.before;
     if (!before) throw new Error("Missing staff session gate");
     await expect(before({ userId: "unverified-context" } as never, { path: "/callback/authentik" } as never)).rejects.toThrow(/receipt/);
+  });
+
+  it("rolls membership, initial grant and audit back together when audit persistence fails", async () => {
+    const userId = "audit-rollback-user";
+    const email = "audit-rollback@mereka.my";
+    await seedBoundIdentity(userId, email);
+    // This is the suite's isolated migrated database, never a runtime database.
+    await db.execute(sql`ALTER TABLE activity_log ADD CONSTRAINT fixture_reject_staff_audit CHECK (entity_id <> 'audit-rollback-user')`);
+    try {
+      expect((await login(email)).status).toBe(401);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId))).toHaveLength(0);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId))).toHaveLength(0);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, userId))).toHaveLength(0);
+    } finally { await db.execute(sql`ALTER TABLE activity_log DROP CONSTRAINT fixture_reject_staff_audit`); }
+    expect((await login(email)).status).toBe(302);
+    expect((await login(email)).status).toBe(302);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, userId))).toHaveLength(1);
+    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId))).toHaveLength(1);
+  });
+  it("retries idempotently after session persistence fails after membership commits", async () => {
+    const userId = "session-failure-user";
+    const email = "session-failure@mereka.my";
+    await seedBoundIdentity(userId, email);
+    await db.execute(sql`ALTER TABLE session ADD CONSTRAINT fixture_reject_staff_session CHECK (user_id <> 'session-failure-user')`);
+    try {
+      expect((await login(email)).status).toBe(401);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId))).toHaveLength(1);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, userId))).toHaveLength(0);
+    } finally { await db.execute(sql`ALTER TABLE session DROP CONSTRAINT fixture_reject_staff_session`); }
+    expect((await login(email)).status).toBe(302);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, userId))).toHaveLength(1);
+    expect(await db.select().from(authAccounts).where(eq(authAccounts.userId, userId))).toHaveLength(1);
+    expect(await db.select().from(authSessions).where(eq(authSessions.userId, userId))).toHaveLength(1);
+  });
+  it("does not slide session expiry and rejects a copied cookie after expiry", async () => {
+    const callback = await login("fixed-expiry@mereka.my");
+    const cookie = callback.headers.getSetCookie().map((v) => v.split(";")[0]).join("; ");
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, "fixed-expiry@mereka.my"));
+    const expiresAt = new Date(Date.now() + 30_000);
+    await db.update(authSessions).set({ createdAt: new Date(Date.now()-172800_000), expiresAt }).where(eq(authSessions.userId, user.id));
+    const request = () => auth.handler(new Request(origin + "/api/auth/get-session", { headers: { Cookie: cookie } }));
+    expect((await (await request()).json()).user.id).toBe(user.id);
+    const [session] = await db.select().from(authSessions).where(eq(authSessions.userId, user.id));
+    expect(session.expiresAt.getTime()).toBe(expiresAt.getTime());
+    await db.update(authSessions).set({ expiresAt: new Date(Date.now()-1000) }).where(eq(authSessions.userId, user.id));
+    expect(await (await request()).json()).toBeNull();
   });
 
   it("preserves a suspended membership and refuses a new session", async () => {

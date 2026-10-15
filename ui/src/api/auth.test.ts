@@ -10,6 +10,20 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("auth diagnostics", () => {
+  it("keeps response bodies and raw network errors out of console logs", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const marker = "sensitive-fixture-not-a-real-credential";
+    const signIn = () => authApi.signInEmail({ email: "fixture@example.test", password: marker });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json({ message: "Authentication failed", details: marker }, { status: 401 })));
+    await expect(signIn()).rejects.toThrow();
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error(marker)));
+    await expect(signIn()).rejects.toThrow();
+    expect(JSON.stringify(log.mock.calls)).not.toContain(marker);
+    expect(JSON.stringify(log.mock.calls)).toContain("401");
+  });
+});
+
 describe("authApi.getSession", () => {
   it("returns null for an ordinary local 401", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
