@@ -33,6 +33,14 @@ use crate::provider_events::{
     NormalizedProviderEvent,
 };
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
+use crate::subscription_auth_hold::{self, HeldTurn, ProtectedSubscription, SubscriptionAuthHold};
+
+fn codex_native_error(error: impl std::fmt::Display, context: &str) -> DurableRunnerError {
+    subscription_auth_hold::native_error(
+        crate::codex_external_auth::selected().then_some(ProtectedSubscription::Codex),
+        error, context,
+    )
+}
 
 const PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.codex-provider-state.v1";
 pub const CODEX_PROVIDER_STATE_FILE: &str = "codex-provider-state.json";
@@ -1488,9 +1496,90 @@ pub struct CodexCommandExecutor {
     opencode_launch_profile: Option<OpenCodeLaunchProfile>,
     startup_command: Option<ProviderStartupCommand>,
     startup_evidence_error: Option<DurableRunnerError>,
+    subscription_hold: Option<SubscriptionAuthHold>,
+    subscription_hold_committed: bool,
 }
 
 impl CodexCommandExecutor {
+    fn check_subscription_lifetime(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold { return Err(DurableRunnerError::subscription_auth(hold)); }
+        if let Some(provider) = self.provider.as_mut() {
+            provider.check_external_auth_live().map_err(|error| codex_native_error(error, "Codex subscription lifetime check failed"))?;
+        }
+        Ok(())
+    }
+
+    /// Retain failure before cleanup, using only this executor's in-memory
+    /// authority. Never restore a provider to manufacture terminal evidence.
+    pub(crate) fn record_subscription_auth_hold(&mut self, hold: SubscriptionAuthHold) -> Result<(), DurableRunnerError> {
+        if hold.selected() != ProtectedSubscription::Codex {
+            return Err(DurableRunnerError::invalid("subscription hold provider mismatch"));
+        }
+        let hold = *self.subscription_hold.get_or_insert(hold);
+        if self.subscription_hold_committed { return Ok(()); }
+        let committed: Result<(), DurableRunnerError> = (|| {
+            if let Some(error) = &self.startup_evidence_error { return Err(error.clone()); }
+            if let Some(mut next) = self.state.clone() {
+                if next.active_provider_turn_id.is_some() || next.ambiguous_turn_start_pending {
+                    let identity = self.event_identity()?;
+                    let events = hold.terminal_events(&HeldTurn {
+                        run_id: &identity.run_id,
+                        normalized_session_id: &identity.normalized_session_id,
+                        turn_id: &identity.turn_id, item_id: &identity.item_id,
+                        provider_turn_id: next.active_provider_turn_id.as_deref(),
+                        provider_session_id: next.thread_id.as_deref(),
+                    });
+                    next.extend_terminal_events(events)?;
+                }
+                // Preserve active/ambiguous identity, startup receipts and tool
+                // receipts for cleanup. Failure is not a provider completion.
+                next.lifecycle = "reconciliation_required".into();
+                next.completed_turn_authoritative = false;
+                next.completed_turn_process_generation = None;
+                next.completed_provider_turn_id = None;
+                self.persist_state(&next)?;
+                self.state = Some(next);
+            }
+            self.subscription_hold_committed = true;
+            Ok(())
+        })();
+        if let Err(error) = &committed {
+            // An uncertain rename/fsync remains a fence, not an empty drain.
+            self.startup_evidence_error = Some(error.clone());
+        }
+        self.retire_subscription_provider();
+        // A failed save leaves the original state and persistence-error latch
+        // untouched. Return the fixed primary cause, not raw secondary details.
+        committed.map_err(|_| DurableRunnerError::subscription_auth(hold))
+    }
+
+    fn retire_subscription_provider(&mut self) {
+        // This exact owned child can be retired without an auth RPC. Even a
+        // direct-child exit does not prove the worker namespace is empty.
+        let reaped = self.provider.as_mut()
+            .is_some_and(|provider| provider.retire_failed_startup().is_some());
+        if reaped { self.provider = None; }
+    }
+
+    fn subscription_hold_control(&mut self, command: &Command, hold: SubscriptionAuthHold) -> Result<CommandExecution, DurableRunnerError> {
+        self.record_subscription_auth_hold(hold)?;
+        if command.command_type == "runner.drain" {
+            return Ok(CommandExecution::result(json!({"status":"completed"})));
+        }
+        if command.command_type == "session.snapshot" {
+            return Ok(CommandExecution::result(json!({
+                "status":"held", "error":hold.fields(), "warmAttachReady":false,
+                "providerExitConfirmed":false, "ownershipUnverified":true,
+            })));
+        }
+        if subscription_auth_hold::cleanup_command(&command.command_type) {
+            self.retire_subscription_provider();
+        }
+        // Cleanup is attempted, but no stop/checkpoint command receives a
+        // successful lease-release or successor-admission receipt from this.
+        Err(DurableRunnerError::subscription_auth(hold))
+    }
+
     pub fn new(state_dir: impl Into<PathBuf>) -> Self {
         Self {
             state_dir: state_dir.into(),
@@ -1502,6 +1591,8 @@ impl CodexCommandExecutor {
             opencode_launch_profile: None,
             startup_command: None,
             startup_evidence_error: None,
+            subscription_hold: None,
+            subscription_hold_committed: false,
         }
     }
 
@@ -1684,10 +1775,7 @@ impl CodexCommandExecutor {
             provider
         })
         .map_err(|error| {
-            DurableRunnerError::invalid(format!(
-                "failed to start {} provider: {error}",
-                state.config.provider
-            ))
+            codex_native_error(error, &format!("failed to start {} provider", state.config.provider))
         })
     }
 
@@ -1829,9 +1917,7 @@ impl CodexCommandExecutor {
         let mut provider = self
             .start_observed_provider(ProviderStartupTrigger::Restore, process_generation)
             .map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to resume {provider_name} provider: {error}"
-                ))
+                error.with_context(format!("failed to resume {provider_name} provider"))
             })?;
         let admission = (|| -> Result<(), DurableRunnerError> {
             provider.enable_durable_tool_call_replays();
@@ -2315,7 +2401,7 @@ impl CodexCommandExecutor {
             let mut provider = self
                 .start_observed_provider(ProviderStartupTrigger::Ensure, process_generation)
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!("failed to start Codex provider: {error}"))
+                    error.with_context("failed to start Codex provider")
                 })?;
             let admission = (|| -> Result<(), DurableRunnerError> {
                 provider.enable_durable_tool_call_replays();
@@ -2547,9 +2633,7 @@ impl CodexCommandExecutor {
                         }),
                     )
                     .map_err(|error| {
-                        DurableRunnerError::invalid(format!(
-                            "failed to retain Codex for warm run attachment: {error}"
-                        ))
+                        codex_native_error(error, "failed to retain Codex for warm run attachment")
                     })?
         } else if next_state.lifecycle == "prepared"
             && next_state.provider_process_generation > 0
@@ -2569,9 +2653,7 @@ impl CodexCommandExecutor {
         if !retained_provider {
             if let Some(provider) = self.provider.as_mut() {
                 provider.shutdown().map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to checkpoint Codex before attaching a new run: {error}"
-                    ))
+                    codex_native_error(error, "failed to checkpoint Codex before attaching a new run")
                 })?;
             }
             self.provider = None;
@@ -2624,6 +2706,8 @@ impl CodexCommandExecutor {
                 normalize_codex_goal(&snapshot, active_provider_turn_id.is_some()),
             ),
             Err(error) => {
+                let failure = codex_native_error(&error, "Codex goal capability probe failed");
+                if failure.subscription_hold().is_some() { return Err(failure); }
                 let message = error.to_string().to_ascii_lowercase();
                 if message.contains("policy")
                     || message.contains("disabled")
@@ -3023,9 +3107,7 @@ impl CodexCommandExecutor {
                 state.last_agent_message = None;
             }
             self.save_state()?;
-            return Err(DurableRunnerError::invalid(format!(
-                "Codex turn/start failed: {error}"
-            )));
+            return Err(codex_native_error(error, "Codex turn/start failed"));
         }
         let (provider_turn_id, thread_id) = {
             let provider = self
@@ -3110,7 +3192,7 @@ impl CodexCommandExecutor {
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
         self.ensure_provider()?.interrupt_turn().map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
+            codex_native_error(error, "Codex turn interrupt failed")
         })?;
         Ok(CommandExecution::result(json!({
             "status": "interrupt_requested",
@@ -3213,7 +3295,7 @@ impl CodexCommandExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| DurableRunnerError::invalid("turn.steer payload.text is required"))?;
         self.ensure_provider()?.steer_turn(text).map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex turn steer failed: {error}"))
+            codex_native_error(error, "Codex turn steer failed")
         })?;
         Ok(CommandExecution::result(json!({"status": "steered"})))
     }
@@ -3239,7 +3321,7 @@ impl CodexCommandExecutor {
         let (snapshot, working_now) = {
             let provider = self.ensure_provider()?;
             let snapshot = provider.get_goal().map_err(|error| {
-                DurableRunnerError::invalid(format!("Codex thread/goal/get failed: {error}"))
+                codex_native_error(error, "Codex thread/goal/get failed")
             })?;
             (snapshot, provider.active_provider_turn_id().is_some())
         };
@@ -3318,7 +3400,7 @@ impl CodexCommandExecutor {
             let result = provider
                 .set_goal(objective, status, token_budget)
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!("Codex thread/goal/set failed: {error}"))
+                    codex_native_error(error, "Codex thread/goal/set failed")
                 })?;
             (result, provider.active_provider_turn_id().is_some())
         };
@@ -3326,9 +3408,7 @@ impl CodexCommandExecutor {
             result
         } else {
             self.ensure_provider()?.get_goal().map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "Codex thread/goal/get after set failed: {error}"
-                ))
+                codex_native_error(error, "Codex thread/goal/get after set failed")
             })?
         };
         let goal = normalize_codex_goal(&snapshot, working_now).ok_or_else(|| {
@@ -3360,7 +3440,7 @@ impl CodexCommandExecutor {
         self.restore_provider_if_needed()?;
         self.ensure_goal_available()?;
         let result = self.ensure_provider()?.clear_goal().map_err(|error| {
-            DurableRunnerError::invalid(format!("Codex thread/goal/clear failed: {error}"))
+            codex_native_error(error, "Codex thread/goal/clear failed")
         })?;
         let (capability, revision, working_now) = {
             let working_now = self
@@ -3425,9 +3505,7 @@ impl CodexCommandExecutor {
         self.ensure_provider()?
             .resolve_runtime_request(request_id, response)
             .map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "{provider_name} runtime response failed: {error}"
-                ))
+                codex_native_error(error, &format!("{provider_name} runtime response failed"))
             })?;
         Ok(CommandExecution {
             result: json!({"status": "delivered", "requestId": request_id}),
@@ -3746,9 +3824,7 @@ impl CodexCommandExecutor {
                     .expect("provider remains present while handling its tool call")
                     .deliver_tool_result(&result)
                     .map_err(|error| {
-                        DurableRunnerError::invalid(format!(
-                            "failed to replay a durable semantic tool result: {error}"
-                        ))
+                        codex_native_error(error, "failed to replay a durable semantic tool result")
                     })?;
                 return Ok(());
             }
@@ -3847,9 +3923,7 @@ impl CodexCommandExecutor {
                 })?;
         }
         provider.deliver_tool_result(&result).map_err(|error| {
-            DurableRunnerError::invalid(format!(
-                "failed to return semantic tool result to Codex: {error}"
-            ))
+            codex_native_error(error, "failed to return semantic tool result to Codex")
         })?;
         Ok(CommandExecution::result(json!({
             "status": "delivered",
@@ -3860,7 +3934,7 @@ impl CodexCommandExecutor {
     fn close_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
         if let Some(provider) = self.provider.as_mut() {
             provider.shutdown().map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to stop Codex provider: {error}"))
+                codex_native_error(error, "failed to stop Codex provider")
             })?;
         }
         self.provider = None;
@@ -3903,9 +3977,7 @@ impl CodexCommandExecutor {
             .map(|provider| provider.warm_run_attachment_blockers(quiesce_for_warm_attach))
             .transpose()
             .map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to inspect Codex warm attachment readiness: {error}"
-                ))
+                codex_native_error(error, "failed to inspect Codex warm attachment readiness")
             })?
             .unwrap_or_else(|| vec!["provider_unavailable"]);
         let state = self
@@ -3944,6 +4016,11 @@ impl CodexCommandExecutor {
     }
 
     fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            self.record_subscription_auth_hold(hold)?;
+            return Ok(());
+        }
+        self.check_subscription_lifetime()?;
         self.restore()?;
         // `restore_checked` records that the durable file was loaded even when
         // provider recovery failed. Retry the provider reconciliation here so
@@ -3974,14 +4051,19 @@ impl CodexCommandExecutor {
             return self.settle_receipt_limit_interrupt_if_deadline_elapsed();
         }
         for _ in 0..MAX_EVENTS_PER_POLL {
-            let event = self
-                .provider
-                .as_mut()
-                .expect("provider remains present while polling")
-                .poll()
-                .map_err(|error| {
-                    DurableRunnerError::invalid(format!("Codex provider failed: {error}"))
-                })?;
+            let observed = self.provider.as_mut()
+                .expect("provider remains present while polling").poll();
+            let event = match observed {
+                Ok(event) => event,
+                Err(error) => {
+                    let failure = codex_native_error(error, "Codex provider failed");
+                    if let Some(hold) = failure.subscription_hold() {
+                        self.record_subscription_auth_hold(hold)?;
+                        return Ok(());
+                    }
+                    return Err(failure);
+                }
+            };
             let Some(event) = event else { break };
             let trace_frame_id = self
                 .provider
@@ -4444,16 +4526,22 @@ impl CommandExecutor for CodexCommandExecutor {
     fn can_reconcile_result_delivery(&mut self) -> Result<bool, DurableRunnerError> {
         // ProviderToolBridge persists the exact call/result and rejects changed
         // receipts. Delivery cannot execute a server-side semantic operation.
-        Ok(true)
+        Ok(self.subscription_hold.is_none())
     }
 
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            return self.subscription_hold_control(command, hold);
+        }
         self.startup_command = Some(ProviderStartupCommand {
             command_id: command.command_id.clone(),
             controller_seq: command.controller_seq,
             command_type: command.command_type.clone(),
         });
         let outcome = (|| {
+            if !subscription_auth_hold::cleanup_command(&command.command_type) {
+                self.check_subscription_lifetime()?;
+            }
             self.restore()?;
             if self
                 .state
@@ -4526,6 +4614,11 @@ impl CommandExecutor for CodexCommandExecutor {
             }
         })();
         self.startup_command = None;
+        if let Err(error) = &outcome {
+            if let Some(hold) = error.subscription_hold() {
+                self.record_subscription_auth_hold(hold)?;
+            }
+        }
         outcome
     }
 
@@ -4534,7 +4627,11 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
-        self.poll_provider()?;
+        if let Err(error) = self.poll_provider() {
+            if let Some(hold) = error.subscription_hold() {
+                self.record_subscription_auth_hold(hold)?;
+            } else { return Err(error); }
+        }
         self.retained_events()
     }
 
@@ -4552,6 +4649,13 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            return self.record_subscription_auth_hold(hold);
+        }
+        if let Err(error) = self.check_subscription_lifetime() {
+            if let Some(hold) = error.subscription_hold() { return self.record_subscription_auth_hold(hold); }
+            return Err(error);
+        }
         if self.state.as_ref().is_some_and(|state| {
             state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
         }) {
@@ -4584,6 +4688,10 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            self.retire_subscription_provider();
+            return Err(DurableRunnerError::subscription_auth(hold));
+        }
         // Terminal-result recovery can invoke shutdown on a fresh executor.
         // Loading the durable provider identity here ensures that cleanup is
         // attempted against the persisted session instead of reporting a
@@ -4591,7 +4699,7 @@ impl CommandExecutor for CodexCommandExecutor {
         self.restore()?;
         if let Some(provider) = self.provider.as_mut() {
             provider.shutdown().map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to stop Codex provider: {error}"))
+                codex_native_error(error, "failed to stop Codex provider")
             })?;
         }
         self.provider = None;
@@ -4601,12 +4709,16 @@ impl CommandExecutor for CodexCommandExecutor {
     fn reconcile_terminal_delivery(
         &mut self,
     ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        if self.subscription_hold.is_some() {
+            self.retire_subscription_provider();
+            return Ok(TerminalDeliveryReconciliation::ProviderCleanupPending);
+        }
         // A fresh terminal-delivery process has no provider handle. Validate
         // its retained state without starting a provider merely to stop it.
         // If this process already owns a handle, stop only that exact handle.
         if let Some(provider) = self.provider.as_mut() {
             provider.shutdown().map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to stop Codex provider: {error}"))
+                codex_native_error(error, "failed to stop Codex provider")
             })?;
             self.provider = None;
         }
@@ -4632,6 +4744,241 @@ impl CommandExecutor for CodexCommandExecutor {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn subscription_hold_actual_codex_rpc_failures_retain_terminal_and_never_restart() {
+        for case in ["refresh_async", "http401_async", "reflect_async", "refresh_pending", "expiry_async"] {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "provider_backend::tests::subscription_hold_actual_codex_child", "--nocapture"])
+                .env_clear().env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("FACTORY_NATIVE_HOLD_FIXTURE", case).output().unwrap();
+            assert!(child.status.success(), "actual provider fixture {case} failed: {} {}",
+                String::from_utf8_lossy(&child.stdout), String::from_utf8_lossy(&child.stderr));
+        }
+    }
+
+    #[test]
+    fn subscription_hold_actual_codex_child() {
+        let Ok(case) = std::env::var("FACTORY_NATIVE_HOLD_FIXTURE") else { return; };
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use crate::codex_external_auth::{self, ExternalAuthRunBinding, FACTORY_COMPANY_ID};
+        use std::io::Write;
+        let directory = std::env::temp_dir().join(format!("subscription-hold-real-rpc-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        for subdir in ["home", "codex", "workspace", "state"] {
+            fs::create_dir(directory.join(subdir)).unwrap();
+            fs::set_permissions(directory.join(subdir), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::env::set_var("HOME", directory.join("home"));
+        std::env::set_var("CODEX_HOME", directory.join("codex"));
+        std::env::set_var("PAPERCLIP_PROVIDER_TRACE_PATH", directory.join("trace.jsonl"));
+        let now = codex_external_auth::unix_ms().unwrap();
+        let admitted_until = now + if case == "expiry_async" { 15_000 } else { 60_000 };
+        let reference = json!({"schema":"paperclip.codex-external-auth.v1", "authorityId":"fixture-owner", "capabilityId":"fixture-capability",
+            "companyId":FACTORY_COMPANY_ID,"profileRef":"fixture@example.invalid","chatgptAccountId":"fixture-account","chatgptPlanType":"team",
+            "runId":"fixture-run","environmentLeaseId":"fixture-lease","normalizedSessionId":"fixture-session","runnerInstanceId":"fixture-runner",
+            "admittedUntilUnixMs":admitted_until});
+        let token = format!("{}.{}.synthetic-signature-not-an-account-token",
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
+            URL_SAFE_NO_PAD.encode(json!({"exp":(now+120000)/1000,"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account","chatgpt_plan_type":"team"}}).to_string()));
+        let bytes = json!({"reference":reference,"accessToken":token,"accessTokenExpiresAtUnixMs":(now+120000)/1000*1000}).to_string().into_bytes();
+        let (read, mut write) = std::io::pipe().unwrap();
+        let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(read));
+        pipe.set_permissions(fs::Permissions::from_mode(0o600)).unwrap();
+        let sender = std::thread::spawn(move || { write.write_all(&bytes).unwrap(); });
+        codex_external_auth::install_trusted_pipe(pipe, &ExternalAuthRunBinding {
+            run_id:"fixture-run", environment_lease_id:"fixture-lease", normalized_session_id:"fixture-session", runner_instance_id:"fixture-runner",
+        }).unwrap();
+        sender.join().unwrap();
+        let program = directory.join("synthetic-provider.py");
+        let log = directory.join("method-names");
+        fs::write(&program, format!("#!/usr/bin/python3\nSCENARIO={}\nEVENTS={}\n{}", json!(case), json!(log),
+            include_str!("../../../tests/fixtures/codex-external-auth-server.py"))).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executor = CodexCommandExecutor::new(directory.join("state"));
+        executor.event_identity = Some(ProviderEventIdentity { runner_instance_id:"fixture-runner".into(),
+            run_id:"fixture-run".into(), normalized_session_id:"fixture-session".into(), turn_id:"fixture-turn".into(), item_id:"fixture-item".into() });
+        let mut prepare = subscription_hold_command("run.prepare");
+        prepare.payload = json!({"provider":{"provider":"codex","driver":"codex_app_server","providerVersion":"codex-app-server-v1",
+            "command":program,"args":["app-server"],"cwd":directory.join("workspace")}});
+        executor.execute(&prepare).unwrap();
+        let opened = executor.execute(&subscription_hold_command("session.open"));
+        if case == "refresh_pending" {
+            let error = opened.unwrap_err();
+            assert_eq!(error.command_failure_result()["code"], "codex_external_auth_operator_required");
+            assert_eq!(error.command_failure_result()["reason"], "refresh_required");
+            assert!(executor.state.as_ref().unwrap().startup_attempt.as_ref().unwrap().direct_child_exit_observed);
+            assert!(!fs::read_to_string(&log).unwrap().contains("turn/start"));
+        } else {
+            opened.unwrap();
+            let mut start = subscription_hold_command("turn.start");
+            start.payload = json!({"text":"provider-free synthetic fixture"});
+            let accepted = executor.execute(&start).unwrap();
+            assert_eq!(accepted.result["status"], "accepted");
+            assert_eq!(accepted.result["providerTurnId"], "turn-fixture");
+            if case == "expiry_async" {
+                std::thread::sleep(std::time::Duration::from_millis(
+                    admitted_until.saturating_sub(codex_external_auth::unix_ms().unwrap()) + 10));
+                // The expiry check must work without consuming ordinary provider
+                // frames, including while the controller owes earlier ACKs.
+                executor.maintain_backpressured_provider().unwrap();
+            }
+            let mut all = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                let prefix = executor.poll_events().unwrap();
+                all.extend(prefix.clone());
+                executor.acknowledge_events(prefix.len()).unwrap();
+                if all.iter().any(|e: &PolledEvent| e.event_type == "run.terminal") { break; }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let terminal = all.iter().find(|e| e.event_type == "turn.failed").expect("accepted turn must have durable failure");
+            assert_eq!(terminal.payload["providerTurnId"], "turn-fixture");
+            assert_eq!(terminal.payload["providerTerminalObserved"], false);
+            assert_eq!(terminal.payload["providerExitConfirmed"], false);
+            assert_eq!(terminal.payload["error"]["reason"], match case.as_str() {
+                "refresh_async"=>"refresh_required", "http401_async"=>"authentication_rejected", "expiry_async"=>"expired_capability", _=>"provider_reflection",
+            });
+            assert_eq!(all.iter().filter(|e| e.event_type == "run.terminal").count(), 1);
+            assert!(executor.execute(&start).unwrap_err().subscription_hold().is_some());
+            assert_eq!(fs::read_to_string(&log).unwrap().lines().filter(|l| *l == "turn/start").count(), 1);
+        }
+        assert!(executor.provider.is_none());
+        assert_eq!(executor.reconcile_terminal_delivery().unwrap(), TerminalDeliveryReconciliation::ProviderCleanupPending);
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().filter(|l| *l == "initialize").count(), 1);
+        drop(executor);
+        for file in [directory.join("trace.jsonl"), directory.join("state/codex-provider-state.json")] {
+            let text = fs::read_to_string(file).unwrap_or_default();
+            assert!(!text.contains(&token));
+            assert!(!text.contains(&URL_SAFE_NO_PAD.encode(&token)));
+            assert!(!text.contains(&base64::engine::general_purpose::STANDARD.encode(&token)));
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn subscription_hold_fixture(directory: &std::path::Path) -> CodexCommandExecutor {
+        fs::create_dir(directory).unwrap();
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut executor = CodexCommandExecutor::new(directory);
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id:"owned-runner".into(), run_id:"owned-run".into(),
+            normalized_session_id:"owned-session".into(), turn_id:"owned-turn".into(), item_id:"owned-item".into(),
+        });
+        let mut state = opencode_result_state();
+        state.config.provider = "codex".into();
+        state.config.driver = "codex_app_server".into();
+        state.config.provider_version = "codex-app-server-v1".into();
+        state.config.command = PathBuf::from("/usr/bin/false");
+        state.config.args = vec!["app-server".into()];
+        state.config.model = None;
+        state.config.cwd = directory.to_string_lossy().into_owned();
+        state.thread_id = Some("owned-provider-session".into());
+        state.active_provider_turn_id = Some("accepted-once".into());
+        executor.state = Some(state);
+        executor.restore_checked = true;
+        executor.save_state().unwrap();
+        executor
+    }
+    fn subscription_hold_command(kind: &str) -> Command {
+        Command { schema:"paperclip.prp.command.v1".into(), command_id:kind.into(), controller_seq:1,
+            command_type:kind.into(), issued_at:"2026-10-16T00:00:00Z".into(),
+            deadline_at:None, precondition:None, payload:json!({}) }
+    }
+    fn codex_test_hold(reason: &str) -> SubscriptionAuthHold {
+        SubscriptionAuthHold::from_native_error(Some(ProtectedSubscription::Codex),
+            &format!("codex_external_auth_operator_required:{reason}")).unwrap()
+    }
+
+    #[test]
+    fn subscription_hold_codex_persists_accepted_identity_without_success_or_cleanup() {
+        let directory = std::env::temp_dir().join(format!("subscription-hold-codex-{}", uuid::Uuid::new_v4()));
+        let mut executor = subscription_hold_fixture(&directory);
+        // A prior semantic proposal must not turn authentication failure into
+        // success through the ordinary optimistic terminal fallback.
+        let state = executor.state.as_mut().unwrap();
+        state.active_provider_result_fingerprint = Some(format!("sha256:{}", "a".repeat(64)));
+        state.active_provider_result_disposition = Some("done".into());
+        let hold = codex_test_hold("refresh_required");
+        executor.record_subscription_auth_hold(hold).unwrap();
+        let persisted: CodexProviderState = serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        persisted.validate().unwrap();
+        assert_eq!(persisted.lifecycle, "reconciliation_required");
+        assert_eq!(persisted.active_provider_turn_id.as_deref(), Some("accepted-once"));
+        assert!(!persisted.completed_turn_authoritative);
+        assert!(persisted.completed_provider_turn_id.is_none());
+        assert!(!persisted.settled_provider_turn_ids.contains("accepted-once"));
+        let events = executor.poll_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "turn.failed");
+        assert_eq!(events[1].event_type, "run.terminal");
+        for event in &events {
+            assert_eq!(event.payload["error"], hold.fields());
+            assert_eq!(event.payload["providerTurnId"], "accepted-once");
+            assert_eq!(event.payload["runId"], "owned-run");
+            assert_eq!(event.payload["providerTerminalObserved"], false);
+            assert_eq!(event.payload["providerExitConfirmed"], false);
+        }
+        assert_eq!(events[1].payload["runTerminalState"], "failed");
+        executor.record_subscription_auth_hold(codex_test_hold("expired_capability")).unwrap();
+        assert_eq!(executor.retained_events().unwrap(), events);
+        executor.acknowledge_events(2).unwrap();
+        assert!(executor.poll_events().unwrap().is_empty());
+        assert_eq!(executor.reconcile_terminal_delivery().unwrap(), TerminalDeliveryReconciliation::ProviderCleanupPending);
+        for kind in ["turn.start", "run.attach", "turn.steer", "semantic_tool.result", "turn.stop", "runner.shutdown"] {
+            let error = executor.execute(&subscription_hold_command(kind)).unwrap_err();
+            assert_eq!(error.subscription_hold(), Some(hold));
+            assert!(executor.provider.is_none());
+        }
+        assert_eq!(executor.execute(&subscription_hold_command("runner.drain")).unwrap().result["status"], "completed");
+        let snapshot = executor.execute(&subscription_hold_command("session.snapshot")).unwrap();
+        assert_eq!(snapshot.result["warmAttachReady"], false);
+        assert_eq!(snapshot.result["providerExitConfirmed"], false);
+        assert!(!executor.can_reconcile_result_delivery().unwrap());
+        assert!(executor.shutdown().is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subscription_hold_codex_preserves_fifo_through_prefix_acknowledgements() {
+        let directory = std::env::temp_dir().join(format!("subscription-hold-codex-fifo-{}", uuid::Uuid::new_v4()));
+        let mut executor = subscription_hold_fixture(&directory);
+        for index in 0..131 { executor.state.as_mut().unwrap().push_event(NormalizedProviderEvent {
+            event_type:"harness.diagnostic".into(), priority:EventPriority::P1, payload:json!({"index":index}),
+        }).unwrap(); }
+        executor.record_subscription_auth_hold(codex_test_hold("authentication_rejected")).unwrap();
+        let mut events = Vec::new();
+        loop {
+            let prefix = executor.poll_events().unwrap();
+            if prefix.is_empty() { break; }
+            events.extend(prefix.clone());
+            assert_eq!(executor.retained_events().unwrap(), prefix);
+            executor.acknowledge_events(prefix.len()).unwrap();
+        }
+        assert_eq!(events.len(), 133);
+        for (index, event) in events[..131].iter().enumerate() { assert_eq!(event.payload["index"], index); }
+        assert_eq!(events[131].event_type, "turn.failed");
+        assert_eq!(events[132].event_type, "run.terminal");
+        assert_eq!(events.iter().map(|e| &e.executor_event_id).collect::<HashSet<_>>().len(), 133);
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subscription_hold_codex_failed_save_never_becomes_an_empty_successful_drain() {
+        let directory = std::env::temp_dir().join(format!("subscription-hold-codex-write-{}", uuid::Uuid::new_v4()));
+        let mut executor = subscription_hold_fixture(&directory);
+        let previous = executor.state.clone();
+        fs::rename(executor.state_path(), directory.join("retained-before.json")).unwrap();
+        fs::create_dir(executor.state_path()).unwrap();
+        assert!(executor.record_subscription_auth_hold(codex_test_hold("expired_capability")).is_err());
+        assert_eq!(executor.state, previous);
+        assert!(executor.retained_events().is_err());
+        assert!(executor.poll_events().is_err());
+        assert!(executor.execute(&subscription_hold_command("turn.start")).is_err());
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn startup_evidence_save_failure_cannot_become_an_empty_drain_or_admission() {

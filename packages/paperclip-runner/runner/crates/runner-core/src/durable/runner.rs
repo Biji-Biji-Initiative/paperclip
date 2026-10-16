@@ -1629,9 +1629,7 @@ fn poll_executor_events<E: CommandExecutor>(
         Ok(events) => events,
         Err(error) => {
             drain_retained_events(state, store, config, executor).map_err(|secondary| {
-                DurableRunnerError::invalid(format!(
-                    "{error}; retained failure evidence remains uncommitted: {secondary}"
-                ))
+                error.retained_evidence_failed(&secondary)
             })?;
             return Err(error);
         }
@@ -1768,9 +1766,7 @@ fn process_command<E: CommandExecutor>(
             // the non-restoring FIFO is legal here; regular poll can launch.
             // A failed evidence save leaves this command pending/indeterminate.
             drain_retained_events(state, store, config, executor).map_err(|secondary| {
-                DurableRunnerError::invalid(format!(
-                    "{error}; retained failure evidence remains uncommitted: {secondary}"
-                ))
+                error.retained_evidence_failed(&secondary)
             })?;
             // An executor-returned error is a terminal observation, not crash
             // ambiguity. Commit it before replying so recovery can replay the
@@ -1784,10 +1780,7 @@ fn process_command<E: CommandExecutor>(
             ));
             let result = state.fail_command(
                 command,
-                json!({
-                    "code": "command_execution_failed",
-                    "message": message,
-                }),
+                error.command_failure_result(),
             )?;
             store.save(state)?;
             return Ok((result, CommandLifecycle::for_terminal(command)));
@@ -1949,6 +1942,118 @@ fn control_envelope(
 
 #[cfg(test)]
 mod tests {
+
+    struct SubscriptionHoldExecutor {
+        failure: DurableRunnerError,
+        calls: usize,
+        retained: VecDeque<PolledEvent>,
+        acknowledgements: Vec<usize>,
+        fail_ack: bool,
+    }
+    impl CommandExecutor for SubscriptionHoldExecutor {
+        fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+            self.calls += 1;
+            Err(self.failure.clone())
+        }
+        fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+            Ok(self.retained.iter().take(128).cloned().collect())
+        }
+        fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+            panic!("failed-command drain must not poll or restore a provider")
+        }
+        fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
+            if self.fail_ack { return Err(DurableRunnerError::invalid("synthetic ack uncertainty")); }
+            self.acknowledgements.push(count);
+            self.retained.drain(..count);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn subscription_hold_command_result_is_durable_exact_and_never_reexecuted() {
+        use crate::subscription_auth_hold::{native_error, ProtectedSubscription, HOLD_MESSAGE};
+        for selected in [None, Some(ProtectedSubscription::Codex), Some(ProtectedSubscription::Claude)] {
+            let directory = std::env::temp_dir().join(format!("subscription-hold-command-{}", uuid::Uuid::new_v4()));
+            let config = config(directory.clone());
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let code = selected.unwrap_or(ProtectedSubscription::Codex).code();
+            let failure = native_error(selected, format!("{code}:expired_capability"), "native source");
+            let mut executor = SubscriptionHoldExecutor { failure, calls:0, retained:VecDeque::new(), acknowledgements:Vec::new(), fail_ack:false };
+            let request = command("session.open");
+            let (result, lifecycle) = process_command(&mut state, &store, &config, &mut executor, &request).unwrap();
+            assert_eq!(result.status, "failed");
+            assert_eq!(lifecycle, CommandLifecycle::Continue);
+            if selected.is_some() {
+                assert_eq!(result.result, json!({"code":code,"reason":"expired_capability","retryable":false,"operatorRequired":true,"message":HOLD_MESSAGE}));
+            } else {
+                assert_eq!(result.result["code"], "command_execution_failed");
+                assert!(result.result.get("operatorRequired").is_none());
+            }
+            let (mut recovered, _) = store.load_or_create(&config).unwrap();
+            let replay = process_command(&mut recovered, &store, &config, &mut executor, &request).unwrap().0;
+            assert_eq!(replay, result);
+            assert_eq!(executor.calls, 1);
+            let wire = command_result_envelope(&recovered, &replay, 2);
+            assert_eq!(wire["payload"]["result"], result.result);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_hold_command_drains_existing_fifo_before_result_and_preserves_uncertainty() {
+        use crate::subscription_auth_hold::{native_error, ProtectedSubscription};
+        for fail_ack in [false, true] {
+            let directory = std::env::temp_dir().join(format!("subscription-hold-fifo-{}", uuid::Uuid::new_v4()));
+            let mut config = config(directory.clone());
+            config.max_outbox_bytes = 1024 * 1024;
+            let store = DurableStateStore::new(&directory).unwrap();
+            let (mut state, _) = store.load_or_create(&config).unwrap();
+            let mut executor = SubscriptionHoldExecutor {
+                failure:native_error(Some(ProtectedSubscription::Codex), "codex_external_auth_operator_required:refresh_required", "poll"),
+                calls:0, acknowledgements:Vec::new(), fail_ack,
+                retained:(0..131).map(|index| PolledEvent {
+                    executor_event_id:format!("held-prefix-{index}"), event_type:"harness.diagnostic".into(),
+                    priority:EventPriority::P0, payload:json!({"index":index}),
+                }).collect(),
+            };
+            let request = command("turn.steer");
+            let result = process_command(&mut state, &store, &config, &mut executor, &request);
+            let (mut recovered, _) = store.load_or_create(&config).unwrap();
+            assert_eq!(recovered.outbox.len(), if fail_ack {128} else {131});
+            for (index, event) in recovered.outbox.iter().enumerate() { assert_eq!(event.envelope["payload"]["payload"]["index"], index); }
+            if fail_ack {
+                assert_eq!(result.err().unwrap().subscription_hold().unwrap().fields()["reason"], "refresh_required");
+                assert_eq!(recovered.processed_commands[&request.command_id].status, "indeterminate");
+            } else {
+                assert_eq!(result.unwrap().0.result["reason"], "refresh_required");
+                assert_eq!(executor.acknowledgements, [128,3]);
+            }
+            let replay = process_command(&mut recovered, &store, &config, &mut executor, &request).unwrap().0;
+            assert_eq!(executor.calls, 1);
+            assert_eq!(replay.status, if fail_ack {"indeterminate"} else {"failed"});
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_hold_malformed_cause_is_generic_without_provider_text_persistence() {
+        use crate::subscription_auth_hold::{native_error, ProtectedSubscription};
+        let directory = std::env::temp_dir().join(format!("subscription-hold-invalid-{}", uuid::Uuid::new_v4()));
+        let config = config(directory.clone());
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = SubscriptionHoldExecutor {
+            failure:native_error(Some(ProtectedSubscription::Codex), "codex_external_auth_operator_required:refresh_required appended-synthetic-private-value", "poll"),
+            calls:0, retained:VecDeque::new(), acknowledgements:Vec::new(), fail_ack:false,
+        };
+        let result = process_command(&mut state, &store, &config, &mut executor, &command("session.open")).unwrap().0;
+        assert_eq!(result.result["code"], "command_execution_failed");
+        let saved = fs::read_to_string(directory.join("runner-state.json")).unwrap();
+        assert!(!saved.contains("appended-synthetic-private-value"));
+        assert!(!saved.contains("refresh_required"));
+        fs::remove_dir_all(directory).unwrap();
+    }
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;

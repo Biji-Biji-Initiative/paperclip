@@ -319,7 +319,7 @@ impl AcpxProviderSession {
             Ok(value) => value,
             Err(error) => {
                 let cleanup = transport.shutdown();
-                return Err(with_cleanup_error(error, cleanup));
+                return Err(with_cleanup_error(error, cleanup, factory_binding.is_some()));
             }
         };
         Ok(Self {
@@ -931,7 +931,7 @@ impl AcpxProviderSession {
         let terminate = self.terminate_transport();
         match (close, terminate) {
             (Ok(_), Ok(())) => Ok(()),
-            (Err(error), cleanup) => Err(with_cleanup_error(error, cleanup)),
+            (Err(error), cleanup) => Err(with_cleanup_error(error, cleanup, self.factory_binding.is_some())),
             (Ok(_), Err(error)) => Err(error),
         }
     }
@@ -1048,7 +1048,7 @@ impl AcpxProviderSession {
             self.transport = replacement;
             self.transport_terminated = false;
         }
-        with_cleanup_error(error, cleanup)
+        with_cleanup_error(error, cleanup, self.factory_binding.is_some())
     }
 
     fn ensure_active_turn(&self) -> Result<&str, LocalRunnerError> {
@@ -1079,7 +1079,7 @@ impl AcpxProviderSession {
 
     fn fail_closed(&mut self, error: LocalRunnerError) -> LocalRunnerError {
         self.closed = true;
-        with_cleanup_error(error, self.terminate_transport())
+        with_cleanup_error(error, self.terminate_transport(), self.factory_binding.is_some())
     }
 }
 
@@ -1520,7 +1520,17 @@ fn validate_input_resolution(
 fn with_cleanup_error(
     error: LocalRunnerError,
     cleanup: Result<(), LocalRunnerError>,
+    factory_selected: bool,
 ) -> LocalRunnerError {
+    // Keep the native cause intact before a generic string wrapper erases it.
+    // Cleanup has already been attempted; the exact transport-owned flags and
+    // provider_exit_unconfirmed state remain authoritative. This is not proof
+    // that cleanup succeeded, and cannot grant a replacement process or lease.
+    if factory_selected && crate::subscription_auth_hold::SubscriptionAuthHold::from_native_error(
+        Some(crate::subscription_auth_hold::ProtectedSubscription::Claude), &error.to_string(),
+    ).is_some() {
+        return error;
+    }
     match cleanup {
         Ok(()) => error,
         Err(cleanup) => LocalRunnerError::invalid(format!(
@@ -1531,6 +1541,23 @@ fn with_cleanup_error(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn subscription_hold_cleanup_wrapper_retains_only_complete_native_protected_cause() {
+        use super::*;
+        let cause = "factory_claude_access_unverified:expired_capability";
+        let protected = with_cleanup_error(LocalRunnerError::invalid(cause),
+            Err(LocalRunnerError::invalid("synthetic-cleanup-private-details")), true);
+        assert_eq!(protected.to_string(), cause);
+        let generic = with_cleanup_error(LocalRunnerError::invalid(cause),
+            Err(LocalRunnerError::invalid("generic-cleanup-error")), false);
+        assert_eq!(generic.to_string(), format!("{cause}; ACPX sidecar cleanup also failed: generic-cleanup-error"));
+        let malformed = with_cleanup_error(LocalRunnerError::invalid(format!("{cause} appended-provider-text")),
+            Err(LocalRunnerError::invalid("cleanup-failed")), true);
+        assert!(crate::subscription_auth_hold::SubscriptionAuthHold::from_native_error(
+            Some(crate::subscription_auth_hold::ProtectedSubscription::Claude), &malformed.to_string()).is_none());
+        assert_eq!(with_cleanup_error(LocalRunnerError::invalid("generic cause"), Ok(()), false).to_string(), "generic cause");
+    }
     #[test]
     fn turn_controls_require_exact_live_pi_capability_fields() {
         use super::*;

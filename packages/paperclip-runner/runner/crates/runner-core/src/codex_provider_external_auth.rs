@@ -41,7 +41,7 @@ impl CodexProvider {
         LocalRunnerError::invalid(failure.to_string())
     }
 
-    pub(super) fn check_external_auth_live(&mut self) -> Result<(), LocalRunnerError> {
+    pub(crate) fn check_external_auth_live(&mut self) -> Result<(), LocalRunnerError> {
         if let Some(Err(ExternalAuthHold(reason))) =
             self.external_auth.as_ref().map(|auth| auth.check_live())
         {

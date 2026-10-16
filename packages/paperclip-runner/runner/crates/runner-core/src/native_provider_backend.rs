@@ -11,11 +11,22 @@ use crate::managed_provider_backend::{
     ManagedProviderCommandExecutor, MANAGED_PROVIDER_STATE_FILE,
 };
 use crate::provider_backend::{CodexCommandExecutor, CODEX_PROVIDER_STATE_FILE};
+use crate::subscription_auth_hold::{self, ProtectedSubscription, SubscriptionAuthHold};
 
 enum SelectedExecutor {
     LocalFacade(CodexCommandExecutor),
     Acpx(AcpxCommandExecutor),
     Managed(ManagedProviderCommandExecutor),
+}
+
+impl SelectedExecutor {
+    fn record_subscription_auth_hold(&mut self, hold: SubscriptionAuthHold) -> Result<(), DurableRunnerError> {
+        match self {
+            Self::LocalFacade(executor) => executor.record_subscription_auth_hold(hold),
+            Self::Acpx(executor) => executor.record_subscription_auth_hold(hold),
+            Self::Managed(_) => Err(DurableRunnerError::invalid("subscription hold provider mismatch")),
+        }
+    }
 }
 
 impl CommandExecutor for SelectedExecutor {
@@ -104,9 +115,29 @@ pub struct NativeProviderCommandExecutor {
     factory_claude: Option<crate::claude_external_auth::ClaudeIngress>,
     factory_authority: Option<crate::claude_external_auth::FactoryAuthority>,
     factory_plan: Option<String>,
+    subscription_hold: Option<SubscriptionAuthHold>,
 }
 
 impl NativeProviderCommandExecutor {
+    fn protected_subscription(&self) -> Option<ProtectedSubscription> {
+        if self.factory_authority.is_some() { Some(ProtectedSubscription::Claude) }
+        else { crate::codex_external_auth::selected().then_some(ProtectedSubscription::Codex) }
+    }
+
+    fn project_subscription_error(&self, error: DurableRunnerError) -> DurableRunnerError {
+        let selected = self.protected_subscription();
+        if selected.is_none() || error.subscription_hold().is_some() { return error; }
+        subscription_auth_hold::native_error(selected, error, "Protected native operation failed")
+    }
+
+    fn record_subscription_auth_hold(&mut self, hold: SubscriptionAuthHold) -> Result<(), DurableRunnerError> {
+        let hold = *self.subscription_hold.get_or_insert(hold);
+        // No select_recovery: a lost/expired capability never grants authority
+        // over a persisted process or a different executor's files.
+        if let Some(executor) = self.selected.as_mut() { executor.record_subscription_auth_hold(hold)?; }
+        Ok(())
+    }
+
     pub fn with_runner_config(state_dir: impl Into<PathBuf>, config: &DurableRunnerConfig) -> Self {
         Self {
             state_dir: state_dir.into(),
@@ -116,6 +147,7 @@ impl NativeProviderCommandExecutor {
             factory_claude: None,
             factory_authority: None,
             factory_plan: None,
+            subscription_hold: None,
         }
     }
 
@@ -264,6 +296,7 @@ impl NativeProviderCommandExecutor {
 
 impl CommandExecutor for NativeProviderCommandExecutor {
     fn can_reconcile_result_delivery(&mut self) -> Result<bool, DurableRunnerError> {
+        if self.subscription_hold.is_some() { return Ok(false); }
         self.select_recovery()?;
         self.selected
             .as_mut()
@@ -276,6 +309,16 @@ impl CommandExecutor for NativeProviderCommandExecutor {
             .map_or_else(|| Ok(Vec::new()), CommandExecutor::retained_events)
     }
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            if !subscription_auth_hold::cleanup_command(&command.command_type) {
+                return Err(DurableRunnerError::subscription_auth(hold));
+            }
+            if let Some(executor) = self.selected.as_mut() { return executor.execute(command); }
+            return if command.command_type == "runner.drain" {
+                Ok(CommandExecution::result(serde_json::json!({"status":"completed"})))
+            } else { Err(DurableRunnerError::subscription_auth(hold)) };
+        }
+        let outcome = (|| {
         // Cleanup/readback remains possible after admission expiry or authority
         // rotation; another prepare/attach/turn cannot reuse this capability.
         if !matches!(
@@ -311,10 +354,7 @@ impl CommandExecutor for NativeProviderCommandExecutor {
         }
         // Preserve the existing Codex admission boundary independently of the
         // Claude executor's actual cleanup-only command vocabulary.
-        if !matches!(
-            command.command_type.as_str(),
-            "turn.interrupt" | "session.suspend" | "session.destroy" | "session.snapshot"
-        ) {
+        if !subscription_auth_hold::cleanup_command(&command.command_type) {
             crate::codex_external_auth::assert_selected_run(
                 &crate::codex_external_auth::ExternalAuthRunBinding {
                     run_id: &self.config.run_id,
@@ -343,17 +383,44 @@ impl CommandExecutor for NativeProviderCommandExecutor {
                 )
             })?
             .execute(command)
+        })();
+        match outcome {
+            Err(error) => {
+                let failure = self.project_subscription_error(error);
+                if let Some(hold) = failure.subscription_hold() { self.record_subscription_auth_hold(hold)?; }
+                Err(failure)
+            }
+            ok => ok,
+        }
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
-        self.assert_factory_authority()?;
-        self.select_recovery()?;
-        self.selected
-            .as_mut()
-            .map_or_else(|| Ok(Vec::new()), CommandExecutor::poll_events)
+        if self.subscription_hold.is_some() { return self.retained_events(); }
+        let outcome = (|| {
+            self.assert_factory_authority()?;
+            self.select_recovery()?;
+            self.selected.as_mut().map_or_else(|| Ok(Vec::new()), CommandExecutor::poll_events)
+        })();
+        match outcome {
+            Err(error) => {
+                let failure = self.project_subscription_error(error);
+                if let Some(hold) = failure.subscription_hold() {
+                    self.record_subscription_auth_hold(hold)?;
+                    return self.retained_events();
+                }
+                Err(failure)
+            }
+            ok => ok,
+        }
     }
 
     fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold { return self.record_subscription_auth_hold(hold); }
+        if let Err(error) = self.assert_factory_authority() {
+            let failure = self.project_subscription_error(error);
+            if let Some(hold) = failure.subscription_hold() { return self.record_subscription_auth_hold(hold); }
+            return Err(failure);
+        }
         // A provider that has not yet been selected/restored cannot have
         // in-process cleanup to advance. Never launch one merely for ACK debt.
         self.selected
@@ -362,6 +429,16 @@ impl CommandExecutor for NativeProviderCommandExecutor {
     }
 
     fn rotate_authority(&mut self, config: &DurableRunnerConfig) {
+        if let Some(selected) = self.protected_subscription() {
+            if self.config.run_id != config.run_id || self.config.environment_lease_id != config.environment_lease_id
+                || self.config.normalized_session_id != config.normalized_session_id
+                || self.config.runner_instance_id != config.runner_instance_id {
+                let cause = format!("{}:binding_mismatch", selected.code());
+                let hold = SubscriptionAuthHold::from_native_error(Some(selected), &cause).expect("fixed native cause");
+                let _ = self.record_subscription_auth_hold(hold);
+                return; // Keep the original accepted-turn correlation and owner.
+            }
+        }
         self.config = config.clone();
         if let Some(executor) = self.selected.as_mut() {
             executor.rotate_authority(config);
@@ -369,7 +446,7 @@ impl CommandExecutor for NativeProviderCommandExecutor {
     }
 
     fn acknowledge_events(&mut self, count: usize) -> Result<(), DurableRunnerError> {
-        self.select_recovery()?;
+        if self.subscription_hold.is_none() { self.select_recovery()?; }
         if let Some(executor) = self.selected.as_mut() {
             executor.acknowledge_events(count)
         } else if count == 0 {
@@ -384,6 +461,10 @@ impl CommandExecutor for NativeProviderCommandExecutor {
     fn reconcile_terminal_delivery(
         &mut self,
     ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        if self.subscription_hold.is_some() {
+            if let Some(executor) = self.selected.as_mut() { executor.reconcile_terminal_delivery()?; }
+            return Ok(TerminalDeliveryReconciliation::ProviderCleanupPending);
+        }
         // Selection only loads the provider authority. The selected executor
         // decides whether terminal delivery can settle without a cold launch.
         self.select_recovery()?;
@@ -394,6 +475,10 @@ impl CommandExecutor for NativeProviderCommandExecutor {
     }
 
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            if let Some(executor) = self.selected.as_mut() { let _ = executor.reconcile_terminal_delivery(); }
+            return Err(DurableRunnerError::subscription_auth(hold));
+        }
         // Terminal delivery can be reconciled by a replacement runner whose
         // executor has not processed a provider command. Select the durable
         // provider authority before cleanup so an absent in-memory selection
@@ -409,6 +494,60 @@ impl CommandExecutor for NativeProviderCommandExecutor {
 
 #[cfg(test)]
 mod factory_cleanup_tests {
+
+    fn subscription_hold_native_fixture() -> (PathBuf, DurableRunnerConfig, NativeProviderCommandExecutor) {
+        let directory = std::env::temp_dir().join(format!("subscription-hold-native-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let config = DurableRunnerConfig {
+            connect_url:"ws://127.0.0.1/runner".into(), ca_bundle_path:None, state_dir:directory.clone(),
+            runner_instance_id:"runner".into(), environment_lease_id:"lease".into(), run_id:"run".into(),
+            normalized_session_id:"session".into(), turn_id:"turn".into(), item_id:"item".into(),
+            runner_version:"test".into(), runner_digest:"sha256:test".into(), acpx_launch_profile:None, opencode_launch_profile:None,
+            max_outbox_bytes:1048576,p0_reserve_bytes:65536,max_frame_bytes:1048576,
+            reconnect_delay:Duration::from_millis(1),reconnect_grace:None,max_runtime:Duration::from_secs(60),
+        };
+        let plan = "a".repeat(64);
+        let ingress = crate::claude_external_auth::synthetic_ingress(&crate::claude_external_auth::ActualRun {
+            run_id:&config.run_id,environment_lease_id:&config.environment_lease_id,
+            normalized_session_id:&config.normalized_session_id,runner_instance_id:&config.runner_instance_id,worker_plan_sha256:&plan,
+        });
+        let executor = NativeProviderCommandExecutor::with_factory_claude(&directory,&config,ingress,plan).unwrap();
+        (directory,config,executor)
+    }
+
+    #[test]
+    fn subscription_hold_native_expiry_precedes_restore_and_never_adopts_cleanup() {
+        let (directory,_,mut executor) = subscription_hold_native_fixture();
+        let foreign = directory.join(ACPX_PROVIDER_STATE_FILE);
+        std::fs::write(&foreign,b"untrusted preexisting state must remain unread and unchanged").unwrap();
+        executor.factory_authority = Some(executor.factory_authority.clone().unwrap().expired_for_test());
+        assert!(executor.poll_events().unwrap().is_empty());
+        assert!(executor.selected.is_none());
+        assert!(!executor.recovery_checked);
+        assert_eq!(executor.subscription_hold.unwrap().fields()["reason"],"expired_capability");
+        assert_eq!(executor.reconcile_terminal_delivery().unwrap(),TerminalDeliveryReconciliation::ProviderCleanupPending);
+        assert!(!executor.can_reconcile_result_delivery().unwrap());
+        assert!(executor.shutdown().is_err());
+        assert_eq!(std::fs::read(&foreign).unwrap(),b"untrusted preexisting state must remain unread and unchanged");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(),1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subscription_hold_native_rejected_rotation_keeps_exact_original_authority() {
+        let (directory,config,mut executor) = subscription_hold_native_fixture();
+        let mut successor = config.clone();
+        successor.environment_lease_id = "foreign-lease".into();
+        successor.run_id = "foreign-run".into();
+        executor.rotate_authority(&successor);
+        assert_eq!(executor.config.run_id,config.run_id);
+        assert_eq!(executor.config.environment_lease_id,config.environment_lease_id);
+        assert_eq!(executor.subscription_hold.unwrap().fields()["reason"],"binding_mismatch");
+        assert!(executor.selected.is_none());
+        assert!(!executor.recovery_checked);
+        assert_eq!(executor.reconcile_terminal_delivery().unwrap(),TerminalDeliveryReconciliation::ProviderCleanupPending);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
     use super::*;
     use std::time::Duration;
 

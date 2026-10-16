@@ -39,17 +39,52 @@ pub fn redact_diagnostic_text(input: &str) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DurableRunnerError(String);
+pub struct DurableRunnerError {
+    message: String,
+    subscription_auth_hold: Option<crate::subscription_auth_hold::SubscriptionAuthHold>,
+}
 
 impl DurableRunnerError {
     pub fn invalid(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self { message: message.into(), subscription_auth_hold: None }
+    }
+
+    pub(crate) fn subscription_auth(hold: crate::subscription_auth_hold::SubscriptionAuthHold) -> Self {
+        Self { message: hold.diagnostic(), subscription_auth_hold: Some(hold) }
+    }
+
+    pub(crate) fn subscription_hold(&self) -> Option<crate::subscription_auth_hold::SubscriptionAuthHold> {
+        self.subscription_auth_hold
+    }
+
+    /// Keep typed native provenance across contextual wrappers. Ordinary errors
+    /// preserve their original diagnostic and command-failure schema.
+    pub(crate) fn with_context(self, context: impl Display) -> Self {
+        if self.subscription_auth_hold.is_some() { self }
+        else { Self::invalid(format!("{context}: {}", self.message)) }
+    }
+
+    /// The caller must keep its pending command / unacknowledged event fence.
+    /// A secondary delivery failure cannot erase the trusted primary cause or
+    /// turn uncertain persistence into a completed command. Generic diagnostics
+    /// keep their existing combined error. Protected errors never reflect the
+    /// secondary text; backend persistence/ownership latches remain intact.
+    pub(crate) fn retained_evidence_failed(&self, secondary: &Self) -> Self {
+        if self.subscription_auth_hold.is_some() { self.clone() }
+        else { Self::invalid(format!("{self}; retained failure evidence remains uncommitted: {secondary}")) }
+    }
+
+    pub(crate) fn command_failure_result(&self) -> serde_json::Value {
+        match self.subscription_auth_hold {
+            Some(hold) => hold.fields(),
+            None => serde_json::json!({"code":"command_execution_failed", "message":self.message}),
+        }
     }
 }
 
 impl Display for DurableRunnerError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 

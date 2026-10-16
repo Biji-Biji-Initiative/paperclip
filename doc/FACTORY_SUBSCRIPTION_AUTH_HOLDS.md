@@ -30,3 +30,19 @@ Transport tests used a prior qualified native binary, so they do not qualify the
 new native producer or final image. The secret scan and whitespace check passed.
 Bounded UBS attempts timed out without results. Actual subscription, image,
 confinement and pilot qualification remain separate deployment work.
+
+The subsequent native source qualification executes21 focused held-state cases
+and nine existing controls, including real synthetic Codex subprocesses. The
+changed durable runner and Codex/ACPX backend source bytes are unchanged in the
+focused harness; managed provider linkage is replaced by an unused fail-closed
+stub. Its38 module inputs and82 static inputs are verified against source.
+The real workspace's lib/bins/examples/tests compile with its locked dependencies.
+Both languages share the exact fixed message and27 closed reasons. These checks
+do not qualify a deployable native binary, real account or worker namespace.
+
+The earlier nine-file native UBS scan reports three critical findings (existing
+public lease-ID/epoch comparisons and a test timestamp nonce),1845 warnings and
+585 informational findings. This is not a whole-source clean report. A bounded
+scan of the two new modules emits a completed module summary (zero critical,
+51 warnings,10 informational) but its orchestration times out. Residual warnings
+and final-image scans remain explicitly separate from focused behavior proof.

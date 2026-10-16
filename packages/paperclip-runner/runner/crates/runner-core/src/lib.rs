@@ -14,6 +14,7 @@ pub mod factory_child_fds;
 pub mod codex_provider;
 pub mod codex_external_auth;
 mod sensitive_memory;
+mod subscription_auth_hold;
 mod codex_startup_trust;
 pub mod durable;
 pub mod fake_harness;

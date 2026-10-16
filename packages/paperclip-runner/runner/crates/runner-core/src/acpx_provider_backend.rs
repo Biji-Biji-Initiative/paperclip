@@ -33,6 +33,7 @@ use crate::provider_events::{
     project_acpx_state_event, AcpxEventProjectionContext, NormalizedProviderEvent,
 };
 use crate::qualified_launch::verify_launch_artifact;
+use crate::subscription_auth_hold::{self, HeldTurn, ProtectedSubscription, SubscriptionAuthHold};
 
 fn is_reserved_terminal_operation_id(operation_id: &str) -> bool {
     matches!(operation_id, "paperclip_finish" | "paperclip_block")
@@ -688,6 +689,8 @@ pub struct AcpxCommandExecutor {
     fail_after_state_rename: bool,
     launch_profile: Option<AcpxLaunchProfile>,
     factory_claude: Option<crate::claude_external_auth::ClaudeIngress>,
+    subscription_hold: Option<SubscriptionAuthHold>,
+    subscription_hold_committed: bool,
     factory_context: Option<(
         DurableRunnerConfig,
         String,
@@ -696,6 +699,79 @@ pub struct AcpxCommandExecutor {
 }
 
 impl AcpxCommandExecutor {
+    fn project_subscription_error(&self, error: DurableRunnerError) -> DurableRunnerError {
+        if self.factory_context.is_none() || error.subscription_hold().is_some() { return error; }
+        subscription_auth_hold::native_error(Some(ProtectedSubscription::Claude), error,
+            "Protected Claude operation failed")
+    }
+
+    /// Use only current in-memory ownership. Expiry must not restore a session
+    /// before retaining the active turn's failure and unconfirmed cleanup state.
+    pub(crate) fn record_subscription_auth_hold(&mut self, hold: SubscriptionAuthHold) -> Result<(), DurableRunnerError> {
+        if self.factory_context.is_none() || hold.selected() != ProtectedSubscription::Claude {
+            return Err(DurableRunnerError::invalid("subscription hold provider mismatch"));
+        }
+        let hold = *self.subscription_hold.get_or_insert(hold);
+        if self.subscription_hold_committed { return Ok(()); }
+        let committed: Result<(), DurableRunnerError> = (|| {
+            self.ensure_persistence_healthy()?;
+            if let Some(mut next) = self.state.clone() {
+                let failed_turn = next.active_turn_id.clone();
+                next.expire_runtime_requests("subscription_auth_operator_required", false)?;
+                if failed_turn.is_some() {
+                    let events = hold.terminal_events(&HeldTurn {
+                        run_id: &self.context.run_id,
+                        normalized_session_id: &self.context.normalized_session_id,
+                        turn_id: &self.context.turn_id, item_id: &self.context.item_id,
+                        provider_turn_id: failed_turn.as_deref(),
+                        provider_session_id: next.identity.as_ref().map(|identity| identity.acpx_record_id.as_str()),
+                    });
+                    for event in events { next.push(event)?; }
+                }
+                next.lifecycle = "closed".into();
+                next.active_turn_id = None;
+                next.provider_exit_unconfirmed |= next.identity.is_some();
+                self.commit_staged_state(next)?;
+                self.context.provider_turn_id = None;
+            }
+            self.subscription_hold_committed = true;
+            Ok(())
+        })();
+        if let Err(error) = &committed {
+            self.persistence_error.get_or_insert_with(|| error.clone());
+        }
+        self.retire_subscription_session();
+        // A failed save leaves the original state and persistence-error latch
+        // untouched. Return the fixed primary cause, not raw secondary details.
+        committed.map_err(|_| DurableRunnerError::subscription_auth(hold))
+    }
+
+    fn retire_subscription_session(&mut self) {
+        // shutdown always attempts physical transport retirement, even when its
+        // courtesy close RPC is rejected by expiry. Preserve the handle on error
+        // for explicit cleanup; never clear provider_exit_unconfirmed here.
+        let retired = self.session.as_mut().is_some_and(|session|
+            session.shutdown("Subscription access requires operator review").is_ok());
+        if retired { self.session = None; }
+    }
+
+    fn subscription_hold_control(&mut self, command: &Command, hold: SubscriptionAuthHold) -> Result<CommandExecution, DurableRunnerError> {
+        self.record_subscription_auth_hold(hold)?;
+        if command.command_type == "runner.drain" {
+            return Ok(CommandExecution::result(json!({"status":"completed"})));
+        }
+        if command.command_type == "session.snapshot" {
+            return Ok(CommandExecution::result(json!({
+                "status":"held", "error":hold.fields(), "warmAttachReady":false,
+                "providerExitConfirmed":false, "ownershipUnverified":true,
+            })));
+        }
+        if subscription_auth_hold::cleanup_command(&command.command_type) {
+            self.retire_subscription_session();
+        }
+        Err(DurableRunnerError::subscription_auth(hold))
+    }
+
     pub fn with_runner_config(state_dir: impl Into<PathBuf>, config: &DurableRunnerConfig) -> Self {
         Self {
             state_dir: state_dir.into(),
@@ -715,6 +791,8 @@ impl AcpxCommandExecutor {
             fail_after_state_rename: false,
             launch_profile: config.acpx_launch_profile.clone(),
             factory_claude: None,
+            subscription_hold: None,
+            subscription_hold_committed: false,
             factory_context: None,
         }
     }
@@ -971,7 +1049,7 @@ impl AcpxCommandExecutor {
             AcpxProviderSession::start(&config)
         };
         let mut session = started.map_err(|error| {
-            DurableRunnerError::invalid(format!("failed to start ACPX provider: {error}"))
+            subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to start ACPX provider")
         })?;
         if session.identity().profile_digest != command_digest {
             let _ = session.shutdown("qualified ACPX profile digest mismatch");
@@ -1188,9 +1266,7 @@ impl AcpxCommandExecutor {
             session
                 .shutdown("run authority rotation")
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to checkpoint ACPX before attaching a new run: {error}"
-                    ))
+                    subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to checkpoint ACPX before attaching a new run")
                 })?;
         }
         self.session = None;
@@ -1324,7 +1400,7 @@ impl AcpxCommandExecutor {
             })?
             .goal_control(sidecar_command, payload.clone())
             .map_err(|error| {
-                DurableRunnerError::invalid(format!("ACPX goal control failed: {error}"))
+                subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "ACPX goal control failed")
             })?;
         if projection.get("schema").and_then(Value::as_str)
             != Some("paperclip.session_goal.snapshot.v1")
@@ -1417,6 +1493,13 @@ impl AcpxCommandExecutor {
             .expect("ACPX session exists before turn start")
             .start_turn(&provider_turn_id, text, &working_directory)
         {
+            let failure = subscription_auth_hold::native_error(
+                self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude),
+                &error, "ACPX turn start failed closed");
+            if let Some(hold) = failure.subscription_hold() {
+                self.record_subscription_auth_hold(hold)?;
+                return Err(failure);
+            }
             let state = self
                 .state
                 .as_mut()
@@ -1426,9 +1509,7 @@ impl AcpxCommandExecutor {
             self.context.provider_turn_id = None;
             self.session = None;
             self.save_state()?;
-            return Err(DurableRunnerError::invalid(format!(
-                "ACPX turn start failed closed: {error}"
-            )));
+            return Err(subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "ACPX turn start failed closed"));
         }
         let state = self
             .state
@@ -1560,7 +1641,7 @@ impl AcpxCommandExecutor {
             .expect("checked live session")
             .steer_turn(turn_id, &control_id, mode, text)
             .map_err(|error| {
-                DurableRunnerError::invalid(format!("ACPX turn control failed: {error}"))
+                subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "ACPX turn control failed")
             })?;
         Ok(CommandExecution {
             result: json!({"status": "accepted", "mode": mode, "providerTurnId": turn_id, "correlationId": control_id}),
@@ -1593,7 +1674,7 @@ impl AcpxCommandExecutor {
             .ok_or_else(|| DurableRunnerError::invalid("ACPX session is unavailable"))?
             .interrupt_turn(&turn_id, reason)
             .map_err(|error| {
-                DurableRunnerError::invalid(format!("ACPX turn interrupt failed: {error}"))
+                subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "ACPX turn interrupt failed")
             })?;
         Ok(CommandExecution::result(json!({
             "status": "interrupt_requested",
@@ -1625,9 +1706,7 @@ impl AcpxCommandExecutor {
             session
                 .terminate_active_turn_for_suspension(&turn_id)
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!(
-                        "failed to terminate ACPX turn at the suspension boundary: {error}"
-                    ))
+                    subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to terminate ACPX turn at the suspension boundary")
                 })?;
             candidates
         };
@@ -1725,7 +1804,7 @@ impl AcpxCommandExecutor {
             session.resolve_input(request_id, &turn_id, &resolution)
         })
         .map_err(|error| {
-            DurableRunnerError::invalid(format!("ACPX runtime response failed: {error}"))
+            subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "ACPX runtime response failed")
         })?;
         // The sidecar ACK proves delivery, not durable controller settlement.
         // Retain that fact in the same atomic state write that retires the
@@ -1749,9 +1828,7 @@ impl AcpxCommandExecutor {
             .ok_or_else(|| DurableRunnerError::invalid("ACPX session is unavailable"))?
             .deliver_tool_result(&result)
             .map_err(|error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to return semantic tool result to ACPX: {error}"
-                ))
+                subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to return semantic tool result to ACPX")
             })?;
         Ok(CommandExecution::result(json!({
             "status": "delivered",
@@ -1803,7 +1880,7 @@ impl AcpxCommandExecutor {
     fn close_session(&mut self, reason: &str) -> Result<CommandExecution, DurableRunnerError> {
         if let Some(session) = self.session.as_mut() {
             session.shutdown(reason).map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to stop ACPX provider: {error}"))
+                subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to stop ACPX provider")
             })?;
         }
         self.session = None;
@@ -1833,7 +1910,7 @@ impl AcpxCommandExecutor {
     fn suspend(&mut self) -> Result<CommandExecution, DurableRunnerError> {
         if let Some(session) = self.session.as_mut() {
             let identity = session.suspend("runner.suspend").map_err(|error| {
-                DurableRunnerError::invalid(format!("failed to suspend ACPX provider: {error}"))
+                subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to suspend ACPX provider")
             })?;
             let state = self
                 .state
@@ -1867,6 +1944,16 @@ impl AcpxCommandExecutor {
     }
 
     fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            return self.record_subscription_auth_hold(hold);
+        }
+        if let Err(error) = self.assert_factory_live() {
+            let failure = self.project_subscription_error(error);
+            if let Some(hold) = failure.subscription_hold() {
+                return self.record_subscription_auth_hold(hold);
+            }
+            return Err(failure);
+        }
         self.restore()?;
         if self
             .state
@@ -1885,6 +1972,15 @@ impl AcpxCommandExecutor {
             let events = match events {
                 Ok(events) => events,
                 Err(error) => {
+                    let failure = subscription_auth_hold::native_error(
+                        self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude),
+                        &error, "ACPX provider transport failed");
+                    if let Some(hold) = failure.subscription_hold() {
+                        self.record_subscription_auth_hold(hold)?;
+                        return Ok(());
+                    }
+                    let diagnostic = if self.factory_context.is_some() { failure.to_string() }
+                        else { crate::durable::redact_text(&error.to_string()) };
                     let state = self
                         .state
                         .as_mut()
@@ -1896,7 +1992,7 @@ impl AcpxCommandExecutor {
                     if let Some(turn_id) = failed_turn {
                         state.push(NormalizedProviderEvent { event_type: "turn.failed".to_owned(), priority: EventPriority::P0,
                             payload: json!({"provider":"acpx","providerTurnId":turn_id,"status":"failed","providerTerminalObserved":false,
-                                "code":"acpx_provider_transport_failed","message":crate::durable::redact_text(&error.to_string())}) })?;
+                                "code":"acpx_provider_transport_failed","message":diagnostic}) })?;
                         state.push(NormalizedProviderEvent { event_type: "run.terminal".to_owned(), priority: EventPriority::P0,
                             payload: json!({"schema":"paperclip.prp.terminal.v1","status":"failed","turnTerminalState":"failed","runTerminalState":"failed","reportedWorkDisposition":"unknown","provider":"acpx"}) })?;
                     }
@@ -2033,6 +2129,10 @@ fn goal_terminal_disposition<'a>(
 
 impl CommandExecutor for AcpxCommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            return self.subscription_hold_control(command, hold);
+        }
+        let outcome = (|| {
         if !matches!(
             command.command_type.as_str(),
             "turn.interrupt"
@@ -2100,6 +2200,17 @@ impl CommandExecutor for AcpxCommandExecutor {
                 "message": "the ACPX provider does not implement this command",
             }))),
         }
+        })();
+        match outcome {
+            Err(error) => {
+                let failure = self.project_subscription_error(error);
+                if let Some(hold) = failure.subscription_hold() {
+                    self.record_subscription_auth_hold(hold)?;
+                }
+                Err(failure)
+            }
+            ok => ok,
+        }
     }
 
     fn rotate_authority(&mut self, config: &DurableRunnerConfig) {
@@ -2115,7 +2226,19 @@ impl CommandExecutor for AcpxCommandExecutor {
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
-        self.assert_factory_live()?;
+        // poll_provider owns the expiry-before-restore terminal path.
+        if self.subscription_hold.is_some() {
+            self.poll_provider()?;
+            return self.retained_events();
+        }
+        if let Err(error) = self.assert_factory_live() {
+            let failure = self.project_subscription_error(error);
+            if let Some(hold) = failure.subscription_hold() {
+                self.record_subscription_auth_hold(hold)?;
+                return self.retained_events();
+            }
+            return Err(failure);
+        }
         self.restore()?;
         if self
             .state
@@ -2124,8 +2247,23 @@ impl CommandExecutor for AcpxCommandExecutor {
         {
             return Ok(Vec::new());
         }
-        self.poll_provider()?;
+        if let Err(error) = self.poll_provider() {
+            let failure = self.project_subscription_error(error);
+            if let Some(hold) = failure.subscription_hold() {
+                self.record_subscription_auth_hold(hold)?;
+            } else { return Err(failure); }
+        }
         self.retained_events()
+    }
+
+    fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold { return self.record_subscription_auth_hold(hold); }
+        if let Err(error) = self.assert_factory_live() {
+            let failure = self.project_subscription_error(error);
+            if let Some(hold) = failure.subscription_hold() { return self.record_subscription_auth_hold(hold); }
+            return Err(failure);
+        }
+        Ok(())
     }
 
     fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
@@ -2160,7 +2298,20 @@ impl CommandExecutor for AcpxCommandExecutor {
         self.save_state()
     }
 
+    fn reconcile_terminal_delivery(&mut self) -> Result<crate::durable::TerminalDeliveryReconciliation, DurableRunnerError> {
+        if self.subscription_hold.is_some() {
+            self.retire_subscription_session();
+            return Ok(crate::durable::TerminalDeliveryReconciliation::ProviderCleanupPending);
+        }
+        self.shutdown()?;
+        Ok(crate::durable::TerminalDeliveryReconciliation::CleanupCompleted)
+    }
+
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+        if let Some(hold) = self.subscription_hold {
+            self.retire_subscription_session();
+            return Err(DurableRunnerError::subscription_auth(hold));
+        }
         if let Some(error) = self.persistence_error.clone() {
             // Reap our owned process even when durable cleanup is uncertain,
             // but do not overwrite the last atomic snapshot or claim success.
@@ -2203,7 +2354,7 @@ impl CommandExecutor for AcpxCommandExecutor {
             session
                 .shutdown("runner process shutdown")
                 .map_err(|error| {
-                    DurableRunnerError::invalid(format!("failed to stop ACPX provider: {error}"))
+                    subscription_auth_hold::native_error(self.factory_context.as_ref().map(|_| ProtectedSubscription::Claude), error, "failed to stop ACPX provider")
                 })?;
         }
         self.session = None;
@@ -2310,6 +2461,132 @@ fn secure_directory(path: &Path, label: &str) -> Result<(), DurableRunnerError> 
 
 #[cfg(test)]
 mod tests {
+
+    fn subscription_hold_acpx_fixture(directory: &Path) -> AcpxCommandExecutor {
+        let command_path = directory.join("must-not-execute");
+        write_artifact(&command_path, b"#!/bin/sh\nexit 98\n", true);
+        let profile = AcpxLaunchProfile {
+            authority_digest:format!("sha256:{}", "d".repeat(64)), command:command_path.clone(),
+            args:Vec::new(), artifacts:vec![artifact(&command_path)],
+        };
+        let mut value = descriptor("claude");
+        value["permissionMode"] = json!("approve-paperclip");
+        value["sidecarCommand"] = json!(command_path);
+        value["sidecarArgs"] = json!([]);
+        let descriptor: AcpxProviderDescriptor = serde_json::from_value(value).unwrap();
+        let identity = AcpxProviderSessionIdentity {
+            kind:"acpx".into(), normalized_session_id:"session-1".into(), acpx_record_id:"owned-record".into(),
+            backend_session_id:"owned-backend".into(), agent_session_id:"owned-agent".into(),
+            profile_digest:descriptor.command_digest.clone(), workspace_digest:format!("sha256:{}", "a".repeat(64)),
+            requested_model:descriptor.model.clone(), effective_model:descriptor.model.clone(),
+            permission_mode:Some(descriptor.permission_mode), provider_lifetime_fence_candidates:[60001,60002,60003],
+        };
+        let operations = Vec::new();
+        let mut state = AcpxDurableState::new(descriptor, AuthorizedToolSet {
+            schema:TOOL_SET_SCHEMA.into(), schema_version:1,
+            catalog_digest:authorized_tool_catalog_digest(&operations).unwrap(), operations,
+        }, profile.canonical_digest().unwrap());
+        state.identity = Some(identity);
+        state.lifecycle = "turn_active".into();
+        state.active_turn_id = Some("accepted-once".into());
+        let config = test_config(directory, Some(profile));
+        let mut executor = AcpxCommandExecutor::with_factory_claude(directory, &config, factory_ingress(&config), FACTORY_PLAN.into()).unwrap();
+        executor.state = Some(state);
+        executor.restore_checked = true;
+        executor.context.provider_turn_id = Some("accepted-once".into());
+        executor.save_state().unwrap();
+        executor
+    }
+    fn expire_subscription_hold_fixture(executor: &mut AcpxCommandExecutor) {
+        let context = executor.factory_context.as_mut().unwrap();
+        context.2 = context.2.clone().expired_for_test();
+    }
+    fn subscription_hold_acpx_command(kind: &str) -> Command {
+        let mut request = factory_command(json!({"kind":"acpx","agent":"claude"}));
+        request.command_type = kind.into(); request.command_id = kind.into(); request
+    }
+
+    #[test]
+    fn subscription_hold_claude_expiry_poll_persists_terminal_before_any_restoration() {
+        let directory = temporary_directory("subscription-hold-expiry");
+        let mut executor = subscription_hold_acpx_fixture(&directory);
+        let original_identity = executor.state.as_ref().unwrap().identity.clone();
+        expire_subscription_hold_fixture(&mut executor);
+        let events = executor.poll_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "turn.failed");
+        assert_eq!(events[1].event_type, "run.terminal");
+        for event in &events {
+            assert_eq!(event.payload["providerTurnId"], "accepted-once");
+            assert_eq!(event.payload["providerSessionId"], "owned-record");
+            assert_eq!(event.payload["error"]["code"], "factory_claude_access_unverified");
+            assert_eq!(event.payload["error"]["reason"], "expired_capability");
+            assert_eq!(event.payload["error"]["retryable"], false);
+            assert_eq!(event.payload["providerTerminalObserved"], false);
+            assert_eq!(event.payload["providerExitConfirmed"], false);
+        }
+        let persisted: AcpxDurableState = serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        persisted.validate(&executor.context, &executor.launch_profile_digest().unwrap()).unwrap();
+        assert_eq!(persisted.identity, original_identity);
+        assert_eq!(persisted.lifecycle, "closed");
+        assert!(persisted.provider_exit_unconfirmed);
+        assert!(persisted.active_turn_id.is_none());
+        assert_eq!(executor.poll_events().unwrap(), events);
+        executor.acknowledge_events(2).unwrap();
+        assert!(executor.poll_events().unwrap().is_empty());
+        assert!(executor.session.is_none());
+        assert_eq!(executor.reconcile_terminal_delivery().unwrap(), crate::durable::TerminalDeliveryReconciliation::ProviderCleanupPending);
+        for kind in ["turn.start", "turn.stop", "runner.shutdown", "run.attach"] {
+            let failure = executor.execute(&subscription_hold_acpx_command(kind)).unwrap_err();
+            assert_eq!(failure.command_failure_result()["reason"], "expired_capability");
+        }
+        assert_eq!(executor.execute(&subscription_hold_acpx_command("runner.drain")).unwrap().result["status"], "completed");
+        assert_eq!(executor.execute(&subscription_hold_acpx_command("session.snapshot")).unwrap().result["warmAttachReady"], false);
+        assert!(executor.state.as_ref().unwrap().provider_exit_unconfirmed);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subscription_hold_claude_synchronous_expiry_keeps_existing_fifo_and_identity() {
+        let directory = temporary_directory("subscription-hold-sync");
+        let mut executor = subscription_hold_acpx_fixture(&directory);
+        for index in 0..131 { executor.state.as_mut().unwrap().push(NormalizedProviderEvent {
+            event_type:"harness.diagnostic".into(), priority:EventPriority::P1, payload:json!({"index":index}),
+        }).unwrap(); }
+        expire_subscription_hold_fixture(&mut executor);
+        let error = executor.execute(&subscription_hold_acpx_command("turn.steer")).unwrap_err();
+        assert_eq!(error.command_failure_result()["reason"], "expired_capability");
+        let mut all = Vec::new();
+        loop {
+            let prefix = executor.retained_events().unwrap();
+            if prefix.is_empty() { break; }
+            all.extend(prefix.clone()); executor.acknowledge_events(prefix.len()).unwrap();
+        }
+        assert_eq!(all.len(), 133);
+        for (index, event) in all[..131].iter().enumerate() { assert_eq!(event.payload["index"], index); }
+        assert_eq!(all[131].event_type, "turn.failed");
+        assert_eq!(all[132].event_type, "run.terminal");
+        assert!(executor.session.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn subscription_hold_claude_uncertain_save_preserves_fence_and_never_publishes_success() {
+        let directory = temporary_directory("subscription-hold-write");
+        let mut executor = subscription_hold_acpx_fixture(&directory);
+        let old_state = executor.state.clone();
+        expire_subscription_hold_fixture(&mut executor);
+        executor.fail_after_state_rename = true;
+        assert!(executor.poll_events().is_err());
+        assert_eq!(executor.state, old_state);
+        assert!(executor.retained_events().is_err());
+        assert!(executor.execute(&subscription_hold_acpx_command("runner.drain")).is_err());
+        let disk: AcpxDurableState = serde_json::from_slice(&fs::read(executor.state_path()).unwrap()).unwrap();
+        assert!(disk.provider_exit_unconfirmed);
+        assert_eq!(disk.pending_events.back().unwrap().event_type, "run.terminal");
+        assert!(executor.session.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
