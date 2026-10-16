@@ -62,8 +62,8 @@ RUN find /app -type d -name node_modules -prune -exec rm -rf {} + \
   && CI=true pnpm --filter '!@paperclipai/ui' install --prod --frozen-lockfile --offline --ignore-scripts
 
 FROM base AS rust-toolchain
-ARG CARGO_BUILD_JOBS
-ENV CARGO_BUILD_JOBS=4
+ARG CARGO_BUILD_JOBS=4
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 WORKDIR /app
 # Debian's packaged rust lags the ecosystem (trixie ships 1.85) and the
 # runner's dependency tree now requires a newer rustc. Install rustup from a

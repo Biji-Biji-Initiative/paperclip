@@ -21,6 +21,17 @@ assert.match(docker, /FROM runner-deps AS runner-build/);
 assert.match(docker, /FROM runner-build AS build/);
 assert.match(docker, /ARG PAPERCLIP_RUNNER_SUBSCRIPTIONS_ONLY=false/);
 
+test("Native stages inherit the requested Cargo job limit", () => {
+  const toolchain = docker.split("FROM base AS rust-toolchain\n")[1].split("\nFROM ")[0];
+  const defaultJobs = toolchain.match(/^ARG CARGO_BUILD_JOBS=(\d+)$/m)?.[1];
+  const environmentValue = toolchain.match(/^ENV CARGO_BUILD_JOBS=(.+)$/m)?.[1];
+  assert.equal(defaultJobs, "4");
+  for (const requested of [undefined, "1", "2"]) {
+    const effective = environmentValue?.replaceAll("${CARGO_BUILD_JOBS}", requested ?? defaultJobs);
+    assert.equal(effective, requested ?? "4");
+  }
+});
+
 test("Final image CLI uses the same Codex version as the verified provider pack", () => {
   const pkg = JSON.parse(readFileSync(new URL("packages/paperclip-runner/package.json", root), "utf8"));
   const versions = [...docker.matchAll(/@openai\/codex@([0-9.]+)/g)].map(match => match[1]);
