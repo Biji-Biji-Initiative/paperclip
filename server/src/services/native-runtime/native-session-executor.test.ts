@@ -1,3 +1,5 @@
+import * as factoryStaging from "../factory-workspace-staging.js";
+import * as factoryWorkerRuntime from "./factory-worker-runtime.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
@@ -49,6 +51,8 @@ import * as noLaunchProofModule from "./native-maintenance-no-launch.js";
 import {
   NativeSessionCleanupQuarantinedError,
   NativeProviderTerminalFailure,
+  NativeProviderAuthHoldError,
+  NATIVE_PROVIDER_AUTH_HOLD_MESSAGE,
   NativeSessionProtocolIntegrityError,
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
@@ -291,6 +295,7 @@ import {
   NativeSessionSteeringError,
   assertRemoteRunnerBuildMetadata,
   nativeSessionFailureDisposition,
+  retainFactoryProviderAuthHold,
   nativeFailedRunRetryStateIsSafe,
   verifyStoppedNativeSessionForContinuation,
   nativePreProviderRetryAfterCleanupStateIsSafe,
@@ -4792,6 +4797,7 @@ function leaseDb(
   updates: Array<{ table: unknown; values: Record<string, unknown> }> = [],
   runnerProfileJson: Record<string, unknown> = {},
   runStatus = "running",
+  authHoldWriteOutcome: "success" | "cas_mismatch" | "persistence_failure" = "success",
 ): Db {
   const coordinator: LeaseCoordinator = {
     runId: boundExecution.binding.runId,
@@ -4809,13 +4815,17 @@ function leaseDb(
       return {
         where: () => {
           updates.push({ table, values });
+          if (values.failureCode === "native_provider_auth_operator_required" && authHoldWriteOutcome === "persistence_failure") {
+            throw new Error("SYNTHETIC_PRIVATE_DATABASE_REFLECTION");
+          }
           const result = Promise.resolve([]) as unknown as Promise<
             unknown[]
           > & {
             returning: () => Promise<Array<{ runId: string }>>;
           };
           result.returning = () =>
-            Promise.resolve([{ runId: coordinator.runId, nextEventSeq: 2 }]);
+            Promise.resolve(values.failureCode === "native_provider_auth_operator_required" && authHoldWriteOutcome === "cas_mismatch"
+              ? [] : [{ runId: coordinator.runId, nextEventSeq: 2 }]);
           return result;
         },
       };
@@ -7416,6 +7426,81 @@ describe("native session bounded recovery", () => {
     })).rejects.toThrow("native_cancellation_pending_recovery");
     expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
     expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
+  });
+
+  it.each(["codex_external_auth_operator_required", "factory_claude_access_unverified"] as const)(
+    "makes structured %s an operator hold without resume or prose classification", (providerCode) => {
+      const typed = new NativeProviderAuthHoldError(providerCode, "expired_capability");
+      const terminal = new NativeProviderTerminalFailure(providerCode, true, "SYNTHETIC_PRIVATE_REFLECTION");
+      for (const error of [typed, terminal]) {
+        const code = nativeSessionFailureSourceCode(error);
+        expect(code).toBe("native_provider_auth_operator_required");
+        expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+          phase: "terminal_failure", failureCode: code, nextAttemptAt: null,
+        });
+        expect(nativeSessionRecoveryProjection({ phase: "terminal_failure", failureCode: code, agentId: "agent" }))
+          .toMatchObject({ recoveryOwner: { kind: "board" }, recoveryActionOwnerType: "board" });
+      }
+      expect(nativeSessionFailureSourceCode(new Error(providerCode + ":expired_capability")))
+        .toBe("native_session_interrupted");
+    },
+  );
+
+  it("records a Factory auth operator fact without clearing physical ownership fields", async () => {
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    state.upsertRecoveryAction.mockClear();
+    await retainFactoryProviderAuthHold({ db: leaseDb(execution, {}, {}, updates), binding: execution.binding,
+      leaseOwner: "current-owner", attempt: 1,
+      hold: new NativeProviderAuthHoldError("codex_external_auth_operator_required", "expired_capability") });
+    const fact = updates.find(update => update.table === nativeRunFinalizations)?.values;
+    expect(fact).toMatchObject({ phase: "terminal_failure", failureCode: "native_provider_auth_operator_required",
+      nextAttemptAt: null, failureDetail: { message: NATIVE_PROVIDER_AUTH_HOLD_MESSAGE,
+        providerAuthHold: { operatorRequired: true, retryable: false, providerTerminalObserved: false, cleanupUnconfirmed: true } } });
+    for (const field of ["leaseOwner", "leaseExpiresAt", "controlDeadlineAt", "resultId", "processPid", "processGroupId"]) {
+      expect(fact).not.toHaveProperty(field);
+    }
+    expect(updates.some(update => update.table === heartbeatRuns)).toBe(false);
+    expect(state.upsertRecoveryAction).toHaveBeenCalledWith(expect.objectContaining({
+      ownerType: "board", cause: "native_provider_auth_operator_required", wakePolicy: null,
+      nextAction: NATIVE_PROVIDER_AUTH_HOLD_MESSAGE,
+    }));
+  });
+
+  it.each(["success", "cas_mismatch", "persistence_failure"] as const)(
+    "keeps the actual Factory auth failure catch ownership-held without a successor (%s)", async (authHoldWriteOutcome) => {
+    const current = { ...execution, binding: { ...execution.binding, companyId: FACTORY_COMPANY_ID,
+      runId: randomUUID(), executionWorkspaceId: randomUUID() },
+      session: { ...execution.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null } } };
+    const remoteCwd = `/workspace/${FACTORY_COMPANY_ID}/${current.binding.executionWorkspaceId}`;
+    const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+      environmentId: randomUUID(), leaseId: randomUUID(), remoteCwd,
+      spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd, remoteWorkspacePath: remoteCwd,
+        privateKey: "fixture-only-not-a-key", knownHosts: "fixture-public-pin", strictHostKeyChecking: true } };
+    // This catch regression bypasses admission; the executor awaits validation
+    // and does not consume this boundary's returned authorization records.
+    const authorize = vi.spyOn(factoryWorkerRuntime, "authorizeFactoryWorker").mockImplementation(vi.fn());
+    const staging = vi.spyOn(factoryStaging, "assertFactoryWorkspaceStagingOwned").mockResolvedValue(undefined);
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    state.execute.mockReset().mockRejectedValueOnce(new NativeProviderAuthHoldError("factory_claude_access_unverified", "expired_capability"));
+    state.upsertRecoveryAction.mockClear();
+    try {
+      const held = await executePaperclipNativeSession({ db: leaseDb(current, {}, {}, updates, {}, "running", authHoldWriteOutcome), execution: current,
+        runnerInstanceId: "factory-auth-hold", runnerExecutionTarget: target,
+        useRunnerd: true }).catch(error => error);
+      expect(held).toBeInstanceOf(NativeRunnerOwnershipUnverifiedError);
+      expect(String(held)).not.toContain("SYNTHETIC_PRIVATE_DATABASE_REFLECTION");
+      expect(state.execute).toHaveBeenCalledOnce();
+      expect(updates.find(update => update.table === nativeRunFinalizations
+        && update.values.failureCode === "native_provider_auth_operator_required")?.values)
+        .toMatchObject({ phase: "terminal_failure", nextAttemptAt: null });
+      expect(updates.filter(update => update.table === heartbeatRuns)
+        .some(update => update.values.status === "failed" || update.values.processPid === null || update.values.processGroupId === null)).toBe(false);
+      if (authHoldWriteOutcome === "success") {
+        expect(state.upsertRecoveryAction).toHaveBeenCalledWith(expect.objectContaining({ ownerType: "board", wakePolicy: null }));
+      } else {
+        expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
+      }
+    } finally { authorize.mockRestore(); staging.mockRestore(); }
   });
 
   it("keeps typed integrity failure permanent even if a wrapper changes its message", () => {

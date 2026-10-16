@@ -128,6 +128,10 @@ export const validatePrpStructuredRunResult =
   runner.validatePrpStructuredRunResult;
 
 export const NativeProviderTerminalFailure = runner.NativeProviderTerminalFailure;
+export const NativeProviderAuthHoldError = runner.NativeProviderAuthHoldError;
+export const isNativeProviderAuthHoldCode = runner.isNativeProviderAuthHoldCode;
+export const NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED = runner.NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED;
+export const NATIVE_PROVIDER_AUTH_HOLD_MESSAGE = runner.NATIVE_PROVIDER_AUTH_HOLD_MESSAGE;
 export const nativeRestartInterruptedTurnId = runner.nativeRestartInterruptedTurnId;
 
 export const completeTerminatedRemoteNativeSessionCleanup = runner.completeTerminatedRemoteNativeSessionCleanup;

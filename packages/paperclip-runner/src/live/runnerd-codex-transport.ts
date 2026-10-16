@@ -42,6 +42,7 @@ import type {
 import type { NativeRunIdentity, NativeTurnControlCapabilities } from "../contracts/types.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
+import { NativeProviderAuthHoldError, nativeProviderAuthHoldFromResult } from "../contracts/native-provider-auth-hold.js";
 import type {
   HarnessRuntimeRequestResolution,
   PersistedHarnessProviderIdentity,
@@ -1246,6 +1247,8 @@ export interface CapabilityRunnerdCodexTransportOptions {
   }) => Promise<Record<string, unknown>>;
   /** Active-connection recovery budget. Omitted for the existing local mode. */
   runnerReconnectGraceMs?: number;
+  /** Host-selected one-shot subscription mode; never a task/provider JSON selector. */
+  factoryProviderAuth?: "codex" | "claude";
   /**
    * A verified local runner that outlived its controller. Adoption registers
    * the durable authority and waits for this exact process to reconnect; it
@@ -3429,6 +3432,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string; permission?: boolean }>();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
+    if (options.factoryProviderAuth !== undefined && !["codex", "claude"].includes(options.factoryProviderAuth)) {
+      throw new Error("Invalid protected Factory provider mode");
+    }
     if (options.adoptExistingRunner && !options.stateDirectory?.trim()) {
       throw new Error("native_adopted_runner_state_directory_required");
     }
@@ -5897,6 +5903,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           : this.#core?.getCommand(commandId);
       if (command?.status === "completed") return;
       if (command !== undefined && command.status !== "pending") {
+        const hold = nativeProviderAuthHoldFromResult(record(command.result).result);
+        if (hold) throw hold;
+        if (this.options.factoryProviderAuth) {
+          throw new Error("Protected Factory runner command failed");
+        }
         throw new Error(
           `PRP command ${type} ${command.status}: ${JSON.stringify(command.result)}`,
         );
@@ -6529,7 +6540,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#evidence.runnerExited = true;
         this.#evidence.runnerExitCode = result.code;
         this.#evidence.runnerSignal = result.signal as NodeJS.Signals | null;
-        const detail = result.stderr.trim() || result.stdout.trim();
+        const detail = this.options.factoryProviderAuth
+          ? "" : result.stderr.trim() || result.stdout.trim();
         if (detail) this.#diagnostic(detail.slice(-4_096));
         this.#publish();
         if (this.#closed || this.#failure !== null || this.#handle !== handle)
@@ -6546,6 +6558,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           ) ??
             false);
         if (expectedPerTurnExit) return;
+        if (this.options.factoryProviderAuth) {
+          this.#failTransport(this.#factoryProviderExitHold());
+          return;
+        }
         const code = /provider_frame_too_large|stdout frame exceeded/i.test(
           detail,
         )
@@ -6574,6 +6590,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       (error) => {
         if (this.#closed || this.#failure !== null || this.#handle !== handle)
           return;
+        if (this.options.factoryProviderAuth) {
+          this.#failTransport(this.#factoryProviderExitHold());
+          return;
+        }
         if (
           this.#startupComplete &&
           this.options.runnerReconnectGraceMs !== undefined &&
@@ -6598,6 +6618,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     failedHandle: RunnerProcessHandle,
     initialDetail: string,
   ): Promise<void> {
+    if (this.options.factoryProviderAuth) {
+      this.#failTransport(this.#factoryProviderExitHold());
+      return;
+    }
     if (
       this.#runnerRecoveryInProgress ||
       this.#closed ||
@@ -6712,6 +6736,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // after the request path has already received this terminal failure.
       this.#queue.close(error);
     }
+  }
+
+  #factoryProviderExitHold(): NativeProviderAuthHoldError {
+    return new NativeProviderAuthHoldError(this.options.factoryProviderAuth === "claude"
+      ? "factory_claude_access_unverified" : "codex_external_auth_operator_required", "runner_exit_unverified");
   }
 
   #throwIfFailed(): void {

@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ControlPlanePort } from "./contracts/control-plane-port.js";
 import type { NativeExecutionInputV1, NativeExecutionInputV5 } from "./contracts/native-execution.js";
 import type { NativeRunIdentity } from "./contracts/types.js";
+import { NativeProviderAuthHoldError } from "./contracts/native-provider-auth-hold.js";
 import type {
   NativeSession,
   NativeSessionBackend,
@@ -19,6 +20,7 @@ import type {
   PrpStructuredRunResult,
   PrpTerminalState,
 } from "./protocol/replay-contract.js";
+import { validatePrpEvent } from "./protocol/replay-contract.js";
 import {
   NATIVE_RUNTIME_ASSET_SCHEMA,
   PAPERCLIP_EXECUTION_PROMPT,
@@ -225,6 +227,103 @@ function highestContiguous(events: PrpEvent[]): number {
 }
 
 describe("executeNativeSession recovery", () => {
+  it.each([
+    { eventType: "turn.failed", code: "codex_external_auth_operator_required", auth: true, eager: false },
+    { eventType: "turn.failed", code: "factory_claude_access_unverified", auth: true, eager: false },
+    { eventType: "session.failed", code: "codex_external_auth_operator_required", auth: true, eager: false },
+    { eventType: "session.failed", code: "factory_claude_access_unverified", auth: true, eager: false },
+    { eventType: "turn.failed", code: "command_execution_failed", auth: false, eager: false },
+    { eventType: "session.failed", code: "command_execution_failed", auth: false, eager: false },
+    { eventType: "turn.failed", code: "factory_claude_access_unverified", auth: true, eager: true },
+  ] as const)("preserves structured auth before terminal checkpoint ($eventType/$code/eager=$eager)", async ({ eventType, code, auth, eager }) => {
+    let releaseStarted!: () => void;
+    const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+    let releaseAppended!: () => void;
+    const appended = new Promise<void>(resolve => { releaseAppended = resolve; });
+    let delivered = false;
+    let turnStarted = false;
+    const afterTerminalSnapshot = vi.fn();
+    const afterTerminalResult = vi.fn();
+    const completeRun = vi.fn();
+    const appendedEvents: PrpEvent[] = [];
+    let sourceEvent: PrpEvent | undefined;
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: false, structuredResult: true };
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return capabilities; },
+      async *events() {
+        if (!eager) await started;
+        delivered = true;
+        sourceEvent = { ...runnerEvent(1, eventType, { error: { code, reason: "expired_capability", retryable: false,
+          operatorRequired: true, message: "factory_claude_access_unverified:SYNTHETIC_PRIVATE_TERMINAL_REFLECTION",
+          extra: "SYNTHETIC_PRIVATE_ERROR_DETAIL" }, private: "SYNTHETIC_PRIVATE_PAYLOAD_DETAIL",
+          providerTerminalObserved: false, cleanupUnconfirmed: true }),
+          debug: { private: "SYNTHETIC_PRIVATE_DEBUG_DETAIL" } };
+        yield sourceEvent;
+      },
+      async startTurn() {
+        turnStarted = true;
+        if (eager) {
+          await appended;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          throw new Error("SYNTHETIC_STARTUP_FAILURE");
+        }
+        return { turnId: "turn-recovery" };
+      },
+      async result() { if (delivered) afterTerminalResult(); return null; },
+      async snapshot() {
+        if (delivered) {
+          afterTerminalSnapshot();
+          throw new Error("SYNTHETIC_CHECKPOINT_FAILURE");
+        }
+        return { backendKind: "mock", sessionId: "driver-recovery", identity, providerSessionId: "provider-recovery",
+          cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [] };
+      },
+      async close() {},
+    };
+    const backend: NativeSessionBackend = {
+      async descriptor() { return { kind: "mock", name: "typed-auth-terminal", version: "1", capabilities }; },
+      async openSession() { return session; },
+    };
+    const port: ControlPlanePort = {
+      async openRun() {}, async checkpointSession() {
+        if (turnStarted) setImmediate(releaseStarted);
+      },
+      async appendEvent(event) { appendedEvents.push(structuredClone(event)); releaseAppended();
+        return { cursor: 1, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; }, completeRun,
+    };
+    const held = await executeNativeSession({ input, backend, controlPlane: port,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" }).catch(error => error);
+    if (auth) {
+      expect(held).toBeInstanceOf(NativeProviderAuthHoldError);
+      expect(held).toMatchObject({ providerHoldCode: code, reason: "expired_capability", retryable: false, operatorRequired: true });
+      expect(String(held)).not.toContain("SYNTHETIC_PRIVATE_TERMINAL_REFLECTION");
+      expect(String(held)).not.toContain("SYNTHETIC_STARTUP_FAILURE");
+      expect(afterTerminalSnapshot).not.toHaveBeenCalled();
+      expect(afterTerminalResult).not.toHaveBeenCalled();
+      expect(JSON.stringify(appendedEvents)).not.toContain("SYNTHETIC_PRIVATE");
+      expect(validatePrpEvent(appendedEvents[0]).ok).toBe(true);
+      expect(sourceEvent!.debug).toEqual({ private: "SYNTHETIC_PRIVATE_DEBUG_DETAIL" });
+      expect(appendedEvents).toEqual([expect.objectContaining({
+        sourceEventId: sourceEvent!.sourceEventId, sourceSeq: sourceEvent!.sourceSeq,
+        runId: identity.runId, normalizedSessionId: identity.sessionId, turnId: "turn-recovery", eventType,
+        payload: { status: "failed", error: { code, reason: "expired_capability",
+          message: held.message, retryable: false, operatorRequired: true },
+          providerTerminalObserved: false, cleanupUnconfirmed: true },
+      })]);
+    } else if (eventType === "turn.failed") {
+      expect(held).not.toBeInstanceOf(NativeProviderAuthHoldError);
+      expect(held.message).toBe("SYNTHETIC_CHECKPOINT_FAILURE");
+      expect(afterTerminalSnapshot).toHaveBeenCalledOnce();
+      expect(afterTerminalResult).toHaveBeenCalledOnce();
+    } else {
+      expect(held).toMatchObject({ code: "native_provider_terminal_failed", providerCode: code });
+    }
+    if (!auth) expect(appendedEvents).toEqual([sourceEvent]);
+    expect(completeRun).not.toHaveBeenCalled();
+  });
+
   it.each([
     { label: "continues a restart-lost Codex turn", allowed: true, error: { code: "provider_turn_lost_on_restore", recoverable: true } },
     { label: "requires the control plane restart claim", allowed: false, error: { code: "provider_turn_lost_on_restore", recoverable: true } },

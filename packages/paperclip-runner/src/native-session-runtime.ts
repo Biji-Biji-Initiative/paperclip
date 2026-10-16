@@ -33,6 +33,7 @@ import {
   type PrpTerminalState,
 } from "./protocol/replay-contract.js";
 import { parsePaperclipQuestionSet } from "./contracts/question-set.js";
+import { NativeProviderAuthHoldError, NATIVE_PROVIDER_AUTH_HOLD_MESSAGE, nativeProviderAuthHoldFromResult } from "./contracts/native-provider-auth-hold.js";
 import {
   retainedRunnerdCleanupProofIsCurrent,
   type RetainedRunnerdCleanupProof,
@@ -958,7 +959,27 @@ async function consumeTurn(
           "native event stream closed before a turn terminal fact",
         );
       }
-      const event = next.value;
+      const sourceEvent = next.value;
+      const sourcePayload = sourceEvent.payload as Record<string, unknown>;
+      const authHold = sourceEvent.eventType === "turn.failed" || sourceEvent.eventType === "session.failed"
+        ? nativeProviderAuthHoldFromResult(sourcePayload.error && typeof sourcePayload.error === "object"
+          ? sourcePayload.error : sourcePayload) : null;
+      // The application ledger fingerprints this closed projection on first
+      // append. Keep source identities; never mutate the source record or
+      // rewrite prior application/upstream journal entries.
+      const event: PrpEvent = authHold ? {
+        schema: sourceEvent.schema, sourceEventId: sourceEvent.sourceEventId,
+        sourceSeq: sourceEvent.sourceSeq, sourceInstanceId: sourceEvent.sourceInstanceId,
+        sourceKind: sourceEvent.sourceKind, runId: sourceEvent.runId,
+        normalizedSessionId: sourceEvent.normalizedSessionId,
+        ...(sourceEvent.turnId !== undefined ? { turnId: sourceEvent.turnId } : {}),
+        ...(sourceEvent.itemId !== undefined ? { itemId: sourceEvent.itemId } : {}),
+        eventType: sourceEvent.eventType, schemaVersion: sourceEvent.schemaVersion,
+        priority: sourceEvent.priority, emittedAt: sourceEvent.emittedAt,
+        payload: { status: "failed", error: { code: authHold.providerHoldCode, reason: authHold.reason,
+          message: NATIVE_PROVIDER_AUTH_HOLD_MESSAGE, retryable: false, operatorRequired: true },
+          providerTerminalObserved: false, cleanupUnconfirmed: true },
+      } : sourceEvent;
       const payload = event.payload as Record<string, unknown>;
       const settlingRequestId =
         [
@@ -982,6 +1003,9 @@ async function consumeTurn(
         highestContiguousSourceSeq,
         receipt.highestContiguousSourceSeq,
       );
+      // This fact explicitly cannot prove retirement. Preserve it before
+      // goal lookup, result lookup, checkpointing or restart continuation.
+      if (authHold) throw authHold;
       const eventGoal = goalFromEvent(event);
       const goalChanged = eventGoal !== undefined &&
         goalLifecycleFingerprint(eventGoal) !== goalLifecycleFingerprint(previousGoal);
@@ -2445,7 +2469,7 @@ export async function executeNativeSession(
           // A failed iterator may have already initiated close while start or
           // checkpoint was pending. Retain the authenticated integrity fault,
           // not the resulting transport/cleanup error from that race.
-          if (consumptionError instanceof NativeSessionProtocolIntegrityError) {
+          if (consumptionError instanceof NativeSessionProtocolIntegrityError || consumptionError instanceof NativeProviderAuthHoldError) {
             startupFailure = consumptionError;
           }
         });
@@ -2489,12 +2513,14 @@ export async function executeNativeSession(
             settledCompletion === null &&
             terminalEvent.eventType === "turn.failed"
           ) {
-            await checkpoint(signal);
             const payload = terminalEvent.payload as Record<string, unknown>;
             const failure =
               payload.error && typeof payload.error === "object"
                 ? (payload.error as Record<string, unknown>)
                 : payload;
+            const authHold = nativeProviderAuthHoldFromResult(failure);
+            if (authHold) throw authHold;
+            await checkpoint(signal);
             const message =
               typeof failure.message === "string"
                 ? failure.message.slice(0, 2_000)

@@ -1,3 +1,4 @@
+export * from "./contracts/native-provider-auth-hold.js";
 export * from "./catalog/index.js";
 export * from "./contracts/control-plane-port.js";
 export * from "./contracts/completion-result.js";

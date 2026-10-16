@@ -23,6 +23,7 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, it, vi } from "vitest";
+import { NativeProviderAuthHoldError } from "../contracts/native-provider-auth-hold.js";
 import type { ControlPlanePort } from "../contracts/control-plane-port.js";
 import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
 import type {
@@ -131,6 +132,99 @@ async function expectTurnStarted(
     "provider turn did not start within the bounded notification prefix",
   );
 }
+
+it.each(["codex_external_auth_operator_required", "factory_claude_access_unverified", "command_execution_failed"] as const)(
+  "propagates structured durable %s without reflecting command payloads", async (code) => {
+    const root = await mkdtemp(join(tmpdir(), "runnerd-durable-auth-hold-"));
+    const OriginalCore = durableControlPlane.DurablePrpControlPlane;
+    let currentCore: DurablePrpControlPlane | undefined;
+    const coreSpy = vi.spyOn(durableControlPlane, "DurablePrpControlPlane")
+      .mockImplementation(function(options: ConstructorParameters<typeof OriginalCore>[0]) {
+        return currentCore = new OriginalCore(options);
+      } as unknown as typeof OriginalCore);
+    const bundle = createCapabilityRunnerdCodexTransport({ runnerBinary: defaultCapabilityRunnerdBinary(),
+      codexCommand: process.env.PAPERCLIP_AUTH_HOLD_FAKE_CODEX ?? fakeCodex,
+      codexArgs: fakeCodexArgs(root), stateDirectory: root, factoryProviderAuth: "codex" });
+    let commandSpy: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await bundle.transport.request("thread/start", { cwd: root, dynamicTools: [] });
+      const core = currentCore!;
+      const getCommand = core.getCommand.bind(core);
+      commandSpy = vi.spyOn(core, "getCommand").mockImplementation((id) => {
+        const command = getCommand(id);
+        return command?.type === "session.snapshot" ? { ...command, status: "failed", result: {
+          result: { code, reason: "expired_capability", retryable: false, operatorRequired: true,
+            message: "SYNTHETIC_PRIVATE_DURABLE_REFLECTION" },
+        } } : command;
+      });
+      const held = await bundle.transport.request("thread/read", {}).catch(error => error);
+      if (code === "command_execution_failed") {
+        expect(held).not.toBeInstanceOf(NativeProviderAuthHoldError);
+        expect(held.message).toBe("Protected Factory runner command failed");
+      } else {
+        expect(held).toBeInstanceOf(NativeProviderAuthHoldError);
+        expect(held).toMatchObject({ code: "native_provider_auth_operator_required", providerHoldCode: code,
+          reason: "expired_capability", retryable: false, operatorRequired: true });
+      }
+      expect(String(held)).not.toContain("SYNTHETIC_PRIVATE_DURABLE_REFLECTION");
+    } finally {
+      commandSpy?.mockRestore();
+      await bundle.transport.close().catch(() => undefined);
+      coreSpy.mockRestore();
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000,
+);
+
+it("holds an accepted protected Factory turn without restarting its runner or exposing exit text", async () => {
+  const root = await mkdtemp(join(tmpdir(), "runnerd-factory-auth-hold-"));
+  const callsPath = join(root, "calls.log");
+  const children: ReturnType<typeof spawn>[] = [];
+  const launcher = vi.fn((spec: durableControlPlane.RunnerProcessLaunchSpec) => {
+    const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment,
+      stdio: ["ignore", "pipe", "pipe"], detached: true });
+    children.push(child);
+    let stdout = "";
+    child.stdout!.on("data", chunk => { stdout += String(chunk); });
+    child.stderr!.on("data", () => undefined);
+    return { child, processGroupId: child.pid!, startedAt: new Date().toISOString(),
+      completion: new Promise<durableControlPlane.RunnerProcessResult>((resolveResult, reject) => {
+        child.once("error", reject);
+        child.once("close", (code, signal) => resolveResult({ code, signal, stdout,
+          stderr: "SYNTHETIC_PRIVATE_EXIT_REFLECTION" }));
+      }) };
+  });
+  const bundle = createCapabilityRunnerdCodexTransport({ runnerBinary: defaultCapabilityRunnerdBinary(),
+    codexCommand: process.env.PAPERCLIP_AUTH_HOLD_FAKE_CODEX ?? fakeCodex,
+    codexArgs: fakeCodexArgs(root, "--hold-turn", "--call-log", callsPath), stateDirectory: root,
+    runnerProcessLauncher: launcher, runnerReconnectGraceMs: 5_000, factoryProviderAuth: "codex" });
+  let providerPid: number | null = null;
+  try {
+    await bundle.transport.request("thread/start", { cwd: root, dynamicTools: [] });
+    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    await bundle.transport.request("turn/start", { input: [{ type: "text", text: "Synthetic held turn." }] });
+    await expectTurnStarted(notifications);
+    providerPid = bundle.evidence().codexPid;
+    process.kill(children[0]!.pid!, "SIGKILL");
+    await vi.waitFor(() => expect(bundle.evidence().runnerExited).toBe(true), { timeout: 5_000 });
+    const held = await bundle.transport.request("thread/read", {}).catch(error => error);
+    expect(held).toBeInstanceOf(NativeProviderAuthHoldError);
+    expect(held).toMatchObject({
+      code: "native_provider_auth_operator_required", providerHoldCode: "codex_external_auth_operator_required",
+      reason: "runner_exit_unverified", retryable: false, operatorRequired: true,
+    });
+    expect(launcher).toHaveBeenCalledOnce();
+    const calls = (await readFile(callsPath, "utf8")).trim().split(/\r?\n/);
+    expect(calls.filter(call => call === "turn/start")).toHaveLength(1);
+    expect(calls).not.toContain("thread/resume");
+    expect(JSON.stringify(bundle.evidence().diagnostics)).not.toContain("SYNTHETIC_PRIVATE_EXIT_REFLECTION");
+  } finally {
+    await bundle.transport.close().catch(() => undefined);
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (providerPid) { try { process.kill(providerPid, "SIGKILL"); } catch { /* Already retired by owned runner. */ } }
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
 
 it("replaces an owned v1 runner with fresh v2 authorization before warm attachment", async () => {
   const directory = await mkdtemp(join(tmpdir(), "runnerd-v1-v2-replacement-"));

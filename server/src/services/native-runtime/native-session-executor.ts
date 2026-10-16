@@ -70,6 +70,10 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   NativeProviderTerminalFailure,
+  NativeProviderAuthHoldError,
+  isNativeProviderAuthHoldCode,
+  NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED,
+  NATIVE_PROVIDER_AUTH_HOLD_MESSAGE,
   NativeSessionCleanupQuarantinedError,
   NativeSessionProtocolIntegrityError,
   completeRetainedNativeSessionCleanup,
@@ -6047,6 +6051,7 @@ export function nativeSessionFailureDisposition(
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
 ) {
   const permanentFailure =
+    sourceFailureCode === NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED ||
     sourceFailureCode === "native_provider_model_rejected" ||
     sourceFailureCode === "native_provider_approval_required" ||
     sourceFailureCode === "native_event_replay_conflict" ||
@@ -6100,6 +6105,7 @@ export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
   | "native_provider_terminal_failed"
+  | "native_provider_auth_operator_required"
   | "native_provider_approval_required"
   | "native_provider_usage_limit"
   | "native_session_cleanup_quarantined"
@@ -6122,6 +6128,7 @@ export function nativeSessionFailureSourceCode(
   | "native_current_wake_comments_unread"
   | "native_current_wake_comments_changed_after_read"
   | "native_session_interrupted" {
+  if (nativeProviderAuthHold(error)) return NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED;
   if (error instanceof NativeProviderTerminalFailure) {
     if (error.providerCode === "approval_required") return "native_provider_approval_required";
     // Failed terminals retain their security meaning across the provider facade.
@@ -6199,6 +6206,64 @@ export function nativeSessionFailureSourceCode(
     return "native_current_wake_comments_unread";
   }
   return "native_session_interrupted";
+}
+
+function nativeProviderAuthHold(error: unknown) {
+  if (error instanceof NativeProviderAuthHoldError) return new NativeProviderAuthHoldError(error.providerHoldCode, error.reason);
+  if (error instanceof NativeProviderTerminalFailure && isNativeProviderAuthHoldCode(error.providerCode)) {
+    return new NativeProviderAuthHoldError(error.providerCode, "provider_terminal");
+  }
+  return null;
+}
+
+/** Retain physical ownership; terminal here suppresses provider replay only. */
+export async function retainFactoryProviderAuthHold(input: {
+  db: Db;
+  binding: NativeExecutionInput["binding"];
+  leaseOwner: string;
+  attempt: number;
+  hold: InstanceType<typeof NativeProviderAuthHoldError>;
+}): Promise<void> {
+  const now = new Date();
+  const fact = { schema: "factory.provider-auth-hold.v1", code: input.hold.providerHoldCode,
+    reason: input.hold.reason, retryable: false, operatorRequired: true,
+    providerTerminalObserved: false, cleanupUnconfirmed: true };
+  await input.db.transaction(async (tx) => {
+    const [issue] = await tx.select().from(issues).where(and(
+      eq(issues.id, input.binding.issueId), eq(issues.companyId, input.binding.companyId),
+    )).for("update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.id, input.binding.runId), eq(heartbeatRuns.companyId, input.binding.companyId),
+      eq(heartbeatRuns.agentId, input.binding.agentId), eq(heartbeatRuns.nativeIssueId, input.binding.issueId),
+      eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "running"),
+    )).for("update");
+    if (!run) return;
+    const [held] = await tx.update(nativeRunFinalizations).set({
+      phase: "terminal_failure", recoveryState: "blocked", failureCode: NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED,
+      nextAttemptAt: null, updatedAt: now,
+      failureDetail: { message: NATIVE_PROVIDER_AUTH_HOLD_MESSAGE, originalFailureCode: input.hold.providerHoldCode,
+        providerAuthHold: fact, recoverable: false, recoveryOwner: { kind: "board" },
+        nextAction: NATIVE_PROVIDER_AUTH_HOLD_MESSAGE },
+      // Do not clear process identity, lease owner/expiry, deadline or result.
+    }).where(and(eq(nativeRunFinalizations.runId, input.binding.runId),
+      eq(nativeRunFinalizations.companyId, input.binding.companyId),
+      eq(nativeRunFinalizations.leaseOwner, input.leaseOwner), eq(nativeRunFinalizations.attempt, input.attempt),
+      isNull(nativeRunFinalizations.resultId),
+    )).returning({ runId: nativeRunFinalizations.runId });
+    if (!held || issue?.assigneeAgentId !== input.binding.agentId
+        || !["in_progress", "in_review"].includes(issue.status)
+        || (issue.executionRunId && issue.executionRunId !== input.binding.runId)
+        || (issue.checkoutRunId && issue.checkoutRunId !== input.binding.runId)) return;
+    await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+      companyId: input.binding.companyId, sourceIssueId: input.binding.issueId, kind: "active_run_watchdog",
+      ownerType: "board", ownerAgentId: null, returnOwnerAgentId: input.binding.agentId,
+      cause: NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED,
+      fingerprint: createHash("sha256").update(`${input.binding.runId}:${input.hold.providerHoldCode}:${input.hold.reason}`).digest("hex"),
+      evidence: { runId: input.binding.runId, providerAuthHold: fact, coordinatorAttempt: input.attempt },
+      nextAction: NATIVE_PROVIDER_AUTH_HOLD_MESSAGE, wakePolicy: null, maxAttempts: 1,
+      supersedeOnIdentityChange: true,
+    });
+  });
 }
 
 const NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE =
@@ -8683,6 +8748,8 @@ async function executePaperclipNativeSessionWithinScope(
     clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
   } catch (error) {
+    const providerAuthHold = nativeProviderAuthHold(error);
+    if (providerAuthHold) error = providerAuthHold;
     if (nativeRunsDetachingForRestart.has(input.execution.binding.runId)) {
       await leaseRenewal.stop().catch(() => undefined);
       liveQuestions.close();
@@ -8709,6 +8776,15 @@ async function executePaperclipNativeSessionWithinScope(
         }
         await trace.finish("ok").catch(() => undefined);
         throw deferred;
+      }
+      if (providerAuthHold) {
+        try {
+          await retainFactoryProviderAuthHold({ db: input.db, binding: input.execution.binding,
+            leaseOwner, attempt, hold: providerAuthHold });
+        } catch {
+          // No database failure can authorize releasing the physical owner or
+          // reflecting its exception. The existing ownership marker still wins.
+        }
       }
       // Every post-admission failure retains the original run. No automatic
       // fresh environment lease can authorize replay of the worker run journal.
@@ -8897,7 +8973,7 @@ async function executePaperclipNativeSessionWithinScope(
                   ? error.providerCode
                   : sourceFailureCode,
               recoverable:
-                error instanceof NativeProviderTerminalFailure
+                sourceFailureCode === NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED ? false : error instanceof NativeProviderTerminalFailure
                   ? error.recoverable
                   : phase === "retryable_failure",
               recoveryMode: recoveryEvidence.recoveryMode,
@@ -8907,7 +8983,9 @@ async function executePaperclipNativeSessionWithinScope(
               checkpointExists: recoveryEvidence.checkpointExists,
               recoveryOwner: recoveryProjection.recoveryOwner,
               nextAction:
-                sourceFailureCode === "native_provider_approval_required"
+                sourceFailureCode === NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED
+                  ? NATIVE_PROVIDER_AUTH_HOLD_MESSAGE
+                  : sourceFailureCode === "native_provider_approval_required"
                   ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
                   : sourceFailureCode === "native_session_cleanup_quarantined"
                   ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
@@ -9082,7 +9160,9 @@ async function executePaperclipNativeSessionWithinScope(
               recoveryEvidence.providerSessionEstablished,
           },
           nextAction:
-            sourceFailureCode === "native_provider_approval_required"
+            sourceFailureCode === NATIVE_PROVIDER_AUTH_OPERATOR_REQUIRED
+              ? NATIVE_PROVIDER_AUTH_HOLD_MESSAGE
+              : sourceFailureCode === "native_provider_approval_required"
               ? "Approval required. Review the operation and update the agent's permission setting before retrying. This runner has no interactive approval handler."
               : sourceFailureCode === "native_session_cleanup_quarantined"
               ? NATIVE_CLEANUP_OPERATOR_RECOVERY_MESSAGE
@@ -12815,6 +12895,8 @@ async function createRunnerdBackendWithinSessionClaim(
           ? resolveSourceCodexHome(resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment))
           : undefined,
         runnerProcessLauncher: remoteProcessLauncher,
+        factoryProviderAuth: isFactoryWorkerTarget(target)
+          ? (input.execution.provider.kind === "codex" ? "codex" : "claude") : undefined,
         runnerReconnectGraceMs: remoteTarget ? 120_000 : undefined,
         adoptExistingRunner: adoptedProcess,
         environment: effectiveRunnerEnvironment,
