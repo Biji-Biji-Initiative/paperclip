@@ -15,7 +15,7 @@ function fixture() {
   const workspaceRoot = `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`, sessionId = "native-" + randomUUID();
   const workerLease = createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID, runId, leaseId,
     workspaceId, workspaceRoot, sessionId, deadlineUnixMs: Date.now() + 60_000 });
-  const providerAdmission: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v1", provider: "codex",
+  const providerAdmission: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v2", provider: "codex",
     admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: sessionId, runnerInstanceId, workerPlanSha256: "a".repeat(64) };
   const owner = new NativeSshForegroundOwner({ directory, runId, runnerInstanceId, ownershipError: () => new Error("ownership-held") });
   const remoteBinary = workspaceRoot + "/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd";

@@ -43,11 +43,26 @@ describe("Factory provider DB-current admission", () => {
   it("binds real IDs/plan and creates fresh attempt IDs after authorization", async () => {
     const f = fixture();
     const a = await createAuthorizedFactoryWorkerAdmission(f), b = await createAuthorizedFactoryWorkerAdmission(f);
-    expect(a.providerAdmission).toMatchObject({ normalizedSessionId: f.sessionId, runnerInstanceId: f.runnerInstanceId,
+    expect(a.providerAdmission).toMatchObject({ schema: "factory.provider-worker-binding.v2", provider: "codex", normalizedSessionId: f.sessionId, runnerInstanceId: f.runnerInstanceId,
       workerPlanSha256: f.target.factoryProviderAdmission!.workerPlanSha256 });
     expect(a.providerAdmission!.admissionId).not.toBe(b.providerAdmission!.admissionId);
     expect(a.providerAdmission!.capabilityId).not.toBe(b.providerAdmission!.capabilityId);
     expect(a.workerLease.deadlineUnixMs).toBe(f.run.executionControlDeadlineAt.getTime());
+  });
+  it.each(["registration", "execution", "stored execution"])("keeps %s Codex-only despite the low-level Claude v2 contract", async boundary => {
+    const f = fixture();
+    if (boundary === "registration") {
+      Reflect.set(f.environment.config.factoryProviderAdmission!, "provider", "claude");
+      Reflect.set(f.target.factoryProviderAdmission!, "provider", "claude");
+    } else if (boundary === "execution") {
+      f.execution = { ...f.execution, provider: { kind: "acpx", agent: "claude" } } as NativeExecutionInput;
+    } else {
+      const stored = f.run.runnerProfileJson.nativeExecutionInput;
+      f.run.runnerProfileJson.nativeExecutionInput = { ...stored, provider: { kind: "acpx", agent: "claude" } } as NativeExecutionInput;
+    }
+    await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toMatchObject({
+      name: "NativeRunnerOwnershipUnverifiedError", reason: "ssh_foreground_ownership_unverified",
+    });
   });
   it("rejects changed registration, omitted mode, stale runner/session and inactive lease", async () => {
     const mutations = [

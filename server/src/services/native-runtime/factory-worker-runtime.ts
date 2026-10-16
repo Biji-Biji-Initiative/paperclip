@@ -138,7 +138,7 @@ export async function createAuthorizedFactoryWorkerAdmission(input: {
       (run.runnerProfileJson?.durableEnvironmentLeaseId !== undefined && run.runnerProfileJson.durableEnvironmentLeaseId !== lease.id) ||
       (stored.session?.normalizedSessionId ?? `session-${run.id}`) !== nativeSession) fail();
   const providerAdmission: FactoryProviderBinding = {
-    schema: "factory.provider-worker-binding.v1", provider: "codex",
+    schema: "factory.provider-worker-binding.v2", provider: "codex",
     admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: nativeSession,
     runnerInstanceId: attempt.runnerInstanceId, workerPlanSha256: providerMode.workerPlanSha256,
   };

@@ -7,15 +7,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createFactoryWorkerLeaseDescriptor, FACTORY_COMPANY_ID } from "./factory-worker-lease.js";
 import { FACTORY_ADMISSION_NAMESPACE, FACTORY_PROVIDER_MARKER, FACTORY_PROVIDER_POLICY,
   createFactoryControllerAdmission, encodeFactoryControllerAdmission, encodeFactoryProviderLaunch,
-  signFactoryControllerAdmission, type FactoryProviderBinding } from "./factory-provider-admission.js";
+  signFactoryControllerAdmission, validateFactoryProviderBinding, type FactoryProviderBinding } from "./factory-provider-admission.js";
 
 function fixture() {
   const workspaceId = randomUUID();
   const descriptor = createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID, runId: randomUUID(), leaseId: randomUUID(),
     workspaceId, workspaceRoot: `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`, sessionId: "worker-session", deadlineUnixMs: Date.now() + 60000 });
-  const binding: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v1", provider: "codex", admissionId: randomUUID(),
+  const binding: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v2", provider: "codex", admissionId: randomUUID(),
     capabilityId: randomUUID(), normalizedSessionId: "native-session", runnerInstanceId: "runner-fixture", workerPlanSha256: "a".repeat(64) };
-  const prepared = { protocol: FACTORY_PROVIDER_MARKER, type: "preparation", status: "prepared", companyId: descriptor.companyId,
+  const prepared = { protocol: FACTORY_PROVIDER_MARKER, provider: binding.provider, type: "preparation", status: "prepared", companyId: descriptor.companyId,
     runId: descriptor.runId, leaseId: descriptor.leaseId, sessionId: descriptor.sessionId, ownerNonce: "b".repeat(32), bootId: randomUUID(),
     createdUnixMs: Date.now(), deadlineUnixMs: descriptor.deadlineUnixMs, workerPlanSha256: binding.workerPlanSha256, dispatchAttempted: false };
   const command = [`${descriptor.workspaceRoot}/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd`,
@@ -49,9 +49,37 @@ describe("explicit provider launch and immutable controller record", () => {
       expect(() => createFactoryControllerAdmission(f.descriptor, f.binding, { ...f.prepared, ...changes })).toThrow();
     }
   });
+  it.each(["codex", "claude"] as const)("binds %s explicitly in launch, prepared receipt and signed payload", provider => {
+    const f = fixture(); f.binding.provider = provider; f.prepared.provider = provider;
+    const header = JSON.parse(encodeFactoryProviderLaunch(f.descriptor, f.binding, f.command).toString());
+    expect(header.protocol).toBe("factory-worker-provider-lease-v2");
+    expect(header.policy).toBe("factory-worker-provider-scope-v2");
+    expect(header.providerAdmission.provider).toBe(provider);
+    const record = createFactoryControllerAdmission(f.descriptor, f.binding, f.prepared);
+    expect(record.schema).toBe("factory.provider-controller-admission.v2");
+    expect(JSON.parse(encodeFactoryControllerAdmission(record).toString()).provider).toBe(provider);
+  });
+  it("rejects old or provider-absent bindings and prepared receipts", () => {
+    const f = fixture();
+    const { provider: _bindingProvider, ...withoutProvider } = f.binding;
+    for (const value of [withoutProvider, { ...f.binding, schema: "factory.provider-worker-binding.v1" }]) {
+      expect(() => validateFactoryProviderBinding(value)).toThrow("factory_provider_admission_invalid");
+    }
+    const { provider: _receiptProvider, ...withoutReceiptProvider } = f.prepared;
+    for (const value of [withoutReceiptProvider, { ...f.prepared, provider: "claude" },
+      { ...f.prepared, protocol: "factory-worker-provider-lease-v1" }]) {
+      expect(() => createFactoryControllerAdmission(f.descriptor, f.binding, value)).toThrow("factory_provider_admission_invalid");
+    }
+    const record = createFactoryControllerAdmission(f.descriptor, f.binding, f.prepared);
+    for (const [key, value] of [["provider", undefined], ["provider", "unregistered"],
+      ["schema", "factory.provider-controller-admission.v1"]] as const) {
+      const invalid = { ...record }; Reflect.set(invalid, key, value);
+      expect(() => encodeFactoryControllerAdmission(invalid)).toThrow("factory_provider_admission_invalid");
+    }
+  });
   it("does not accept another provider or request-selected source/account fields", () => {
     const f = fixture();
-    for (const changes of [{ provider: "claude" }, { source: "/arbitrary" }, { account: "arbitrary" }]) {
+    for (const changes of [{ provider: "unregistered" }, { source: "/arbitrary" }, { account: "arbitrary" }]) {
       expect(() => encodeFactoryProviderLaunch(f.descriptor, { ...f.binding, ...changes } as FactoryProviderBinding, f.command)).toThrow();
     }
   });
@@ -72,12 +100,19 @@ describe("scoped SSHSIG signer", () => {
     await writeFile(signature, signed.signature, { mode: 0o600 });
     await writeFile(signers, `factory-${FACTORY_COMPANY_ID}@mereka.io namespaces="${FACTORY_ADMISSION_NAMESPACE}" ` +
       (await readFile(key + ".pub", "utf8")).trim() + "\n", { mode: 0o600 });
-    for (const namespace of [FACTORY_ADMISSION_NAMESPACE, "foreign@mereka.io"]) {
+    for (const namespace of [FACTORY_ADMISSION_NAMESPACE, "factory-provider-admission-v1@mereka.io", "foreign@mereka.io"]) {
       const result = spawnSync("/usr/bin/ssh-keygen", ["-Y", "verify", "-f", signers, "-I", `factory-${FACTORY_COMPANY_ID}@mereka.io`,
         "-n", namespace, "-s", signature], { input: Buffer.from(signed.payload, "base64"), stdio: ["pipe", "ignore", "ignore"],
         timeout: 5000, env: { PATH: "/usr/bin:/bin", LANG: "C" } });
       expect(result.status === 0).toBe(namespace === FACTORY_ADMISSION_NAMESPACE);
     }
+    // A valid provider substitution is still a signature forgery, not merely a schema error.
+    const tampered = encodeFactoryControllerAdmission({ ...record, provider: "claude" });
+    const rejected = spawnSync("/usr/bin/ssh-keygen", ["-Y", "verify", "-f", signers,
+      "-I", `factory-${FACTORY_COMPANY_ID}@mereka.io`, "-n", FACTORY_ADMISSION_NAMESPACE, "-s", signature],
+      { input: tampered, stdio: ["pipe", "ignore", "ignore"], timeout: 5000, env: { PATH: "/usr/bin:/bin", LANG: "C" } });
+    expect(rejected.status).not.toBe(0);
+
   });
   it("never starts a signer for a pre-aborted admission", async () => {
     const f = fixture(), controller = new AbortController(); controller.abort();

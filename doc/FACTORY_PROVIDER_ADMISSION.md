@@ -1,15 +1,15 @@
 # Factory signed provider admission
 
 `openDedicatedSshDuplex` accepts an explicit `providerAdmission` binding only with
-a worker lease. This chooses the separate Codex-only
-`factory-worker-provider-lease-v1` protocol. Ordinary workerLease callers retain
+a worker lease. This chooses the separate provider-bound
+`factory-worker-provider-lease-v2` protocol. Ordinary workerLease callers retain
 the credential-free v1/scope-v2 protocol.
 
 The adapter validates the actual native argv run/lease/session/runner IDs, awaits
-the preparing challenge, binds nonce/boot/creation/deadline to its current frozen
-plan and signs canonical metadata. Signing uses the existing temporary scoped
+the preparing challenge and requires its provider to match the binding. It binds
+nonce/boot/creation/deadline to its current frozen plan and signs canonical metadata. Signing uses the existing temporary scoped
 SSH key and `/usr/local/bin/ssh-keygen` from the application image, with namespace
-`factory-provider-admission-v1@mereka.io`. No key or provider bearer enters the
+`factory-provider-admission-v2@mereka.io`. No private key or provider bearer enters the
 wire record. Abort, timeout, premature EOF or unexpected channel data closes the
 owned channel and cancels its signer. Only a matching accepted receipt admits the
 lifetime channel; a strict busy receipt additionally requires real exit 75.
@@ -33,7 +33,19 @@ The root-host fixed policy chooses the canonical CAAM profile/account/source;
 the signed request never selects source paths or account material. Host receiver
 installation, source mapping, entitlement, native FD consumption and actual tool
 confinement remain deployment gates. These source helpers do not connect accounts.
-Claude needs a distinct reviewed provider contract rather than Codex account fields.
+The low-level v2 contract accepts `codex` or `claude` in the required `provider`
+field of binding, prepared receipt and signed controller admission. The binding
+schema is `factory.provider-worker-binding.v2`; controller schemas are
+`factory.provider-controller-admission.v2` and `factory.provider-controller-signed.v2`.
+The provider discriminator is signed metadata, not a request-selected account or source.
+Missing providers, mismatched preparation, old v1 schemas and the old signature
+namespace fail closed. The unshipped provider v1 contract is replaced, not retained
+as a second issuer. Ordinary credential-free lease v1/scope-v2 stays unchanged.
+
+Persisted server registration, runtime authorization and subscription billing policy
+remain Codex-only. Low-level Claude schema fixtures do not enable Claude jobs.
+Its canonical host source, native consumer and actual isolation must qualify before
+a separate activation change; no source mapping or live setting changes here.
 
 Focused checks: run Vitest for `factory-provider-admission.test.ts` and
 `factory-provider-lease-channel.test.ts`, then adapter-utils typecheck. Fixtures

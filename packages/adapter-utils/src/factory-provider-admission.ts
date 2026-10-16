@@ -3,13 +3,14 @@ import { isAbsolute } from "node:path";
 import { FACTORY_COMPANY_ID, encodeFactoryWorkerLaunch, validateFactoryWorkerLeaseDescriptor,
   type FactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
 
-export const FACTORY_PROVIDER_MARKER = "factory-worker-provider-lease-v1" as const;
-export const FACTORY_PROVIDER_POLICY = "factory-worker-provider-scope-v1" as const;
-export const FACTORY_ADMISSION_NAMESPACE = "factory-provider-admission-v1@mereka.io" as const;
-export const FACTORY_ADMISSION_SIGNED_SCHEMA = "factory.provider-controller-signed.v1" as const;
+export const FACTORY_PROVIDER_MARKER = "factory-worker-provider-lease-v2" as const;
+export const FACTORY_PROVIDER_POLICY = "factory-worker-provider-scope-v2" as const;
+export const FACTORY_ADMISSION_NAMESPACE = "factory-provider-admission-v2@mereka.io" as const;
+export const FACTORY_ADMISSION_SIGNED_SCHEMA = "factory.provider-controller-signed.v2" as const;
+export type FactoryAdmissionProvider = "codex" | "claude";
 export interface FactoryProviderBinding {
-  schema: "factory.provider-worker-binding.v1";
-  provider: "codex";
+  schema: "factory.provider-worker-binding.v2";
+  provider: FactoryAdmissionProvider;
   admissionId: string;
   capabilityId: string;
   normalizedSessionId: string;
@@ -18,6 +19,7 @@ export interface FactoryProviderBinding {
 }
 export interface FactoryPreparedReceipt {
   protocol: typeof FACTORY_PROVIDER_MARKER;
+  provider: FactoryAdmissionProvider;
   type: "preparation";
   status: "prepared";
   companyId: string;
@@ -32,7 +34,8 @@ export interface FactoryPreparedReceipt {
   dispatchAttempted: false;
 }
 export interface FactoryControllerAdmission {
-  schema: "factory.provider-controller-admission.v1";
+  schema: "factory.provider-controller-admission.v2";
+  provider: FactoryAdmissionProvider;
   admissionId: string;
   companyId: typeof FACTORY_COMPANY_ID;
   capabilityId: string;
@@ -53,9 +56,9 @@ export interface FactorySignedAdmission {
   signature: string;
 }
 const bindingKeys = ["schema", "provider", "admissionId", "capabilityId", "normalizedSessionId", "runnerInstanceId", "workerPlanSha256"];
-const preparedKeys = ["protocol", "type", "status", "companyId", "runId", "leaseId", "sessionId", "ownerNonce", "bootId",
+const preparedKeys = ["protocol", "provider", "type", "status", "companyId", "runId", "leaseId", "sessionId", "ownerNonce", "bootId",
   "createdUnixMs", "deadlineUnixMs", "workerPlanSha256", "dispatchAttempted"];
-const admissionKeys = ["schema", "admissionId", "companyId", "capabilityId", "runId", "environmentLeaseId", "workerSessionId",
+const admissionKeys = ["schema", "provider", "admissionId", "companyId", "capabilityId", "runId", "environmentLeaseId", "workerSessionId",
   "normalizedSessionId", "runnerInstanceId", "workerOwnerNonce", "workerPlanSha256", "bootId", "createdUnixMs", "admittedUntilUnixMs"];
 const ID = /^[A-Za-z0-9_.:@+-]{1,128}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -66,11 +69,12 @@ function object(value: unknown): value is Record<string, unknown> {
 function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return object(value) && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 }
+function provider(value: unknown): value is FactoryAdmissionProvider { return value === "codex" || value === "claude"; }
 function id(value: unknown): value is string { return typeof value === "string" && ID.test(value); }
 function integer(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value); }
 
 export function validateFactoryProviderBinding(value: unknown): asserts value is FactoryProviderBinding {
-  if (!exact(value, bindingKeys) || value.schema !== "factory.provider-worker-binding.v1" || value.provider !== "codex" ||
+  if (!exact(value, bindingKeys) || value.schema !== "factory.provider-worker-binding.v2" || !provider(value.provider) ||
       ["admissionId", "capabilityId", "normalizedSessionId", "runnerInstanceId"].some(key => !id(value[key])) ||
       typeof value.workerPlanSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.workerPlanSha256)) invalid();
 }
@@ -99,7 +103,7 @@ export function validateFactoryPreparedReceipt(value: unknown, descriptor: Facto
   validateFactoryWorkerLeaseDescriptor(descriptor);
   validateFactoryProviderBinding(binding);
   if (!exact(value, preparedKeys) || value.protocol !== FACTORY_PROVIDER_MARKER || value.type !== "preparation" ||
-      value.status !== "prepared" || value.dispatchAttempted !== false ||
+      value.status !== "prepared" || value.provider !== binding.provider || value.dispatchAttempted !== false ||
       ["companyId", "runId", "leaseId", "sessionId"].some(key => value[key] !== descriptor[key as keyof FactoryWorkerLeaseDescriptor]) ||
       value.workerPlanSha256 !== binding.workerPlanSha256 || value.deadlineUnixMs !== descriptor.deadlineUnixMs ||
       typeof value.ownerNonce !== "string" || !/^[a-f0-9]{32}$/.test(value.ownerNonce) ||
@@ -110,7 +114,7 @@ export function validateFactoryPreparedReceipt(value: unknown, descriptor: Facto
 export function createFactoryControllerAdmission(descriptor: FactoryWorkerLeaseDescriptor, binding: FactoryProviderBinding,
   prepared: unknown): FactoryControllerAdmission {
   validateFactoryPreparedReceipt(prepared, descriptor, binding);
-  return { schema: "factory.provider-controller-admission.v1", admissionId: binding.admissionId,
+  return { schema: "factory.provider-controller-admission.v2", provider: binding.provider, admissionId: binding.admissionId,
     companyId: FACTORY_COMPANY_ID, capabilityId: binding.capabilityId, runId: descriptor.runId,
     environmentLeaseId: descriptor.leaseId, workerSessionId: descriptor.sessionId,
     normalizedSessionId: binding.normalizedSessionId, runnerInstanceId: binding.runnerInstanceId,
@@ -119,7 +123,7 @@ export function createFactoryControllerAdmission(descriptor: FactoryWorkerLeaseD
 }
 
 export function encodeFactoryControllerAdmission(value: FactoryControllerAdmission): Buffer {
-  if (!exact(value, admissionKeys) || value.schema !== "factory.provider-controller-admission.v1" || value.companyId !== FACTORY_COMPANY_ID ||
+  if (!exact(value, admissionKeys) || value.schema !== "factory.provider-controller-admission.v2" || !provider(value.provider) || value.companyId !== FACTORY_COMPANY_ID ||
       ["admissionId", "capabilityId", "runId", "environmentLeaseId", "normalizedSessionId", "runnerInstanceId"].some(key => !id(value[key])) ||
       typeof value.workerSessionId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(value.workerSessionId) ||
       typeof value.workerOwnerNonce !== "string" || !/^[a-f0-9]{32}$/.test(value.workerOwnerNonce) ||
