@@ -195,6 +195,21 @@ function requestShutdown(reason: string): void {
   );
 }
 
+function verifyFactoryClaudeAdmission(expectedRunId: string): void {
+  try {
+    verifyFactoryClaudeSidecarRun(factoryClaudeAccess, expectedRunId);
+  } catch (error) {
+    if (factoryClaudeAccess) {
+      const reason = "Factory Claude admission expired or mismatched";
+      requestShutdown(reason);
+      // A provider callback can be needed to settle pendingInput itself.
+      // Start the existing owned cleanup now; never await it inside that callback.
+      void shutdown(reason).catch((failure) => diagnostic("sidecar_shutdown_failed", safeMessage(failure)));
+    }
+    throw error;
+  }
+}
+
 async function receiveLine(line: string): Promise<void> {
   if (shutdownRequested) return;
   if (!line.trim()) return;
@@ -219,7 +234,7 @@ async function receiveLine(line: string): Promise<void> {
   } catch (error) {
     const normalized =
       error instanceof Error ? error : new Error(String(error));
-    if (factoryClaudeAccess && ["initialize", "session.open", "run.attach"].includes(request.command)) {
+    if (factoryClaudeAccess && ["initialize", "session.open", "run.attach", "turn.start", "turn.steer", "permission.resolve", "input.resolve", "tool.resolve", "session.goal.set", "session.goal.clear"].includes(request.command)) {
       retireFactoryClaudeSidecarAccess(factoryClaudeAccess);
       requestShutdown("Factory Claude admission failed");
     }
@@ -351,7 +366,7 @@ async function dispatch(
       throw new Error("ACPX run tool catalog differs from the opened session");
     }
     const attachment = parseAcpxRunAttachment(request.params);
-    verifyFactoryClaudeSidecarRun(factoryClaudeAccess, attachment.runId);
+    verifyFactoryClaudeAdmission(attachment.runId);
     runId = attachment.runId;
     return {
       runId: attachment.runId,
@@ -378,6 +393,7 @@ async function dispatch(
     let usageBefore: unknown;
     try {
       usageBefore = await readSidecarHostStatusWithin(activeHost);
+      verifyFactoryClaudeAdmission(runId);
       runtimeTurn = activeHost.startTurn({
         requestId: `${runId}:${currentTurnId}`,
         text: boundedText(request.params.message, "message", 1024 * 1024),
@@ -408,6 +424,7 @@ async function dispatch(
     }
     turnControls.reserve(control, turnId);
     const runtimeRequestId = `${runId}:${control.turnId}`;
+    verifyFactoryClaudeAdmission(runId);
     if (control.mode === "steer") await activeHost.steerActiveTurn(control.message, runtimeRequestId);
     else await activeHost.queueFollowUp(control.message, runtimeRequestId);
     if (host !== activeHost || turnId !== control.turnId) throw new Error("ACP turn settled before control acknowledgement");
@@ -426,6 +443,7 @@ async function dispatch(
     return { cancelled: true };
   }
   if (request.command === "permission.resolve") {
+    verifyFactoryClaudeAdmission(runId ?? "");
     const requestId = boundedIdentity(request.params.requestId, "requestId");
     const expectedTurnId = boundedIdentity(request.params.turnId, "turnId");
     const pending = permissions.get(requestId);
@@ -439,6 +457,7 @@ async function dispatch(
     return await deliverAcpxResponse(pending.responseDelivery, () => pending.settle(decision));
   }
   if (request.command === "input.resolve") {
+    verifyFactoryClaudeAdmission(runId ?? "");
     const requestId = boundedIdentity(request.params.requestId, "requestId");
     const expectedTurnId = boundedIdentity(request.params.turnId, "turnId");
     const pending = inputs.get(requestId);
@@ -461,6 +480,7 @@ async function dispatch(
     return await deliverAcpxResponse(pending.responseDelivery, deliver);
   }
   if (request.command === "tool.resolve") {
+    verifyFactoryClaudeAdmission(runId ?? "");
     const callId = boundedIdentity(request.params.callId, "callId");
     const expectedTurnId = boundedIdentity(request.params.turnId, "turnId");
     const pending = tools.get(callId);
@@ -535,11 +555,13 @@ async function dispatch(
           ? "resume"
           : null;
     if (!action) throw new Error("session.goal.set requires an objective or active/paused status");
+    verifyFactoryClaudeAdmission(runId ?? "");
     const goal = await activeHost.controlGoal(action, objective || undefined);
     return observedGoalProjection(activeHost.goalCapability(), goal, turnId !== null);
   }
   if (request.command === "session.goal.clear") {
     const activeHost = requireHost();
+    verifyFactoryClaudeAdmission(runId ?? "");
     await activeHost.controlGoal("clear");
     return observedGoalProjection(activeHost.goalCapability(), null, turnId !== null);
   }
@@ -659,6 +681,7 @@ async function pumpTurn(
 }
 
 async function waitForTool(call: RunnerToolCall): Promise<unknown> {
+  verifyFactoryClaudeAdmission(runId ?? "");
   const activeTurnId = turnId;
   if (!activeTurnId || call.signal.aborted) {
     throw new Error("ACPX tool call is not bound to an active turn");
@@ -751,6 +774,7 @@ async function waitForPermission(
   context: { signal: AbortSignal; responseDelivery?: Promise<void> },
 ): Promise<AcpPermissionDecision> {
   const { signal } = context;
+  verifyFactoryClaudeAdmission(runId ?? "");
   if (turnId !== activeTurnId || signal.aborted || permissions.size >= MAX_PENDING_INPUTS) {
     return { outcome: "cancel" };
   }
@@ -781,6 +805,7 @@ async function waitForInput(
   request: AcpElicitationRequest,
   context: AcpElicitationContext,
 ): Promise<AcpElicitationResponse> {
+  verifyFactoryClaudeAdmission(runId ?? "");
   if (turnId !== activeTurnId || context.signal.aborted) {
     return { action: "cancel" };
   }
@@ -828,6 +853,7 @@ async function waitForExtensionInput(
   input: AcpxExtensionInput,
   context: { requestId: string | number | null; signal: AbortSignal; responseDelivery?: Promise<void> },
 ): Promise<Record<string, unknown>> {
+  verifyFactoryClaudeAdmission(runId ?? "");
   if (turnId !== activeTurnId || context.signal.aborted || inputs.size >= MAX_PENDING_INPUTS) return input.cancel();
   const responseDelivery = requireAcpxResponseDelivery(context);
   const requestId = stableRequestId(activeTurnId, ++requestSequence, context.requestId);

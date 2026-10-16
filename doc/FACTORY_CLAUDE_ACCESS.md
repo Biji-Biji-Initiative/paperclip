@@ -14,7 +14,10 @@ paths and a maximum 300-second deadline. Private access can expire earlier.
 
 A private in-memory capability permits one matching session open and run attach.
 Open, attach and handoff check actual access expiry independently of the retirement
-timer. Runtime host supplies the actual workspace, runtime, authenticated tool
+timer. Prompt, follow-up, goal and interaction submission boundaries also recheck
+access. Callback failures begin the existing owned provider cleanup immediately,
+so an unresolved serial input response cannot hold cleanup behind itself.
+Runtime host supplies the actual workspace, runtime, authenticated tool
 bridge and assigned semantic tools. Extra native MCP gateways are held for this
 initial contract. Finish and block remain available.
 

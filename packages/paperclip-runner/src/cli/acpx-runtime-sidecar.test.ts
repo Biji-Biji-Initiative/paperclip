@@ -3,6 +3,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { transformSync } from "esbuild";
+
+import { deliverAcpxResponse } from "../drivers/acpx/response-delivery.js";
+import { enqueueAcpxSidecarInput } from "./acpx-sidecar-input.js";
 
 import { normalizeAcpxPermission } from "../drivers/acpx/acp-permission-adapter.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
@@ -41,11 +45,12 @@ describe("qualified ACPX runtime sidecar", () => {
     expect(start).toBeGreaterThan(0);
     const permissions = new Map<string, unknown>();
     const emitted: Array<{ choices: Array<{ key: string }> }> = [];
-    const wait = new Function("permissions", "openParams", "normalizeAcpxPermission", "emit",
+    const wait = new Function("permissions", "openParams", "normalizeAcpxPermission", "emit", "verifyFactoryClaudeAdmission", "factoryClaudeAccess", "runId",
       `let turnId = "turn-1", requestSequence = 0; const MAX_PENDING_INPUTS = 512;
        const stableRequestId = () => "request-1"; const requireAcpxResponseDelivery = c => c.responseDelivery;
        return async function(activeTurnId, request, context) { ${source.slice(start, end)}`)(
       permissions, { agent }, normalizeAcpxPermission, (_event: string, payload: { choices: Array<{ key: string }> }) => emitted.push(payload),
+      () => undefined, undefined, "test-run",
     );
     const abort = new AbortController();
     const pending = wait("turn-1", { sessionId: "session", inferredKind: "edit", raw: {
@@ -733,6 +738,7 @@ function loadWaitForTool(input: {
   const factory = new Function(
     "boundedIdentity", "tools", "turnId", "emit", "PRP_COMPLETION_TOOL_NAME",
     "PRP_BLOCK_TOOL_NAME", "validatePrpStructuredRunResult", "boundedSidecarValue", "record", "MAX_PENDING_TOOLS",
+    "verifyFactoryClaudeAdmission", "factoryClaudeAccess", "runId",
     `return (${functionSource});`,
   );
   return factory(
@@ -749,5 +755,203 @@ function loadWaitForTool(input: {
     (value: unknown) => value,
     (value: unknown) => value,
     512,
+    () => undefined, undefined, "test-run",
   );
+}
+
+
+// Execute the production handlers, with provider effects replaced at their boundary.
+// Advancing this clock never runs timers: each admission must check expiry itself.
+describe("Factory Claude command admission after capability expiry", () => {
+  it("rechecks expiry after asynchronous host status before submitting a prompt", async () => {
+    const fixture = protectedDispatchFixture();
+    let release!: () => void;
+    fixture.dependencies.readSidecarHostStatusWithin = () => new Promise<void>(resolve => { release = resolve; });
+    const dispatch = fixture.load(null);
+    const result = dispatch({ command: "turn.start", params: { turnId: "turn-1", message: "synthetic" } });
+    fixture.expire();
+    release();
+    await expect(result).rejects.toThrow("synthetic capability expired");
+    expect(fixture.host.startTurn).not.toHaveBeenCalled();
+  });
+
+  it.each(["steer", "queue"])("rejects expired %s before the host receives it", async mode => {
+    const fixture = protectedDispatchFixture();
+    fixture.expire();
+    await expect(fixture.load()({ command: "turn.steer", params: {
+      turnId: "turn-1", controlId: "control-1", message: "synthetic", mode,
+    } })).rejects.toThrow("synthetic capability expired");
+    expect(fixture.host.steerActiveTurn).not.toHaveBeenCalled();
+    expect(fixture.host.queueFollowUp).not.toHaveBeenCalled();
+  });
+
+  it.each(["steer", "queue"])("preserves a fresh %s request", async mode => {
+    const fixture = protectedDispatchFixture();
+    await expect(fixture.load()({ command: "turn.steer", params: {
+      turnId: "turn-1", controlId: "control-1", message: "synthetic", mode,
+    } })).resolves.toMatchObject({ accepted: true, mode });
+    expect(mode === "steer" ? fixture.host.steerActiveTurn : fixture.host.queueFollowUp)
+      .toHaveBeenCalledWith("synthetic", "run-1:turn-1");
+  });
+
+  it.each(["session.goal.set", "session.goal.clear"])("rejects expired %s before goal mutation", async command => {
+    const fixture = protectedDispatchFixture();
+    fixture.expire();
+    await expect(fixture.load()({ command, params: { objective: "synthetic" } }))
+      .rejects.toThrow("synthetic capability expired");
+    expect(fixture.host.controlGoal).not.toHaveBeenCalled();
+  });
+
+  it.each(["permission", "input", "tool"])("holds expired %s responses before preparation or settlement", async kind => {
+    const fixture = protectedDispatchFixture();
+    fixture.expire();
+    await expect(fixture.load()({ command: `${kind}.resolve`, params: {
+      requestId: "request-1", callId: "request-1", turnId: "turn-1", resolution: {}, result: {},
+    } })).rejects.toThrow("synthetic capability expired");
+    expect(fixture.prepare).not.toHaveBeenCalled();
+    expect(fixture.settle).not.toHaveBeenCalled();
+    expect(fixture.cleanup).not.toHaveBeenCalled();
+    expect(fixture.pending.size).toBe(1);
+  });
+
+  it.each(["permission", "input", "tool"])("preserves fresh %s settlement and delivery receipts", async kind => {
+    const fixture = protectedDispatchFixture();
+    let release!: () => void;
+    fixture.responseDelivery = new Promise<void>(resolve => { release = resolve; });
+    const result = fixture.load()({ command: `${kind}.resolve`, params: {
+      requestId: "request-1", callId: "request-1", turnId: "turn-1", resolution: {}, result: {},
+    } });
+    // ACP settlement happens before awaiting the transport receipt; no fabricated await gap.
+    expect(fixture.settle).toHaveBeenCalledOnce();
+    expect(fixture.cleanup).toHaveBeenCalledOnce();
+    expect(fixture.pending.size).toBe(0);
+    release();
+    await expect(result).resolves.toEqual({ resolved: true });
+  });
+
+  it("starts owned cleanup immediately when callback expiry finds a blocked input queue", async () => {
+    let releaseInput!: () => void;
+    let releaseClose!: () => void;
+    const inputQueue = new Promise<void>(resolve => { releaseInput = resolve; });
+    const closeReceipt = new Promise<void>(resolve => { releaseClose = resolve; });
+    const close = vi.fn(() => closeReceipt);
+    const permissionSettled = vi.fn();
+    const toolRejected = vi.fn();
+    const inputCancelled = vi.fn();
+    const cleanup = vi.fn();
+    const dependencyValues = {
+      factoryClaudeAccess: {},
+      verifyFactoryClaudeSidecarRun: () => { throw new Error("synthetic capability expired"); },
+      initialInput: inputQueue, ownedHost: { close },
+      permissions: new Map([["permission-1", { turnId: "turn-1", settle: permissionSettled, cleanup }]]),
+      tools: new Map([["tool-1", { turnId: "turn-1", reject: toolRejected, cleanup }]]),
+      inputs: new Map([["input-1", { turnId: "turn-1", cancel: inputCancelled, cleanup }]]),
+      lines: { pause: vi.fn(), close: vi.fn() },
+      process: { stdin: { pause: vi.fn() }, exitCode: 0 },
+      enqueueAcpxSidecarInput,
+      diagnostic: vi.fn(), safeMessage: (error: unknown) => String(error),
+      retainActiveHostCleanup: vi.fn(),
+      observeSidecarCleanupWithin: async (receipt: Promise<void>) => { await receipt; return { status: "settled" }; },
+    };
+    const source = [
+      productionFunctionSource("verifyFactoryClaudeAdmission", "receiveLine"),
+      productionFunctionSource("requestShutdown", "verifyFactoryClaudeAdmission"),
+      productionFunctionSource("shutdown", "retainActiveHostCleanup"),
+      productionFunctionSource("rejectTurnWaiters", "boundRuntimeEventForNormalization"),
+    ].join("\n");
+    const compiled = transformSync(source, { loader: "ts", target: "es2022" }).code;
+    const actual = new Function(...Object.keys(dependencyValues), `
+      let closing = false, shutdownRequested = false, inputClosed = false;
+      let pendingInput = initialInput, host = ownedHost, activeHostCleanup = null, failedAdmissionCleanup = null;
+      let turnId = "turn-1", runId = "run-1", openParams = {};
+      ${compiled};
+      return { verifyFactoryClaudeAdmission, drained: () => pendingInput, closing: () => closing };
+    `)(...Object.values(dependencyValues)) as {
+      verifyFactoryClaudeAdmission: (runId: string) => void;
+      drained: () => Promise<void>; closing: () => boolean;
+    };
+    expect(() => actual.verifyFactoryClaudeAdmission("run-1")).toThrow("synthetic capability expired");
+    // Neither the SDK close receipt nor the serial input queue has completed.
+    expect(actual.closing()).toBe(true);
+    expect(close).toHaveBeenCalledOnce();
+    expect(permissionSettled).toHaveBeenCalledWith({ outcome: "cancel" });
+    expect(toolRejected).toHaveBeenCalledOnce();
+    expect(inputCancelled).toHaveBeenCalledOnce();
+    releaseClose();
+    releaseInput();
+    await actual.drained();
+    expect(close).toHaveBeenCalledOnce();
+    expect(dependencyValues.diagnostic).not.toHaveBeenCalled();
+  });
+
+  it.each(["waitForTool", "waitForPermission", "waitForInput", "waitForExtensionInput"])(
+    "rejects expired %s before emitting a new provider request", async name => {
+      const fixture = protectedDispatchFixture();
+      fixture.expire();
+      fixture.load();
+      const emitted = vi.fn();
+      const successors: Record<string, string> = { waitForTool: "waitForPermission", waitForPermission: "waitForInput", waitForInput: "waitForExtensionInput", waitForExtensionInput: "elicitationResponse" };
+      const nextName = successors[name];
+      if (!nextName) throw new Error("unknown production waiter");
+      const wait = loadSidecarProductionFunction(name, nextName, { ...fixture.dependencies, emit: emitted });
+      const signal = new AbortController().signal;
+      const args = name === "waitForTool" ? [{ signal }] : ["turn-1", {}, { signal }];
+      await expect(wait(...args)).rejects.toThrow("synthetic capability expired");
+      expect(emitted).not.toHaveBeenCalled();
+      expect(fixture.pending.size).toBe(1);
+    },
+  );
+});
+
+function loadSidecarProductionFunction(name: string, nextName: string, dependencies: Record<string, unknown>) {
+  const functionSource = productionFunctionSource(name, nextName);
+  const compiled = transformSync(functionSource, { loader: "ts", target: "es2022" }).code;
+  return new Function(...Object.keys(dependencies), `${compiled}; return ${name};`)(...Object.values(dependencies)) as (...args: unknown[]) => Promise<unknown>;
+}
+
+function productionFunctionSource(name: string, nextName: string) {
+  const source = readFileSync(fileURLToPath(new URL("./acpx-runtime-sidecar.ts", import.meta.url)), "utf8");
+  const start = source.search(new RegExp(`(?:async )?function ${name}\\(`));
+  const remaining = source.slice(start);
+  const next = remaining.search(new RegExp(`\\n(?:async )?function ${nextName}\\(`));
+  if (start < 0 || next < 0) throw new Error(`production ${name} slice missing`);
+  return remaining.slice(0, next);
+}
+
+function protectedDispatchFixture() {
+  let expired = false;
+  const settle = vi.fn();
+  const cleanup = vi.fn();
+  const prepare = vi.fn(() => settle);
+  const pending = new Map<string, unknown>();
+  const host = {
+    identity: () => ({ backendSessionId: "session-1" }),
+    startTurn: vi.fn(), steerActiveTurn: vi.fn(), queueFollowUp: vi.fn(), controlGoal: vi.fn(),
+    steeringCapability: () => ({ steering: true, queuedFollowUp: true }),
+  };
+  const dependencies: Record<string, unknown> = {
+    factoryClaudeAccess: {}, runId: "run-1", turnId: "turn-1", host,
+    openParams: { agent: "claude", workingDirectory: "/synthetic" },
+    requireHost: () => host,
+    verifyFactoryClaudeAdmission: () => { if (expired) throw new Error("synthetic capability expired"); },
+    boundedIdentity: (value: unknown) => value, boundedText: (value: unknown) => value,
+    text: (value: unknown) => typeof value === "string" ? value : "",
+    parseAcpxTurnControl: (value: unknown) => value,
+    turnControls: { begin: vi.fn(), reserve: vi.fn() },
+    bindAcpxExtensionTurn: () => ({}), createAcpxProfileExtensionAdapter: () => ({}),
+    readSidecarHostStatusWithin: async () => ({}),
+    permissions: pending, inputs: pending, tools: pending,
+    parseHarnessRuntimeRequestResolution: () => ({}), deliverAcpxResponse,
+  };
+  const fixture = {
+    host, settle, prepare, cleanup, pending, dependencies,
+    responseDelivery: Promise.resolve(),
+    expire: () => { expired = true; },
+    load: (turnId: string | null = "turn-1") => {
+      pending.set("request-1", { turnId: "turn-1", normalized: { resolve: prepare }, prepareResolution: prepare,
+        settle, cleanup, responseDelivery: fixture.responseDelivery });
+      return loadSidecarProductionFunction("dispatch", "pumpTurn", { ...dependencies, turnId });
+    },
+  };
+  return fixture;
 }
