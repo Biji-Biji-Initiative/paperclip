@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /** Focused build/tests. Uses a disposable directory; no SSH/provider contact. */
-import {mkdtemp,readFile,writeFile,mkdir,copyFile,readdir,rm} from 'node:fs/promises';
+import {mkdtemp,readFile,writeFile,mkdir,copyFile,readdir,rm,symlink} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {dirname,join,resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
@@ -20,6 +20,8 @@ const modules=[
  'packages/adapter-utils/src/ssh-command.ts',
  'packages/adapter-utils/src/ssh-process-channel.ts',
  'packages/adapter-utils/src/ssh-duplex.ts',
+ 'packages/adapter-utils/src/factory-worker-lease.ts',
+ 'packages/adapter-utils/src/factory-worker-lease-channel.ts',
  'server/src/services/native-runtime/native-ssh-foreground-owner.ts',
 ];
 try {
@@ -36,7 +38,7 @@ try {
   // These source interfaces end at column zero; their nested members are
   // indented. Compile the extracted declarations with the installed CLI so
   // this works with TypeScript 7, which no longer exports the old compiler API.
-  for(const name of names){const declaration=text.match(new RegExp(`^export interface ${name} \\{[\\s\\S]*?^\\}`, 'm'));if(!declaration)throw Error('Missing integration contract: '+name);declarations.push(declaration[0]);}
+  for(const name of names){const declaration=text.match(new RegExp(`^export interface ${name} \\{[\\s\\S]*?^\\}`, 'm'));if(!declaration)throw Error('Missing integration contract: '+name);declarations.push(declaration[0].replaceAll('./factory-worker-lease.js','./packages/adapter-utils/src/factory-worker-lease.js'));}
  }
  await writeFile(join(source,'contracts.ts'),declarations.join('\n')+`
 import {openDedicatedSshDuplex} from './packages/adapter-utils/src/ssh-duplex.js';
@@ -48,13 +50,17 @@ const opener: (input: DuplexChannelOpenInput) => Promise<CommandManagedDuplexCha
   input => openDedicatedSshDuplex({host:'fixture.invalid',port:2222,username:'node',remoteCwd:'/workspace',privateKey:'fixture-only',knownHosts:'fixture-only',strictHostKeyChecking:true},input);
 void launcher; void opener;
 `);
- const config={compilerOptions:{target:'ES2022',module:'NodeNext',moduleResolution:'NodeNext',strict:true,noUnusedLocals:true,noUnusedParameters:true,skipLibCheck:true,noEmitOnError:true,types:['node'],typeRoots:[typesRoot],rootDir:source,outDir:build},include:[...modules.map(p=>join(source,p)),join(source,'contracts.ts')]};
+ const config={compilerOptions:{target:'ES2022',module:'NodeNext',moduleResolution:'NodeNext',strict:true,noUnusedLocals:true,noUnusedParameters:true,skipLibCheck:true,noEmitOnError:true,types:['node'],typeRoots:[typesRoot],paths:{'@paperclipai/adapter-utils/*':[join(source,'packages/adapter-utils/src/*.ts')]},rootDir:source,outDir:build},include:[...modules.map(p=>join(source,p)),join(source,'contracts.ts')]};
  const configPath=join(scratch,'tsconfig.json');
  await writeFile(configPath,JSON.stringify(config));
  const compilation=spawnSync(process.execPath,[compiler,'--project',configPath],{stdio:'inherit'});
  if(compilation.status!==0){process.exitCode=compilation.status ?? 1;}
  else {
   await writeFile(join(build,'package.json'),'{"type":"module"}\n');
+  const packageDir=join(build,'node_modules/@paperclipai/adapter-utils');
+  await mkdir(packageDir,{recursive:true});
+  await symlink(join(build,'packages/adapter-utils/src'),join(packageDir,'src'),'dir');
+  await writeFile(join(packageDir,'package.json'),'{"name":"@paperclipai/adapter-utils","type":"module","exports":{"./*":"./src/*.js"}}\n');
   const testsDir=join(root,'scripts/tests/native-ssh-foreground');
   const tests=(await readdir(testsDir)).filter(p=>p.endsWith('.test.mjs')).sort().map(p=>join(testsDir,p));
   console.log(`Focused compiler: TypeScript ${tsMetadata.version}; Node ${process.version}. Not a whole-repository typecheck.`);

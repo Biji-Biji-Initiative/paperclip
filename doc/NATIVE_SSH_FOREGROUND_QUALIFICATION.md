@@ -162,3 +162,44 @@ This qualifies the transport and owner seam. The real Rust `dial_wss` PRP,
 whole-application checkpoint/recovery behavior, workspace continuation, worker
 scope/admission and subscription accounts remain release gates. No worker
 enrollment or production deployment is authorized by these transport results.
+
+## Explicit Factory lease opt-in — 2026-10-16
+
+Dedicated SSH accepts an optional validated Factory worker descriptor. Its exact
+fixed marker and bounded JSON stdin header preserve argv/environment without
+placing the launch payload in the SSH command string. Admission consumes one
+identity-bound receipt before returning the lifetime channel. A busy refusal is
+retryable only after the matching nondispatch receipt, actual SSH exit75 and
+successful cleanup. An accepted runner's exit75, malformed receipt, loss or failed
+cleanup cannot become safe busy. The foreground owner releases its local fence
+only for that verified nondispatch case; uncertainty retains the durable hold.
+
+The optional descriptor does not select a production worker or enroll an account.
+No executor metadata defaults or model-provided IDs are accepted. Authoritative
+resolved run/environment binding, scheduler busy integration and the actual
+native bootstrap environment allowlist remain required before activation.
+
+`node scripts/test-factory-worker-lease.mjs` runs the focused lease tests. Set
+`FACTORY_FOREGROUND_TEST_DIRECTORY` to `scripts/tests/native-ssh-foreground` to
+include the original tests:50 cases pass locally. `FACTORY_NODE_TYPES` can point
+to the installed adapter package's `node_modules/@types/node`; no package download
+is performed. The original foreground harness still extracts and compiles the
+actual interface contracts and independently passes31 cases. Both harnesses use
+the installed TypeScript CLI. Adapter typecheck and direct server `tsc --noEmit`
+also pass; no full Rust rebuild is claimed for this TypeScript-only change.
+
+A separate disposable candidate on g2 passes32 Python tests with zero skips under
+the actual enforcing AppArmor/seccomp, cap-free UID1000 policy. Pristine actual
+forced-command tests prove scoped mounts, sibling/control denial, persistent own
+artifacts, read-only common binaries, fresh homes, admission and retirement. A
+pinned SSH fixture using these compiled client modules passes two artifact
+revisions, typed busy before dispatch and EOF143 with no exact-argv workloads
+remaining. Full native Rust PRP through this scoped candidate remains unproved;
+the earlier Rust lifecycle receipts refer to worker014. No provider credentials,
+inference, production worker registration or deployment was performed.
+
+Focused UBS scans4 changed client modules:0 critical,5 warning,74 info. Warnings
+are non-null assertions following validated key material, acknowledged admission,
+claimed owner state or assigned channel. The Python worker scan and fixture
+failure history are retained in deploy.mereka.io's candidate qualification proof.
+These scans are not an image vulnerability clean bill.

@@ -33,6 +33,9 @@ export interface DuplexChannelOpenInput {
   command: readonly string[];
   /** Honored by native SSH foreground ownership; not a new sandbox capability. */
   signal?: AbortSignal;
+  /** Explicit scoped Factory worker; populated only from authorized run metadata. */
+  workerLease?: import("./factory-worker-lease.js").FactoryWorkerLeaseDescriptor;
+  environment?: Readonly<Record<string, string>>;
 }
 
 /**

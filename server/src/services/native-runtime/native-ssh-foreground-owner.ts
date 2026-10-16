@@ -1,3 +1,4 @@
+import { isFactoryWorkerBusyError, type FactoryWorkerLeaseDescriptor } from "@paperclipai/adapter-utils/factory-worker-lease";
 import {
   closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, renameSync, writeFileSync,
@@ -37,7 +38,12 @@ interface ProcessHandle {
   completion: Promise<ProcessResult>;
 }
 export interface ForegroundCommandRunner {
-  openDuplexChannel?(input: { command: readonly string[]; signal?: AbortSignal }): Promise<Channel>;
+  openDuplexChannel?(input: {
+    command: readonly string[];
+    signal?: AbortSignal;
+    workerLease?: FactoryWorkerLeaseDescriptor;
+    environment?: Readonly<Record<string, string>>;
+  }): Promise<Channel>;
 }
 interface OwnerRecord {
   schema: "paperclip.native-ssh-owner.v1";
@@ -167,11 +173,18 @@ export class NativeSshForegroundOwner {
     remoteCwd: string;
     diagnosticsDirectory: string;
     ensureArtifact: () => Promise<void>;
+    /** Passed only after operator-selected worker/run metadata has been bound. */
+    workerLease?: FactoryWorkerLeaseDescriptor;
     onDispatched?: () => void;
   }): (spec: LaunchSpec) => ProcessHandle {
     if (!input.runner.openDuplexChannel) throw new Error("native_ssh_foreground_channel_required");
     if (![input.remoteBinary, input.remoteCwd, input.diagnosticsDirectory].every((p) => p.startsWith("/") && !p.includes("\0"))) {
       throw new Error("Invalid native SSH foreground launch path");
+    }
+    const workerLease = input.workerLease ? structuredClone(input.workerLease) : undefined;
+    if (workerLease && (workerLease.runId !== this.options.runId ||
+        workerLease.workspaceRoot !== input.remoteCwd || workerLease.diagnosticsDirectory !== input.diagnosticsDirectory)) {
+      throw new Error("factory_worker_lease_owner_mismatch");
     }
     return (spec) => {
       this.assertAvailable();
@@ -182,6 +195,7 @@ export class NativeSshForegroundOwner {
       const abort = new AbortController();
       let dispatchAttempted = false;
       let cancelledBeforeDispatch = false;
+      let safeBusyRefusal: Error | undefined;
       let finished = false;
       let stopped = false;
       let stopDeadline: ReturnType<typeof setTimeout> | undefined;
@@ -222,12 +236,15 @@ export class NativeSshForegroundOwner {
           }
           // Preserve the actual runner vector. The small shell only creates the
           // diagnostics directory, changes cwd and execs; no nohup/setsid/&/PID RPC.
-          const command = ["/usr/bin/env", ...env.map(([key, value]) => `${key}=${value}`),
-            "/bin/sh", "-c", 'set -eu; umask 077; mkdir -p -- "$1"; cd -- "$2"; shift 2; exec "$@"',
-            "paperclip-ssh-foreground", input.diagnosticsDirectory, input.remoteCwd, input.remoteBinary, ...args];
+          const command = workerLease ? [input.remoteBinary, ...args] :
+            ["/usr/bin/env", ...env.map(([key, value]) => `${key}=${value}`),
+              "/bin/sh", "-c", 'set -eu; umask 077; mkdir -p -- "$1"; cd -- "$2"; shift 2; exec "$@"',
+              "paperclip-ssh-foreground", input.diagnosticsDirectory, input.remoteCwd, input.remoteBinary, ...args];
           this.update("dispatched");
           dispatchAttempted = true;
-          const opening = input.runner.openDuplexChannel!({ command, signal: abort.signal });
+          const opening = input.runner.openDuplexChannel!({ command, signal: abort.signal,
+            ...(workerLease ? {workerLease, environment: Object.fromEntries(env)} : {}),
+          });
           let openingExpired = false;
           // A delayed provider implementation must not orphan a late-open channel.
           void opening.then((channel) => {
@@ -235,7 +252,18 @@ export class NativeSshForegroundOwner {
           }, () => undefined);
           try {
             this.channel = await Promise.race([bounded(opening, this.options.openTimeoutMs ?? 20_000, this.options.ownershipError), stopExpired]);
-          } catch (error) { openingExpired = true; abort.abort(); throw error; }
+          } catch (error) {
+            openingExpired = true;
+            if (workerLease && !stopped && isFactoryWorkerBusyError(error)) {
+              // Matching worker receipt + real SSH exit 75 + successful cleanup
+              // prove no dispatch. This is not an accepted run's exit code 75.
+              this.update("exited", 75);
+              this.release();
+              safeBusyRefusal = error;
+              throw error;
+            }
+            abort.abort(); throw error;
+          }
           if (stopped) this.channel.stop();
           // Dispatch notification is not an authenticated remote-PID claim.
           input.onDispatched?.();
@@ -259,6 +287,7 @@ export class NativeSshForegroundOwner {
           await bounded(this.channel.close(), this.options.cleanupTimeoutMs ?? 6_000, this.options.ownershipError);
           return { code: exit.exitCode, signal: null, stdout: "", stderr: "" };
         } catch {
+          if (safeBusyRefusal) throw safeBusyRefusal;
           if (cancelledBeforeDispatch) throw new Error("native_ssh_cancelled_before_dispatch");
           // No detached retry. Keeping the receipt is intentional even if an
           // exception preceded dispatch: staging/cleanup must first be reconciled.

@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSshArgvCommand, quoteSshArgument } from "./ssh-command.js";
 import { createSshProcessChannel, type SshProcessChannel } from "./ssh-process-channel.js";
+import { FACTORY_WORKER_MARKER, encodeFactoryWorkerLaunch, isFactoryWorkerBusyError, type FactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
+import { admitFactoryWorkerLease } from "./factory-worker-lease-channel.js";
 
 export interface DedicatedSshTarget {
   host: string;
@@ -18,6 +20,9 @@ export interface DedicatedSshTarget {
 export interface SshDuplexOpenInput {
   command: readonly string[];
   signal?: AbortSignal;
+  /** Explicit Factory opt-in only. Generic/control calls never acquire a slot. */
+  workerLease?: FactoryWorkerLeaseDescriptor;
+  environment?: Readonly<Record<string, string>>;
 }
 
 /** Native worker path only: no operator profile, agent, jump host or alternate key. */
@@ -68,9 +73,20 @@ export async function openDedicatedSshDuplex(
 ): Promise<SshProcessChannel> {
   validateDedicatedSshTarget(config);
   if (!input.command.length) throw new Error("SSH duplex command is empty");
-  const command = buildSshArgvCommand({
+  // Snapshot before async key preparation: changes to caller-owned objects cannot
+  // retarget the request after validation. Bootstrap argv stays on stdin, never
+  // in the SSH command string, receipt or diagnostics.
+  const workerLease = input.workerLease ? structuredClone(input.workerLease) : undefined;
+  if (workerLease && config.remoteCwd !== workerLease.workspaceRoot) {
+    throw new Error("factory_worker_lease_cwd_mismatch");
+  }
+  if (!workerLease && input.environment !== undefined) {
+    throw new Error("factory_worker_environment_requires_explicit_lease");
+  }
+  const header = workerLease ? encodeFactoryWorkerLaunch(workerLease, input.command, input.environment) : undefined;
+  const command = workerLease ? FACTORY_WORKER_MARKER : `/bin/sh -c ${quoteSshArgument(buildSshArgvCommand({
     command: input.command[0]!, args: input.command.slice(1), cwd: config.remoteCwd,
-  });
+  }))}`;
   if (input.signal?.aborted) throw new Error("native_ssh_open_cancelled_before_dispatch");
   const directory = await mkdtemp(join(tmpdir(), "paperclip-native-ssh-"));
   const cleanup = () => rm(directory, { recursive: true, force: true });
@@ -85,13 +101,20 @@ export async function openDedicatedSshDuplex(
     // helpers retain their original PATH/profile behavior outside this mode.
     const child = spawn("/usr/local/bin/ssh", [
       ...dedicatedSshArgs(config, keyPath, hostsPath),
-      `/bin/sh -c ${quoteSshArgument(command)}`,
+      command,
     ], { stdio: ["pipe", "pipe", "pipe"], env: dedicatedSshClientEnvironment() });
-    return createSshProcessChannel(child, { cleanup, signal: input.signal });
-  } catch {
+    const channel = createSshProcessChannel(child, { cleanup, signal: input.signal });
+    // Keep stdin open after the header. Rust's authenticated dial_wss channel
+    // carries work; EOF on this owning channel cancels the worker namespace.
+    return workerLease && header ? await admitFactoryWorkerLease(channel, workerLease, header) : channel;
+  } catch (error) {
     await cleanup();
     // Never include command, credential or raw spawn error in a thrown message.
+    // Preserve only the verified non-dispatch busy classification, not raw errors.
+    if (isFactoryWorkerBusyError(error)) throw error;
     throw new Error("native_ssh_channel_open_failed");
+  } finally {
+    header?.fill(0);
   }
 }
 
