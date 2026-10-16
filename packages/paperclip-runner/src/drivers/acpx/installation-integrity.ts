@@ -1,4 +1,5 @@
 import { MAX_ACPX_RUNTIME_EXECUTABLE_BYTES, ACPX_PRIVATE_SNAPSHOT_ENV, createAcpxPrivateSnapshot, type AcpxPrivateSnapshot } from "./private-snapshot.js";
+import { claimFactoryClaudeAccessHandoff, factoryClaudeAccessBootstrap, type FactoryClaudeAccessHandoff } from "./factory-claude-access.js";
 import { createNativeAcpxDistributionSnapshot, NATIVE_ACPX_BOOTSTRAP_NAME, readNativeAcpxDistributionEntries, type NativeAcpxDistributionInput } from "./native-distribution-integrity.js";
 export type { NativeAcpxDistributionInput } from "./native-distribution-integrity.js";
 import { createHash } from "node:crypto";
@@ -144,6 +145,7 @@ const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 const WATCHDOG_SOURCE = ${JSON.stringify(PROVIDER_LIFETIME_WATCHDOG_SOURCE)};
 const runtimeExecutable = process.env.${VERIFIED_RUNTIME_EXECUTABLE_ENV} || process.execPath;
+const factoryAccessFd = null;
 const dependencyAncestorCount = Number.parseInt(process.argv[4], 10);
 const providerRuntimeExecutableCount = Number.parseInt(process.argv[8], 10);
 if (!Number.isSafeInteger(dependencyAncestorCount) || dependencyAncestorCount < 0 || dependencyAncestorCount > ${MAX_DEPENDENCY_ANCESTORS}) throw new Error("ACPX provider dependency ancestry is invalid");
@@ -205,7 +207,7 @@ const startProvider = () => {
         // The provider observes this guardian-owned pipe directly. Kernel EOF
         // therefore revokes it even when SIGKILL/OOM prevents our JS reap path.
         // It also inherits both quorum fences until that self-reap completes.
-        stdio: [0, 1, 2, ${COMMAND_SOURCE_FD}, ${COMMAND_DIRECTORY_FD}, ...dependencyAncestorFds, ...(providerRuntimeExecutableCount === 1 ? [PROVIDER_RUNTIME_EXECUTABLE_FD] : []), "pipe", PROVIDER_EXIT_FD, CREDENTIAL_FENCE_FD_START, CREDENTIAL_FENCE_FD_START + 1, ...(runtimeDescriptorFd === null ? [] : ["ignore", runtimeDescriptorFd])],
+        stdio: [0, 1, 2, ${COMMAND_SOURCE_FD}, ${COMMAND_DIRECTORY_FD}, ...dependencyAncestorFds, ...(providerRuntimeExecutableCount === 1 ? [PROVIDER_RUNTIME_EXECUTABLE_FD] : []), "pipe", PROVIDER_EXIT_FD, CREDENTIAL_FENCE_FD_START, CREDENTIAL_FENCE_FD_START + 1, ...(runtimeDescriptorFd === null ? [] : ["ignore", runtimeDescriptorFd]), ...(factoryAccessFd === null ? [] : runtimeDescriptorFd === null ? ["ignore", factoryAccessFd] : [factoryAccessFd])],
         windowsHide: true,
       },
     );
@@ -465,6 +467,8 @@ export interface VerifiedAcpxProviderLifetime {
   credentialFenceFds: readonly [number, number];
   /** Validate the guardian before provider admission can succeed. */
   activateCredentialFenceOwner(pid: number): Promise<void>;
+  /** Explicit Factory-only owned pipe, never projected from task environment. */
+  factoryClaudeAccess?: FactoryClaudeAccessHandoff;
 }
 
 /** Fail closed where verified provider-group ownership cannot be guaranteed. */
@@ -1399,10 +1403,11 @@ function commandLease(
       if (consumed) throw new Error("Verified ACPX command lease is closed");
       consumed = true;
       let child: ChildProcess;
+      let factoryAccess: ReturnType<typeof claimFactoryClaudeAccessHandoff> | null = null;
       try {
         const guarded = lifetime !== undefined;
         if (guarded) assertVerifiedAcpxProviderPlatform(process.platform);
-        const providerBootstrap = guarded
+        let providerBootstrap = guarded
           ? format === "module"
             ? GUARDED_MODULE_SNAPSHOT_BOOTSTRAP
             : GUARDED_COMMONJS_SNAPSHOT_BOOTSTRAP
@@ -1436,6 +1441,18 @@ function commandLease(
             providerRuntimeExecutableCount;
         const runtimeHandoff =
           verifiedRuntimeExecutableHandoff(runtimeTargetFd);
+        factoryAccess = lifetime?.factoryClaudeAccess === undefined ? null
+          : claimFactoryClaudeAccessHandoff(lifetime.factoryClaudeAccess);
+        if (factoryAccess && (!guarded || providerRuntimeEnvironmentVariable !== "CLAUDE_CODE_EXECUTABLE")) {
+          factoryAccess.close(); throw new Error("factory_claude_access_unverified");
+        }
+        const factoryAccessTargetFd = runtimeTargetFd + (runtimeHandoff.sourceFd === null ? 0 : 1);
+        if (factoryAccess) {
+          const marker = 'import(target).catch((error) => { console.error(error); process.exitCode = 1; });';
+          if (!providerBootstrap.includes(marker)) { factoryAccess.close(); throw new Error("factory_claude_access_unverified"); }
+          providerBootstrap = providerBootstrap.replace(marker,
+            `${factoryClaudeAccessBootstrap(factoryAccessTargetFd, factoryAccess.policy)}.then(() => import(target)).catch(() => { console.error("factory_claude_access_unverified"); process.exitCode = 1; });`);
+        }
         const environment = sanitizedNodeEnvironment(options.env);
         delete environment[ACPX_PRIVATE_SNAPSHOT_ENV];
         if (privateSnapshot) environment[ACPX_PRIVATE_SNAPSHOT_ENV] = JSON.stringify(privateSnapshot.handoff);
@@ -1465,7 +1482,8 @@ function commandLease(
                 // so the hook can distinguish them from host ancestry.
                 "--preserve-symlinks",
                 "--eval",
-                PROVIDER_LIFETIME_GUARDIAN_SOURCE,
+                factoryAccess === null ? PROVIDER_LIFETIME_GUARDIAN_SOURCE
+                  : PROVIDER_LIFETIME_GUARDIAN_SOURCE.replace("const factoryAccessFd = null;", `const factoryAccessFd = ${factoryAccessTargetFd};`),
                 providerBootstrap,
                 commandDirectoryPath,
                 commandName,
@@ -1516,6 +1534,7 @@ function commandLease(
                   ...(runtimeHandoff.sourceFd === null
                     ? []
                     : [runtimeHandoff.sourceFd]),
+                  ...(factoryAccess === null ? [] : [factoryAccess.fd ?? "pipe" as const]),
                 ]
               : [
                   "pipe",
@@ -1533,6 +1552,11 @@ function commandLease(
                 ],
           },
         );
+        if (factoryAccess?.fd === null) {
+          const accessPipe = child.stdio[factoryAccessTargetFd] as Writable | null;
+          if (accessPipe === null) throw new Error("factory_claude_access_unverified");
+          factoryAccess.seed(accessPipe, () => { child.kill("SIGKILL"); });
+        } else factoryAccess?.close();
         if (guarded) {
           const guardianOwnerPipe = child.stdio[
             providerOwnershipFd - 1
@@ -1560,6 +1584,7 @@ function commandLease(
           providerGuardianOwnership.set(child, ownership);
         }
       } catch (error) {
+        factoryAccess?.close();
         verifiedBytes.fill(0);
         releaseDirectoriesBestEffort();
         void privateSnapshot?.close();

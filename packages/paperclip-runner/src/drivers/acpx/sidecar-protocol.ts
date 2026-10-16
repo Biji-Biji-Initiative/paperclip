@@ -1,6 +1,7 @@
 import type { QualifiedAcpxAgent } from "./qualified-profiles.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import type { NativeAcpxPermissionMode } from "../../contracts/native-execution.js";
+import type { FactoryClaudeSidecarBinding } from "./factory-claude-sidecar-access.js";
 import {
   classifyGeneratedAcpxToolOperation,
   GENERATED_ACPX_SIDECAR_COMMANDS,
@@ -39,6 +40,8 @@ export interface AcpxSidecarEvent {
 }
 
 export interface AcpxSidecarOpenParams {
+  /** Public attempt identity; access material travels only on inherited pipes. */
+  factoryBinding?: FactoryClaudeSidecarBinding;
   runtimeDirectory: string;
   normalizedSessionId: string;
   workingDirectory: string;

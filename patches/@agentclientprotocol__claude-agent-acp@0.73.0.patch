@@ -47,7 +47,7 @@ index 0214a509eb5e7b777a69e4e34637941c275d27b1..403be02df66e25eee29e7d5bef146270
                  ...mcpServers,
                  ...(fileChangeAuditSupport
                      ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
-@@ -5329,6 +5345,16 @@ export class ClaudeAcpAgent {
+@@ -5329,6 +5345,20 @@ export class ClaudeAcpAgent {
              allowDangerouslySkipPermissions: ALLOW_BYPASS,
              permissionMode: initialPermissionMode,
              canUseTool: this.canUseTool(sessionId),
@@ -61,6 +61,10 @@ index 0214a509eb5e7b777a69e4e34637941c275d27b1..403be02df66e25eee29e7d5bef146270
 +                        .map((tool) => `mcp__paperclip__${tool}`)
 +                    : [],
 +            }),
++            // Factory's verified bootstrap owns this private, one-shot SDK
++            // spawn boundary. No task setting or environment can supply it.
++            ...(globalThis[Symbol.for("paperclip.factoryClaudeAccess.v1")]
++                ? globalThis[Symbol.for("paperclip.factoryClaudeAccess.v1")](mcpServers) : {}),
              // Forward MCP elicitation requests onto ACP elicitation. Only attached
              // when the client advertised support, so non-supporting clients keep the
              // SDK's default (auto-decline) behavior. (AskUserQuestion is handled in

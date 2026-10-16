@@ -12,6 +12,7 @@ import { decodeAcpxRuntimeHandleState } from "acpx/runtime";
 import { describe, expect, it, vi } from "vitest";
 
 import type { VerifiedAcpxCommandLease } from "./installation-integrity.js";
+import { closeFactoryClaudeAccessHandoff, createFactoryClaudeAccessBufferHandoff } from "./factory-claude-access.js";
 import { openCodexAcpxRuntime } from "./codex-runtime-adapter.js";
 import { createAcpxCommandLeaseOwner } from "./command-lease-owner.js";
 import { resolveQualifiedAcpxProfile } from "./qualified-profiles.js";
@@ -28,6 +29,27 @@ const HANDLE: AcpRuntimeHandle = {
 };
 
 describe("Codex ACPX runtime adapter", () => {
+  it("passes the ephemeral Factory Claude handoff to the actual verified spawn callback", async () => {
+    const handoff = createFactoryClaudeAccessBufferHandoff(Buffer.from("synthetic-access-envelope"), {
+      provider: "claude", admissionId: "admission", capabilityId: "capability", workerPlanSha256: "a".repeat(64), runId: "run", normalizedSessionId: "session", environmentLeaseId: "lease", runnerInstanceId: "runner", deadlineAtMs: Date.now() + 30_000,
+      runtimeRoot: "/private/runtime", workspaceRoot: "/workspace", bridgeUrl: "http://127.0.0.1:41234/mcp", allowedMcpTools: ["mcp__paperclip__report_progress"],
+    });
+    const command = fakeCommand(); const runtime = fakeRuntime();
+    vi.mocked(command.spawn).mockReturnValue(fakeChild());
+    let port: Awaited<ReturnType<typeof openCodexAcpxRuntime>> | undefined;
+    try {
+      const options = { ...openOptions(command), profile: resolveQualifiedAcpxProfile("claude", "claude-sonnet-5"), factoryClaudeAccess: handoff, launchEnvironment: { PATH: "/usr/bin:/bin" } };
+      port = await openCodexAcpxRuntime(options, {
+        createRegistry: () => registry(), createStore: () => store(), awaitProviderOwnership: providerOwnershipEstablished, awaitProviderExit: providerOwnershipEstablished,
+        createRuntime: created => {
+          vi.mocked(runtime.ensureSession).mockImplementation(async () => { created.spawnAgent!({ command: "ignored", args: ["--stdio"], options: {} }); return HANDLE; });
+          return runtime;
+        },
+      });
+      expect(command.spawn).toHaveBeenCalledWith(["--stdio"], {}, expect.objectContaining({ factoryClaudeAccess: handoff }));
+      expect(JSON.stringify(options.launchEnvironment)).not.toContain("access");
+    } finally { await port?.close({ reason: "synthetic handoff proof complete" }); closeFactoryClaudeAccessHandoff(handoff); }
+  });
   it("rejects forged permission session identifiers before delegating or applying full-auto policy", async () => {
     const pending = pendingExtensionTurn("turn-1");
     const runtime = fakeRuntime(); vi.mocked(runtime.startTurn).mockReturnValue(pending.turn);

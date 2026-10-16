@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
+import { factoryClaudeSidecarAccess, parseFactoryClaudeSidecarBinding, retireFactoryClaudeSidecarAccess, verifyFactoryClaudeSidecarOpen, verifyFactoryClaudeSidecarRun } from "../drivers/acpx/factory-claude-sidecar-access.js";
 import { deliverAcpxResponse, requireAcpxResponseDelivery } from "../drivers/acpx/response-delivery.js";
 import { createAcpxSidecarHostEnvironment } from "../drivers/acpx/environment.js";
 
@@ -91,6 +92,7 @@ import {
 import { AcpxTurnControlLedger, parseAcpxTurnControl } from "../drivers/acpx/turn-controls.js";
 
 const turnControls = new AcpxTurnControlLedger();
+const factoryClaudeAccess = factoryClaudeSidecarAccess();
 const MAX_PENDING_TOOLS = 512;
 const MAX_PENDING_INPUTS = 16;
 let goalSourceRevision = 0;
@@ -217,6 +219,10 @@ async function receiveLine(line: string): Promise<void> {
   } catch (error) {
     const normalized =
       error instanceof Error ? error : new Error(String(error));
+    if (factoryClaudeAccess && ["initialize", "session.open", "run.attach"].includes(request.command)) {
+      retireFactoryClaudeSidecarAccess(factoryClaudeAccess);
+      requestShutdown("Factory Claude admission failed");
+    }
     const normalizedRecord = record(normalized);
     bootstrapFailure = recordAcpxBootstrapFailure(
       bootstrapFailure,
@@ -276,8 +282,10 @@ async function dispatch(
     ) {
       throw new Error("ACPX session profile differs from its initialization");
     }
+    verifyFactoryClaudeSidecarOpen(factoryClaudeAccess, params);
     const openedHost = await AcpxRuntimeHost.open(
       {
+        ...(factoryClaudeAccess === undefined ? {} : { factoryClaudeAccess }),
         runtimeDirectory: params.runtimeDirectory,
         normalizedSessionId: params.normalizedSessionId,
         workingDirectory: params.workingDirectory,
@@ -343,6 +351,7 @@ async function dispatch(
       throw new Error("ACPX run tool catalog differs from the opened session");
     }
     const attachment = parseAcpxRunAttachment(request.params);
+    verifyFactoryClaudeSidecarRun(factoryClaudeAccess, attachment.runId);
     runId = attachment.runId;
     return {
       runId: attachment.runId,
@@ -1151,6 +1160,7 @@ function parseOpenParams(
   }
   return {
     runtimeDirectory: requiredText(value.runtimeDirectory, "runtimeDirectory"),
+    ...(value.factoryBinding === undefined ? {} : { factoryBinding: parseFactoryClaudeSidecarBinding(value.factoryBinding) }),
     normalizedSessionId: boundedIdentity(
       value.normalizedSessionId,
       "normalizedSessionId",

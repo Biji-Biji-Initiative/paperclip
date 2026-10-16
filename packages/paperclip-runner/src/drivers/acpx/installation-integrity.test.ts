@@ -19,6 +19,7 @@ import {
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -54,6 +55,66 @@ afterEach(async () => {
 });
 
 describe("ACPX installation integrity", () => {
+  it.runIf(process.platform === "linux" && process.arch === "x64").each([
+    { verifiedNode: false, buffered: false }, { verifiedNode: true, buffered: false },
+    { verifiedNode: false, buffered: true }, { verifiedNode: true, buffered: true },
+  ])("carries the Factory Claude pipe through the real lifetime guardian %j", async ({ verifiedNode, buffered }) => {
+    const root = await mkdtemp("/data/tmp/factory-claude-guardian-test-"); temporaryDirectories.push(root);
+    const runtimeRoot = join(root, "runtime"); const workspaceRoot = join(root, "workspace");
+    await mkdir(runtimeRoot, { mode: 0o700 }); await mkdir(workspaceRoot, { mode: 0o700 });
+    const environment: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin" };
+    for (const [key, name] of Object.entries({ HOME: "home", XDG_CONFIG_HOME: "config", XDG_DATA_HOME: "data", XDG_CACHE_HOME: "cache", CLAUDE_CONFIG_DIR: "claude" })) {
+      environment[key] = join(runtimeRoot, name); await mkdir(environment[key]!, { mode: 0o700 });
+    }
+    await writeFile(join(environment.CLAUDE_CONFIG_DIR!, "settings.json"), JSON.stringify({ model: "claude-sonnet-5", permissions: { allow: ["mcp__paperclip__report_progress"] } }), { mode: 0o600 });
+    const bridgeUrl = "http://127.0.0.1:41234/mcp";
+    const command = `const guard=globalThis[Symbol.for("paperclip.factoryClaudeAccess.v1")];const options=guard({paperclip:{type:"http",url:${JSON.stringify(bridgeUrl)}}});options.canUseTool("Read",{}).then(result=>process.stdout.write(JSON.stringify({installed:typeof guard==="function",tools:options.tools,read:result.behavior})+"\\n"));setInterval(()=>{},1000);`;
+    const packages = [
+      ["@agentclientprotocol/claude-agent-acp", { version: "0.73.0", bin: "server.cjs", dependencies: { "@agentclientprotocol/sdk": "1.4.0", "@anthropic-ai/claude-agent-sdk": "0.3.257", zod: "^4.0.0" } }],
+      ["@anthropic-ai/claude-agent-sdk", { version: "0.3.286", optionalDependencies: { "@anthropic-ai/claude-agent-sdk-linux-x64": "0.3.286" } }],
+      ["@agentclientprotocol/sdk", { version: "1.4.0" }], ["zod", { version: "4.4.3" }],
+    ] as const;
+    const paths = new Map<string, string>();
+    for (const [index, [name, metadata]] of packages.entries()) {
+      const directory = join(root, `package-${index}`); await mkdir(directory);
+      const manifest = join(directory, "package.json"); await writeFile(manifest, JSON.stringify(metadata)); paths.set(name, manifest);
+      if (index === 0) await writeFile(join(directory, "server.cjs"), command);
+    }
+    paths.set("@anthropic-ai/claude-agent-sdk-linux-x64", fileURLToPath(new URL("../../../../../node_modules/.pnpm/@anthropic-ai+claude-agent-sdk-linux-x64@0.3.286/node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/package.json", import.meta.url)));
+    const profile = { ...resolveQualifiedAcpxProfile("claude", "claude-sonnet-5"), commandDigest: `sha256:${createHash("sha256").update(command).digest("hex")}` };
+    const policy = { provider: "claude", admissionId: "admission-guardian", capabilityId: "capability-guardian", workerPlanSha256: "a".repeat(64), runId: "run-guardian", normalizedSessionId: "native-guardian", environmentLeaseId: "lease-guardian", runnerInstanceId: "runner-guardian", deadlineAtMs: Date.now() + 30_000,
+      runtimeRoot, workspaceRoot, bridgeUrl, allowedMcpTools: ["mcp__paperclip__report_progress"] };
+    const ownerScript = join(root, "owner.mjs");
+    await writeFile(ownerScript, `
+import {createServer} from 'node:net';
+import {once} from 'node:events';
+import {openSync,readFileSync} from 'node:fs';
+${verifiedNode ? 'process.env.PAPERCLIP_VERIFIED_RUNTIME_EXECUTABLE="/proc/self/fd/"+openSync(process.execPath,"r");' : ""}
+const module=await import(${JSON.stringify(new URL("./installation-integrity.ts", import.meta.url).href)});
+const access=await import(${JSON.stringify(new URL("./factory-claude-access.ts", import.meta.url).href)});
+const paths=new Map(${JSON.stringify([...paths])});
+const installation=await module.verifyQualifiedAcpxInstallation(${JSON.stringify(profile)},name=>paths.get(name));
+const fences=await Promise.all([1,2].map(async()=>{const server=createServer();server.listen(0,'127.0.0.1');await once(server,'listening');return server}));
+${buffered ? `const bytes=readFileSync(4);const handoff=access.createFactoryClaudeAccessBufferHandoff(bytes,${JSON.stringify(policy)});bytes.fill(0);` : `const handoff=access.createFactoryClaudeAccessHandoff(4,${JSON.stringify(policy)});`}
+const provider=(await installation.openCommand()).spawn([],{env:${JSON.stringify(environment)},cwd:${JSON.stringify(workspaceRoot)}},{credentialFenceFds:fences.map(value=>value._handle.fd),activateCredentialFenceOwner:async()=>{},factoryClaudeAccess:handoff});
+let output='';let diagnostic='';provider.stdout.on('data',value=>{output+=value});provider.stderr.on('data',value=>{diagnostic+=value});
+await module.awaitVerifiedAcpxProviderOwnership(provider);
+const deadline=Date.now()+5000;while(!output.includes('\\n')&&Date.now()<deadline&&provider.exitCode===null&&provider.signalCode===null)await new Promise(resolve=>setTimeout(resolve,20));
+provider.kill('SIGKILL');await module.awaitVerifiedAcpxProviderExit(provider);
+await Promise.all(fences.map(server=>new Promise(resolve=>server.close(resolve))));
+if(!output.includes('\\n')){process.stderr.write(diagnostic);throw Error('factory_guardian_test_failed');}
+process.stdout.write(output);process.exit(0);
+`);
+    const owner = fork(ownerScript, [], { execArgv: ["--import", "tsx"], stdio: ["pipe", "pipe", "pipe", "ipc", "pipe"] });
+    let output = ""; let errors = "";
+    owner.stdout!.on("data", value => { output += value; }); owner.stderr!.on("data", value => { errors += value; });
+    (owner.stdio[4] as import("node:stream").Writable).on("error", () => undefined);
+    (owner.stdio[4] as import("node:stream").Writable).end(JSON.stringify({ schema: "paperclip.factory-claude-access.v1", provider: "claude", admissionId: policy.admissionId, capabilityId: policy.capabilityId, workerPlanSha256: policy.workerPlanSha256, runId: policy.runId, normalizedSessionId: policy.normalizedSessionId,
+      environmentLeaseId: policy.environmentLeaseId, runnerInstanceId: policy.runnerInstanceId, expiresAtMs: policy.deadlineAtMs, accessToken: "synthetic-guardian-access-only-canary-0123456789" }));
+    const [code] = await once(owner, "exit");
+    expect(errors).toBe(""); expect(code).toBe(0);
+    expect(JSON.parse(output)).toEqual({ installed: true, tools: [], read: "deny" });
+  }, 40_000);
   it.each([["linux", "arm64"], ["darwin", "ia32"], ["freebsd", "x64"]] as const)(
     "rejects the actual Claude runtime probe on unsupported %s %s",
     async (platform, arch) => {
@@ -607,6 +668,7 @@ describe("ACPX installation integrity", () => {
       const command = await installation.openCommand();
       await command.close();
     },
+    30_000,
   );
 
   it("resolves the shipped builtin launcher without an npm package", async () => {

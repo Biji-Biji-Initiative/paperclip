@@ -426,6 +426,7 @@ export async function openQualifiedAcpxRuntime(
       commandLaunches.count += 1;
       return children.add(
         options.command.spawn(input.args, input.options, {
+          ...(options.factoryClaudeAccess === undefined ? {} : { factoryClaudeAccess: options.factoryClaudeAccess }),
           credentialFenceFds,
           activateCredentialFenceOwner: options.activateCredentialFenceOwner!,
         }) as ChildProcess,

@@ -10,7 +10,7 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const verifiedProviderEntrypoints = Object.freeze([
   Object.freeze({
     name: "acpx-runtime-sidecar",
-    source: resolve(packageRoot, "src/cli/acpx-runtime-sidecar.ts"),
+    source: resolve(packageRoot, "src/cli/acpx-runtime-sidecar-bootstrap.ts"),
     output: resolve(packageRoot, "dist/cli/acpx-runtime-sidecar.js"),
     verifiedOutput: resolve(packageRoot, "dist/cli/acpx-runtime-sidecar.cjs"),
   }),

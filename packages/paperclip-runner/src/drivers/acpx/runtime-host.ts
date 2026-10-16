@@ -1,4 +1,7 @@
 import { dirname, join } from "node:path";
+import { PRP_BLOCK_TOOL_NAME, PRP_COMPLETION_TOOL_NAME } from "../../contracts/completion-result.js";
+import { createFactoryClaudeSidecarHandoff, retireFactoryClaudeSidecarAccess, type FactoryClaudeSidecarAccess } from "./factory-claude-sidecar-access.js";
+import { closeFactoryClaudeAccessHandoff, type FactoryClaudeAccessHandoff } from "./factory-claude-access.js";
 import { assertAcpxProfileEnvironment, assertAcpxProfileWorkspace, classifyAcpxProfileError, verifyAcpxProfileInstallation } from "./profile-installation.js";
 import { createAcpxRuntimeSkillLease } from "./runtime-skill-lease.js";
 import { stageManagedGrokCredential } from "./grok-credentials.js";
@@ -37,7 +40,7 @@ import {
   requireVerifiedAcpxModel,
   type AcpxModelStatus,
 } from "./model-verification.js";
-import { acpxRuntimePermissionPolicy } from "./permission-policy.js";
+import { acpxRuntimePermissionPolicy, claudePaperclipPermissionRules } from "./permission-policy.js";
 import {
   resolveQualifiedAcpxProfile,
   type QualifiedAcpxAgent,
@@ -141,6 +144,8 @@ export interface AcpxRuntimePort {
 }
 
 export interface AcpxRuntimePortOpenOptions {
+  /** Ephemeral one-shot access, absent from persistence and public sidecar JSON. */
+  factoryClaudeAccess?: FactoryClaudeAccessHandoff;
   /** Ephemeral provider extension metadata; mandatory ACP caps remain host-owned. */
   clientCapabilities?: Record<string, unknown>;
   command: VerifiedAcpxCommandLease;
@@ -214,6 +219,7 @@ export interface AcpxRuntimeHostDependencies {
 }
 
 export interface OpenAcpxRuntimeHostOptions {
+  factoryClaudeAccess?: FactoryClaudeSidecarAccess;
   /** Explicit task execution policy; never inferred from auto-approval. Required for Pi. */
   providerPolicy?: AcpxProviderRuntimePolicy;
   /** Never persisted as session options or recovery identity. */
@@ -362,6 +368,7 @@ export class AcpxRuntimeHost {
     let command: VerifiedAcpxCommandLease | null = null;
     let credential: AcpxProviderLifetimeLease | null = null;
     let toolBridge: RunnerToolBridge | null = null;
+    let factoryHandoff: FactoryClaudeAccessHandoff | undefined;
     let runtime: AcpxRuntimePort | null = null;
     let pendingRuntimeOwnsCredential = false;
     const admissionVerificationTimeoutMs =
@@ -519,12 +526,30 @@ export class AcpxRuntimeHost {
       if (admittedLifetime === null) {
         throw new Error("ACPX provider lifetime lease is unavailable");
       }
+      if (options.factoryClaudeAccess !== undefined) {
+        if (options.agent !== "claude" || binding.permissionMode !== "approve-paperclip" || !toolBridge || nativeMcp) {
+          throw new Error("factory_claude_access_unverified");
+        }
+        factoryHandoff = await createFactoryClaudeSidecarHandoff(options.factoryClaudeAccess, {
+          normalizedSessionId: binding.normalizedSessionId,
+          runtimeDirectory: options.runtimeDirectory,
+          runtimeRoot: sandbox.root,
+          workspaceRoot: binding.workspacePath,
+          bridgeUrl: toolBridge.url,
+          allowedMcpTools: [
+            ...claudePaperclipPermissionRules(options.semanticTools!.tools ?? [], binding.permissionMode),
+            `mcp__paperclip__${PRP_COMPLETION_TOOL_NAME}`,
+            `mcp__paperclip__${PRP_BLOCK_TOOL_NAME}`,
+          ],
+        });
+      }
       runtime = await acquireAbortableAdmissionResource({
         signal: options.signal,
         acquire: async () => {
           options.assertWorkspaceHeld?.();
           await assertAcpxProfileWorkspace(options.agent, binding.workspacePath);
           return dependencies.openRuntime({
+            ...(factoryHandoff === undefined ? {} : { factoryClaudeAccess: factoryHandoff }),
             ...(options.clientCapabilities === undefined ? {} : {
               clientCapabilities: structuredClone(options.clientCapabilities),
             }),
@@ -623,6 +648,7 @@ export class AcpxRuntimeHost {
           : [],
       });
     } catch (error) {
+      if (options.factoryClaudeAccess) retireFactoryClaudeSidecarAccess(options.factoryClaudeAccess);
       error = classifyAcpxProfileError(options.agent, error) ?? error;
       const cleanup = cleanupRuntimeResources(
         runtime,
@@ -669,6 +695,8 @@ export class AcpxRuntimeHost {
         );
       }
       throw error;
+    } finally {
+      if (factoryHandoff) closeFactoryClaudeAccessHandoff(factoryHandoff);
     }
   }
 
