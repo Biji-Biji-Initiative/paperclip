@@ -162,7 +162,7 @@ impl AcpxProviderDescriptor {
                 "@agentclientprotocol/codex-acp",
                 "1.6.2",
                 Some("@openai/codex"),
-                Some("0.160.0"),
+                Some("0.163.0"),
                 "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
             ),
             "pi" => (
@@ -2704,12 +2704,9 @@ mod tests {
             let error = executor
                 .execute(&factory_command(provider))
                 .err()
-                .unwrap()
-                .to_string();
-            assert!(
-                error.contains("factory_claude_access_unverified:incompatible_provider"),
-                "{error}"
-            );
+                .unwrap();
+            assert_eq!(error.to_string(), "factory_claude_access_unverified:binding_mismatch");
+            assert_eq!(error.subscription_hold().unwrap().fields()["reason"], "binding_mismatch");
             assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
             fs::remove_dir(directory).unwrap();
         }
@@ -2720,7 +2717,7 @@ mod tests {
         for file in [
             ACPX_PROVIDER_STATE_FILE,
             crate::provider_backend::CODEX_PROVIDER_STATE_FILE,
-            crate::managed_provider_backend::MANAGED_PROVIDER_STATE_FILE,
+            crate::managed_provider::MANAGED_PROVIDER_STATE_FILE,
         ] {
             let directory = temporary_directory("factory-retained-provider");
             fs::write(
@@ -2737,15 +2734,41 @@ mod tests {
                     FACTORY_PLAN.into(),
                 )
                 .unwrap();
-            let error = executor.poll_events().err().unwrap().to_string();
-            assert!(
-                error.contains("factory_claude_access_unverified:recovery_not_permitted"),
-                "{error}"
-            );
-            assert_eq!(
-                fs::read_to_string(directory.join(file)).unwrap(),
-                "invalid retained state must never be parsed"
-            );
+            let managed_disabled = !cfg!(feature = "managed-api-providers")
+                && file == crate::managed_provider::MANAGED_PROVIDER_STATE_FILE;
+            if managed_disabled {
+                // The disabled-feature fence precedes generic recovery. Its
+                // unknown protected cause stays fixed and nonreflecting.
+                let error = executor.poll_events().err().unwrap();
+                assert_eq!(error.to_string(), "Protected provider operation failed; details withheld.");
+                assert!(error.subscription_hold().is_none());
+            } else {
+                // A recognized cold recovery refusal is retained as a sticky
+                // typed hold; polling drains retained events, not an error.
+                assert!(executor.poll_events().unwrap().is_empty());
+            }
+            for _ in 0..2 {
+                let error = executor
+                    .execute(&factory_command(json!({"kind":"acpx","agent":"claude"})))
+                    .err()
+                    .unwrap();
+                if managed_disabled {
+                    assert_eq!(error.to_string(), "Protected provider operation failed; details withheld.");
+                    assert!(error.subscription_hold().is_none());
+                } else {
+                    assert_eq!(error.to_string(), "factory_claude_access_unverified:recovery_not_permitted");
+                    let fields = error.subscription_hold().unwrap().fields();
+                    assert_eq!(fields["reason"], "recovery_not_permitted");
+                    assert_eq!(fields["retryable"], false);
+                    assert_eq!(fields["operatorRequired"], true);
+                    assert!(executor.poll_events().unwrap().is_empty());
+                }
+                assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+                assert_eq!(
+                    fs::read_to_string(directory.join(file)).unwrap(),
+                    "invalid retained state must never be parsed"
+                );
+            }
             fs::remove_file(directory.join(file)).unwrap();
             fs::remove_dir(directory).unwrap();
         }
@@ -2915,7 +2938,7 @@ mod tests {
                     "@agentclientprotocol/codex-acp",
                     "1.6.2",
                     json!("@openai/codex"),
-                    json!("0.160.0"),
+                    json!("0.163.0"),
                     "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
                 )
             };

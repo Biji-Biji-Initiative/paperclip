@@ -2,13 +2,15 @@
  * The app-server compatibility window is separate from the reproducible install
  * pin. The minimum stays at 0.149.0 until maintainers explicitly change it;
  * newer install pins and the passage of time must not raise it automatically.
- * Qualify the upper bound separately when adding support for a new Codex minor.
+ * Qualify new minors separately; one exact release does not qualify intervening
+ * minors or future patch releases.
  * Do not query a registry at startup.
  */
 export const REMOTE_CODEX_MINIMUM_VERSION = "0.149.0";
 export const REMOTE_CODEX_MAXIMUM_VERSION_EXCLUSIVE = "0.161.0";
+export const REMOTE_CODEX_ADDITIONAL_QUALIFIED_VERSION = "0.163.0";
 export const REMOTE_CODEX_SUPPORTED_RANGE =
-  `>=${REMOTE_CODEX_MINIMUM_VERSION} <${REMOTE_CODEX_MAXIMUM_VERSION_EXCLUSIVE}`;
+  `>=${REMOTE_CODEX_MINIMUM_VERSION} <${REMOTE_CODEX_MAXIMUM_VERSION_EXCLUSIVE} || =${REMOTE_CODEX_ADDITIONAL_QUALIFIED_VERSION}`;
 
 const STABLE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -39,5 +41,5 @@ export function isSupportedRemoteCodexVersion(version: string): boolean {
     }
     return 0;
   };
-  return compare(minimum) >= 0 && compare(maximum) < 0;
+  return version === REMOTE_CODEX_ADDITIONAL_QUALIFIED_VERSION || (compare(minimum) >= 0 && compare(maximum) < 0);
 }

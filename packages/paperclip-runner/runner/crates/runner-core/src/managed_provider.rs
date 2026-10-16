@@ -4,6 +4,9 @@ use serde_json::Value;
 use crate::local_runner::LocalRunnerError;
 use crate::provider_bridge::{AuthorizedTool, ToolResult};
 
+// This state filename remains authoritative even in a build without API clients.
+pub const MANAGED_PROVIDER_STATE_FILE: &str = "managed-provider-state.json";
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {

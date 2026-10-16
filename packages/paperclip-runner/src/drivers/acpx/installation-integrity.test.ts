@@ -661,6 +661,9 @@ process.stdout.write(output);process.exit(0);
     "resolves and pins the qualified Codex native runtime through its transitive packages",
     async () => {
       const profile = resolveQualifiedAcpxProfile("codex", "gpt-5.6-sol");
+      expect(profile.agentRuntimeVersion).toBe("0.163.0");
+      await expect(verifyQualifiedAcpxInstallation({ ...profile, agentRuntimeVersion: "0.160.0" }))
+        .rejects.toThrow("runtime version mismatch");
       const installation = await verifyQualifiedAcpxInstallation(profile);
       expect(installation.agentRuntimePackageJsonPath).toContain(
         "/@openai/codex/package.json",

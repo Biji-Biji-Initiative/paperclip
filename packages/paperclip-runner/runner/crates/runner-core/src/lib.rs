@@ -7,7 +7,9 @@ pub mod acpx_provider_checkpoint;
 pub mod acpx_provider_session;
 pub mod acpx_provider_state;
 pub mod acpx_sidecar_transport;
+#[cfg(feature = "managed-api-providers")]
 pub mod aws_agentcore_provider;
+#[cfg(feature = "managed-api-providers")]
 pub mod claude_managed_provider;
 pub mod claude_external_auth;
 pub mod factory_child_fds;
@@ -21,6 +23,7 @@ pub mod fake_harness;
 pub mod generated_acpx_sidecar_contract;
 pub mod local_runner;
 pub mod managed_provider;
+#[cfg(feature = "managed-api-providers")]
 pub mod managed_provider_backend;
 pub mod native_provider_backend;
 pub mod process_supervisor;

@@ -36,7 +36,7 @@ use crate::provider_events::{
     normalize_codex_notification, with_terminal_outcome, NormalizedProviderEvent,
 };
 
-pub const MANAGED_PROVIDER_STATE_FILE: &str = "managed-provider-state.json";
+pub use crate::managed_provider::MANAGED_PROVIDER_STATE_FILE;
 const MANAGED_PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.managed-provider-state.v1";
 const MAX_PROVIDER_STATE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PENDING_EVENTS: usize = 8_320;

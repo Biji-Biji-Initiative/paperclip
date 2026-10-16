@@ -1103,7 +1103,7 @@ describe("remote provider pack manifest", () => {
     const payload = {
       pins: {
         nodeMinimum: "24.11.0",
-        codex: "0.160.0",
+        codex: "0.163.0",
         opencode: "1.18.34",
         acpx: "0.13.1",
         claudeAcp: "0.73.0",
@@ -11539,10 +11539,10 @@ describe("runnerd provider runtime wiring", () => {
 
   it.each([
     ...["current", "preinstalled-exact", "preinstalled-mismatch", "preinstalled-error", "preinstalled-timeout", "stale", "missing", "retained", "retained-mismatch", "retained-error", "retained-timeout", "retained-explicit"]
-      .map((image) => ({ image, version: "0.160.0", compatible: true })),
+      .map((image) => ({ image, version: "0.163.0", compatible: true })),
     ...["0.149.0", "0.149.1", "0.153.4", "0.156.0", "0.160.1"]
       .map((version) => ({ image: "current", version, compatible: true })),
-    ...["0.148.9", "0.161.0", "1.0.0", "0.160.0-alpha.1", "unknown"]
+    ...["0.148.9", "0.161.0", "0.162.0", "0.163.1", "1.0.0", "0.163.0-alpha.1", "unknown"]
       .map((version) => ({ image: "current", version, compatible: false })),
   ])("uses shared Codex and the server-owned replacement artifact (image=$image, Codex=$version)", async ({ image, version, compatible }) => {
     const retained = image.startsWith("retained");
@@ -11644,7 +11644,7 @@ describe("runnerd provider runtime wiring", () => {
       expect(onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining("using compatible Codex"));
       return;
     }
-    if (version !== "0.160.0") {
+    if (version !== "0.163.0") {
       expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(`using compatible Codex ${version}`));
     }
     if (needsReplacement) {

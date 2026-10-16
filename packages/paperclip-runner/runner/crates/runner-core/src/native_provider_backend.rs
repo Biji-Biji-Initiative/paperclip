@@ -7,15 +7,16 @@ use crate::durable::{
     Command, CommandExecution, CommandExecutor, DurableRunnerConfig, DurableRunnerError,
     PolledEvent, TerminalDeliveryReconciliation,
 };
-use crate::managed_provider_backend::{
-    ManagedProviderCommandExecutor, MANAGED_PROVIDER_STATE_FILE,
-};
+use crate::managed_provider::MANAGED_PROVIDER_STATE_FILE;
+#[cfg(feature = "managed-api-providers")]
+use crate::managed_provider_backend::ManagedProviderCommandExecutor;
 use crate::provider_backend::{CodexCommandExecutor, CODEX_PROVIDER_STATE_FILE};
 use crate::subscription_auth_hold::{self, ProtectedSubscription, SubscriptionAuthHold};
 
 enum SelectedExecutor {
     LocalFacade(CodexCommandExecutor),
     Acpx(AcpxCommandExecutor),
+    #[cfg(feature = "managed-api-providers")]
     Managed(ManagedProviderCommandExecutor),
 }
 
@@ -24,6 +25,7 @@ impl SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.record_subscription_auth_hold(hold),
             Self::Acpx(executor) => executor.record_subscription_auth_hold(hold),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(_) => Err(DurableRunnerError::invalid("subscription hold provider mismatch")),
         }
     }
@@ -34,6 +36,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.can_reconcile_result_delivery(),
             Self::Acpx(executor) => executor.can_reconcile_result_delivery(),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.can_reconcile_result_delivery(),
         }
     }
@@ -42,6 +45,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.retained_events(),
             Self::Acpx(executor) => executor.retained_events(),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.retained_events(),
         }
     }
@@ -49,6 +53,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.execute(command),
             Self::Acpx(executor) => executor.execute(command),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.execute(command),
         }
     }
@@ -57,6 +62,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.poll_events(),
             Self::Acpx(executor) => executor.poll_events(),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.poll_events(),
         }
     }
@@ -65,6 +71,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.rotate_authority(config),
             Self::Acpx(executor) => executor.rotate_authority(config),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.rotate_authority(config),
         }
     }
@@ -73,6 +80,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.maintain_backpressured_provider(),
             Self::Acpx(executor) => executor.maintain_backpressured_provider(),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.maintain_backpressured_provider(),
         }
     }
@@ -81,6 +89,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.acknowledge_events(count),
             Self::Acpx(executor) => executor.acknowledge_events(count),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.acknowledge_events(count),
         }
     }
@@ -91,6 +100,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.reconcile_terminal_delivery(),
             Self::Acpx(executor) => executor.reconcile_terminal_delivery(),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.reconcile_terminal_delivery(),
         }
     }
@@ -99,6 +109,7 @@ impl CommandExecutor for SelectedExecutor {
         match self {
             Self::LocalFacade(executor) => executor.shutdown(),
             Self::Acpx(executor) => executor.shutdown(),
+            #[cfg(feature = "managed-api-providers")]
             Self::Managed(executor) => executor.shutdown(),
         }
     }
@@ -191,12 +202,20 @@ impl NativeProviderCommandExecutor {
         let codex = self.state_dir.join(CODEX_PROVIDER_STATE_FILE).exists();
         let acpx = self.state_dir.join(ACPX_PROVIDER_STATE_FILE).exists();
         let managed = self.state_dir.join(MANAGED_PROVIDER_STATE_FILE).exists();
+        #[cfg(not(feature = "managed-api-providers"))]
+        if managed {
+            // Even conflicting or unreadable retained managed state is an
+            // authority fence on every command, never a local fallback.
+            self.recovery_checked = false;
+            return Err(DurableRunnerError::invalid("managed_api_providers_disabled"));
+        }
         if [codex, acpx, managed]
             .into_iter()
             .filter(|present| *present)
             .count()
             > 1
         {
+            self.recovery_checked = false;
             return Err(DurableRunnerError::invalid(
                 "runner state contains conflicting provider authorities",
             ));
@@ -216,9 +235,19 @@ impl NativeProviderCommandExecutor {
             ));
         }
         self.selected = if managed {
-            Some(SelectedExecutor::Managed(
-                ManagedProviderCommandExecutor::with_runner_config(&self.state_dir, &self.config),
-            ))
+            #[cfg(feature = "managed-api-providers")]
+            {
+                Some(SelectedExecutor::Managed(
+                    ManagedProviderCommandExecutor::with_runner_config(&self.state_dir, &self.config),
+                ))
+            }
+            #[cfg(not(feature = "managed-api-providers"))]
+            {
+                // Never ignore an unavailable retained authority and select a
+                // different provider on a later command in this process.
+                self.recovery_checked = false;
+                return Err(DurableRunnerError::invalid("managed_api_providers_disabled"));
+            }
         } else if acpx {
             Some(SelectedExecutor::Acpx(
                 AcpxCommandExecutor::with_runner_config(&self.state_dir, &self.config),
@@ -281,9 +310,18 @@ impl NativeProviderCommandExecutor {
             } else {
                 AcpxCommandExecutor::with_runner_config(&self.state_dir, &self.config)
             }),
-            "claude_managed" | "aws_agentcore" => SelectedExecutor::Managed(
-                ManagedProviderCommandExecutor::with_runner_config(&self.state_dir, &self.config),
-            ),
+            "claude_managed" | "aws_agentcore" => {
+                #[cfg(feature = "managed-api-providers")]
+                {
+                    SelectedExecutor::Managed(
+                        ManagedProviderCommandExecutor::with_runner_config(&self.state_dir, &self.config),
+                    )
+                }
+                #[cfg(not(feature = "managed-api-providers"))]
+                {
+                    return Err(DurableRunnerError::invalid("managed_api_providers_disabled"));
+                }
+            },
             _ => {
                 return Err(DurableRunnerError::invalid(format!(
                     "provider kind {kind} is not executable through the local runnerd boundary"

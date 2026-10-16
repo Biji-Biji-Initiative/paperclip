@@ -182,7 +182,7 @@ fn prepare_payload(directory: &Path, agent: &str) -> Value {
 fn prepare_payload_with_mode(directory: &Path, agent: &str, mode: &str) -> Value {
     let operations = Vec::new();
     let (runtime_package, runtime_version) = if agent == "codex" {
-        (json!("@openai/codex"), json!("0.160.0"))
+        (json!("@openai/codex"), json!("0.163.0"))
     } else {
         (Value::Null, Value::Null)
     };
@@ -865,6 +865,7 @@ fn managed_prepare_payload(kind: &str) -> Value {
     })
 }
 
+#[cfg(feature = "managed-api-providers")]
 #[test]
 fn preserves_managed_provider_descriptors_through_the_native_selector() {
     for kind in ["claude_managed", "aws_agentcore"] {
@@ -1434,4 +1435,72 @@ fn publishes_only_changed_pi_controls_before_the_new_turn() {
         executor.shutdown().unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
+}
+
+#[cfg(not(feature = "managed-api-providers"))]
+#[test]
+fn disabled_managed_providers_reject_both_kinds_before_state_or_dispatch() {
+    for kind in ["claude_managed", "aws_agentcore"] {
+        let directory = temporary_directory(kind);
+        let config = config(&directory);
+        let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        let error = executor.execute(&command(1, "run.prepare", managed_prepare_payload(kind))).err().unwrap();
+        assert!(error.to_string().contains("managed_api_providers_disabled"));
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(directory).unwrap();
+    }
+}
+
+#[cfg(not(feature = "managed-api-providers"))]
+#[test]
+fn disabled_managed_state_remains_a_blocking_authority_on_repeated_commands() {
+    for conflicting in [false, true] {
+        let directory = temporary_directory("disabled-managed-recovery");
+        let path = directory.join("managed-provider-state.json");
+        let contents = "invalid retained data must not be parsed, replaced or ignored";
+        fs::write(&path, contents).unwrap();
+        if conflicting {
+            fs::write(directory.join("codex-provider-state.json"), "conflicting authority").unwrap();
+        }
+        let config = config(&directory);
+        let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        for (index, kind) in ["aws_agentcore", "codex", "acpx", "claude_managed"].into_iter().enumerate() {
+            let payload = if kind == "aws_agentcore" || kind == "claude_managed" {
+                managed_prepare_payload(kind)
+            } else {
+                json!({"provider":{"kind":kind}})
+            };
+            let error = executor.execute(&command(index as u64 + 1, "run.prepare", payload)).err().unwrap();
+            assert!(error.to_string().contains("managed_api_providers_disabled"));
+            assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), if conflicting { 2 } else { 1 });
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn conflicting_retained_provider_authorities_block_repeated_commands() {
+    let directory = temporary_directory("conflicting-provider-recovery");
+    let codex_path = directory.join("codex-provider-state.json");
+    let acpx_path = directory.join("acpx-provider-state.json");
+    let contents = "conflicting retained authority must never be parsed or adopted";
+    fs::write(&codex_path, contents).unwrap();
+    fs::write(&acpx_path, contents).unwrap();
+    let config = config(&directory);
+    let mut executor = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    for (index, kind) in ["codex", "acpx", "codex", "acpx"].into_iter().enumerate() {
+        let error = executor.execute(&command(
+            index as u64 + 1,
+            "run.prepare",
+            json!({"provider":{"kind":kind}}),
+        )).err().unwrap();
+        assert_eq!(error.to_string(), "runner state contains conflicting provider authorities");
+        assert_eq!(executor.poll_events().err().unwrap().to_string(), error.to_string());
+        assert_eq!(executor.can_reconcile_result_delivery().err().unwrap().to_string(), error.to_string());
+        assert_eq!(fs::read_to_string(&codex_path).unwrap(), contents);
+        assert_eq!(fs::read_to_string(&acpx_path).unwrap(), contents);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+    }
+    fs::remove_dir_all(directory).unwrap();
 }

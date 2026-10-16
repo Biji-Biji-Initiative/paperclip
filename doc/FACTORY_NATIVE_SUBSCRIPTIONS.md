@@ -97,3 +97,19 @@ not proof that every possible escaped descendant has retired.
 
 Do not infer operational readiness from these source tests. Never enable an API
 billing fallback or restore a consumed/revoked capability to bypass a hold.
+
+## Factory native image build
+
+Factory image builds must pass `--build-arg PAPERCLIP_RUNNER_SUBSCRIPTIONS_ONLY=true`.
+The same inherited build argument disables default Cargo features for dependency
+cooking, the final runner build and later recursive package builds. This omits
+managed API provider dependencies;
+the resulting runner explicitly rejects managed provider selection and retained
+managed state. The default remains `false` for ordinary upstream images; any
+other value fails the build before invoking Cargo. Runtime billing policy remains
+a separate required application setting.
+Bounded builders can also pass `--build-arg CARGO_BUILD_JOBS=1`; this is inherited
+by the native stages and recursive package build without changing the default.
+
+The build-mode shell regression verifies actual arguments in both stages. It is
+not an image build, native artifact, compiler/ABI or provider qualification.
