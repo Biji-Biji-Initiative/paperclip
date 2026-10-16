@@ -21,6 +21,17 @@ Runtime host supplies the actual workspace, runtime, authenticated tool
 bridge and assigned semantic tools. Extra native MCP gateways are held for this
 initial contract. Finish and block remain available.
 
+Cold admission also rejects prior ACPX persistent records. The pinned ACPX
+`ensureSession` otherwise reuses a matching record even when native provider-state
+is absent. Protected mode rejects that record before remembering its cleanup
+handle, saving it or spawning a child. Only this invocation's fresh missing record,
+single owned spawn and collision-checked first save establish ownership. Later
+reloads and saves must retain that same identity; loading or re-saving a foreign
+record cannot establish ownership. Generic persistent-session reuse is unchanged.
+The store API remains load/save, not a cross-process compare-and-swap operation.
+Its checks still require the enclosing exclusive workspace ownership and private
+runtime directory; they do not authorize concurrent writers.
+
 The guardian hands the subscription token through the SDK native descriptor
 interface, with subprocess environment scrubbing enabled. Public argv contains a
 closed policy projection; access never belongs in argv, bearer environment values
@@ -34,6 +45,12 @@ remains 4.4.3; this contract does not require a dependency upgrade. The verified
 entrypoint builder must run before packaging the provider pack.
 
 Focused caller and installation-integrity tests and runner TypeScript checks pass.
+The cold-record slice passes all 80 adapter tests and the runner TypeScript check.
+Its three new behavior tests use the installed ACPX library: matching old state is
+held without spawn/save/old-handle cleanup, generic mode reuses the same seed, and
+a builtin-only synthetic ACP child creates and reloads its own fresh record.
+The two-file UBS attempt timed out without completed JSON; syntax, tests and
+gitleaks passed, but no completed scanner proof is claimed for this slice.
 These are synthetic source checks, not evidence of a real account, paid inference,
 or a complete native tool isolation run. The latest whole-source UBS attempt
 timed out without a completed scan; no clean whole-source scanner claim is made.

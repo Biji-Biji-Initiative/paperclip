@@ -203,6 +203,21 @@ export async function openQualifiedAcpxRuntime(
     dependencies.awaitProviderExit,
   );
   const baseStore = createStore({ stateDir: options.stateDirectory });
+  const protectedFactorySession = options.factoryClaudeAccess !== undefined;
+  const factorySession = {
+    freshRecordId: null as string | null,
+    ownedIdentity: null as string | null,
+    denied: false,
+  };
+  const factorySessionIdentity = (record: AcpSessionRecord): string =>
+    JSON.stringify([record.acpxRecordId, record.acpSessionId, record.agentSessionId ?? null,
+      record.cwd, record.name, record.agentCommand, record.agentArgv ?? []]);
+  const rejectFactorySession = (): never => {
+    factorySession.denied = true;
+    throw Object.assign(new Error("factory_claude_access_unverified"), {
+      code: "FACTORY_CLAUDE_ACCESS_UNVERIFIED",
+    });
+  };
   let failedHandshakeHandle: AcpRuntimeHandle | null = null;
   let admissionCleanup: RuntimeAdmissionCleanup | null = null;
   const rememberHandshakeHandle = (record: AcpSessionRecord): void => {
@@ -246,11 +261,40 @@ export async function openQualifiedAcpxRuntime(
   };
   const sessionStore: AcpSessionStore = {
     async load(sessionId) {
+      if (protectedFactorySession && (factorySession.denied || sessionId !== options.providerSessionKey)) rejectFactorySession();
       const record = await baseStore.load(sessionId);
+      if (protectedFactorySession) {
+        if (factorySession.denied || sessionId !== options.providerSessionKey) rejectFactorySession();
+        if (factorySession.ownedIdentity === null) {
+          // A prior persistent ACPX record is recovery authority even when the
+          // outer native provider-state file is absent. Never adopt its handle.
+          if (record !== undefined) rejectFactorySession();
+          factorySession.freshRecordId = sessionId;
+        } else if (record === undefined || factorySessionIdentity(record) !== factorySession.ownedIdentity) {
+          rejectFactorySession();
+        }
+      }
       if (record !== undefined) rememberHandshakeHandle(record);
       return record;
     },
     async save(record) {
+      if (protectedFactorySession) {
+        if (factorySession.denied || record.acpxRecordId !== options.providerSessionKey) rejectFactorySession();
+        if (factorySession.ownedIdentity === null) {
+          if (factorySession.freshRecordId !== record.acpxRecordId || commandLaunches.count !== 1
+              || record.cwd !== options.cwd || record.name !== options.providerSessionKey
+              || typeof record.acpSessionId !== "string" || record.acpSessionId.length === 0) rejectFactorySession();
+          // Saving a loaded foreign record cannot mint ownership. Recheck the
+          // private store after the new handshake, before any save or remember.
+          if (await baseStore.load(record.acpxRecordId) !== undefined
+              || factorySession.denied || factorySession.ownedIdentity !== null) rejectFactorySession();
+          factorySession.ownedIdentity = factorySessionIdentity(record);
+        } else {
+          const current = await baseStore.load(record.acpxRecordId);
+          if (factorySession.denied || factorySessionIdentity(record) !== factorySession.ownedIdentity || current === undefined
+              || factorySessionIdentity(current) !== factorySession.ownedIdentity) rejectFactorySession();
+        }
+      }
       // ACPX has already created this runtime-owned identity before it asks
       // the store to persist it. Capture cleanup authority first so a storage
       // rejection cannot orphan the live session created by the handshake.
@@ -525,7 +569,7 @@ export async function openQualifiedAcpxRuntime(
       runtime,
       handle,
       requireIdentity(handle),
-      baseStore,
+      protectedFactorySession ? sessionStore : baseStore,
       children,
       runtimeCloseTimeoutMs,
       goalState,

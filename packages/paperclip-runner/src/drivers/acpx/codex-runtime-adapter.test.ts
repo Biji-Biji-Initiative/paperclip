@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 
 import type {
@@ -8,7 +9,7 @@ import type {
   AcpRuntimeOptions,
   AcpSessionStore,
 } from "acpx/runtime";
-import { decodeAcpxRuntimeHandleState } from "acpx/runtime";
+import { createAcpRuntime, decodeAcpxRuntimeHandleState } from "acpx/runtime";
 import { describe, expect, it, vi } from "vitest";
 
 import type { VerifiedAcpxCommandLease } from "./installation-integrity.js";
@@ -29,6 +30,115 @@ const HANDLE: AcpRuntimeHandle = {
 };
 
 describe("Codex ACPX runtime adapter", () => {
+  it("rejects a matching persisted Factory record before real ACPX can reuse or remember it", async () => {
+    const command = fakeCommand();
+    const { options, handoff } = factoryOpenOptions(command);
+    const record = factoryRecord();
+    const persisted: AcpSessionStore = { load: vi.fn(async () => structuredClone(record) as never), save: vi.fn() };
+    let runtime!: AcpRuntime;
+    try {
+      await expect(openCodexAcpxRuntime(options, {
+        createStore: () => persisted,
+        createRuntime: (created) => {
+          runtime = createAcpRuntime(created);
+          vi.spyOn(runtime, "close");
+          return runtime;
+        },
+      })).rejects.toMatchObject({ message: "factory_claude_access_unverified", code: "FACTORY_CLAUDE_ACCESS_UNVERIFIED" });
+      expect(command.spawn).not.toHaveBeenCalled();
+      expect(persisted.save).not.toHaveBeenCalled();
+      // Remembering that old record would authorize cleanup of its old handle.
+      expect(runtime.close).not.toHaveBeenCalled();
+
+      const generic = { ...options };
+      delete generic.factoryClaudeAccess;
+      const port = await openCodexAcpxRuntime(generic, { createStore: () => persisted });
+      expect(command.spawn).not.toHaveBeenCalled();
+      expect(persisted.save).toHaveBeenCalled(); // Exact matching seed is reusable generically.
+      await port.close({ reason: "generic reuse qualified" });
+    } finally {
+      closeFactoryClaudeAccessHandoff(handoff);
+    }
+  });
+
+  it("does not mint Factory ownership by re-saving a foreign record or skipping its fresh lookup", async () => {
+    for (const loadForeign of [true, false]) {
+      const command = fakeCommand();
+      const { options, handoff } = factoryOpenOptions(command);
+      const record = factoryRecord();
+      const persisted: AcpSessionStore = { load: vi.fn(async () => structuredClone(record) as never), save: vi.fn() };
+      const runtime = fakeRuntime();
+      try {
+        await expect(openCodexAcpxRuntime(options, {
+          createStore: () => persisted,
+          createRuntime: (created) => {
+            vi.mocked(runtime.ensureSession).mockImplementation(async () => {
+              if (loadForeign) await created.sessionStore.load("provider-key").catch(() => undefined);
+              await created.sessionStore.save(record as never);
+              return HANDLE;
+            });
+            return runtime;
+          },
+        })).rejects.toThrow("factory_claude_access_unverified");
+        expect(command.spawn).not.toHaveBeenCalled();
+        expect(persisted.save).not.toHaveBeenCalled();
+        expect(runtime.close).not.toHaveBeenCalled();
+      } finally {
+        closeFactoryClaudeAccessHandoff(handoff);
+      }
+    }
+  });
+
+  it("lets real ACPX create a fresh Factory session and reload only its owned record", async () => {
+    const command = fakeCommand();
+    const { options, handoff } = factoryOpenOptions(command);
+    const records = new Map<string, ReturnType<typeof factoryRecord>>();
+    const persisted: AcpSessionStore = {
+      load: vi.fn(async (id) => structuredClone(records.get(id)) as never),
+      save: vi.fn(async (record) => { records.set(record.acpxRecordId, structuredClone(record) as never); }),
+    };
+    let created!: AcpRuntimeOptions;
+    let child: ChildProcess | undefined;
+    vi.mocked(command.spawn).mockImplementation(() => {
+      // Builtin-only ACP fixture: no provider, credentials, tools or network.
+      child = spawn(process.execPath, ["-e", `
+        const readline = require('node:readline');
+        readline.createInterface({input:process.stdin}).on('line', line => {
+          const message = JSON.parse(line);
+          if (message.id === undefined) return;
+          const result = message.method === 'initialize' ? {protocolVersion:1,agentCapabilities:{}} :
+            message.method === 'session/new' ? {sessionId:'fresh-backend',models:{currentModelId:'claude-sonnet-5',availableModels:[{modelId:'claude-sonnet-5',name:'Fixture'}]}} : {};
+          process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:message.id,result})+'\\n');
+        }).on('close', () => process.exit(0));
+      `], { stdio: "pipe", env: { PATH: "/usr/bin:/bin" } });
+      return child;
+    });
+    let port: Awaited<ReturnType<typeof openCodexAcpxRuntime>> | undefined;
+    try {
+      port = await openCodexAcpxRuntime(options, {
+        createStore: () => persisted,
+        createRuntime: (value) => { created = value; return createAcpRuntime(value); },
+        awaitProviderOwnership: providerOwnershipEstablished,
+        awaitProviderExit: providerOwnershipEstablished,
+      });
+      expect(command.spawn).toHaveBeenCalledOnce();
+      expect(persisted.save).toHaveBeenCalled();
+      const own = await created.sessionStore.load("provider-key");
+      expect(own).toMatchObject({ acpxRecordId: "provider-key", acpSessionId: "fresh-backend" });
+      await created.sessionStore.save({ ...own, lastRequestId: "fresh-owned-update" } as never);
+      expect(await created.sessionStore.load("provider-key")).toMatchObject({ lastRequestId: "fresh-owned-update" });
+      const oldSaveCount = vi.mocked(persisted.save).mock.calls.length;
+      await expect(created.sessionStore.save({ ...own, acpSessionId: "foreign-backend" } as never))
+        .rejects.toThrow("factory_claude_access_unverified");
+      expect(persisted.save).toHaveBeenCalledTimes(oldSaveCount);
+    } finally {
+      // This test deliberately trips the store fence after proving own reload;
+      // the exact owned synthetic child still needs retirement on cleanup.
+      if (port) await port.close({ reason: "fresh fixture complete" }).catch(() => undefined);
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      closeFactoryClaudeAccessHandoff(handoff);
+    }
+  });
   it("passes the ephemeral Factory Claude handoff to the actual verified spawn callback", async () => {
     const handoff = createFactoryClaudeAccessBufferHandoff(Buffer.from("synthetic-access-envelope"), {
       provider: "claude", admissionId: "admission", capabilityId: "capability", workerPlanSha256: "a".repeat(64), runId: "run", normalizedSessionId: "session", environmentLeaseId: "lease", runnerInstanceId: "runner", deadlineAtMs: Date.now() + 30_000,
@@ -2954,6 +3064,23 @@ function openOptions(
     mcpServers: [],
     retainFailedAdmissionCleanup: vi.fn(),
   };
+}
+
+function factoryRecord() {
+  return { acpxRecordId: "provider-key", acpSessionId: "old-backend", agentSessionId: "old-agent",
+    name: "provider-key", cwd: "/workspace", agentCommand: "/paperclip-verified/claude-agent-acp", agentArgv: ["/paperclip-verified/claude-agent-acp"] };
+}
+
+function factoryOpenOptions(command: VerifiedAcpxCommandLease) {
+  const handoff = createFactoryClaudeAccessBufferHandoff(Buffer.from("synthetic-access-envelope"), {
+    provider: "claude", admissionId: "admission", capabilityId: "capability", workerPlanSha256: "a".repeat(64),
+    runId: "run", normalizedSessionId: "session", environmentLeaseId: "lease", runnerInstanceId: "runner",
+    deadlineAtMs: Date.now() + 30_000, runtimeRoot: "/private/runtime", workspaceRoot: "/workspace",
+    bridgeUrl: "http://127.0.0.1:41234/mcp", allowedMcpTools: ["mcp__paperclip__report_progress"],
+  });
+  const options = { ...openOptions(command), profile: resolveQualifiedAcpxProfile("claude", "claude-sonnet-5"),
+    factoryClaudeAccess: handoff, launchEnvironment: { PATH: "/usr/bin:/bin" } };
+  return { options, handoff };
 }
 
 function fakeRuntime(handle: AcpRuntimeHandle = HANDLE): AcpRuntime {
