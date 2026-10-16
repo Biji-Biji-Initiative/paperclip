@@ -51,6 +51,15 @@ test('reject secrets/config override and lone surrogate or NUL argument',()=>{
  for(const value of ['\ud800','x\0y'])assert.throws(()=>api.encodeFactoryWorkerLaunch(d,[...command(d),value]));
  assert.throws(()=>api.encodeFactoryWorkerLaunch(d,['/bin/sh','-c','true']));
 });
+test('v2 admits only native bootstrap ticket syntax and still denies provider credentials',()=>{
+ const d=desc(),token='bootstrap_'+randomUUID();
+ assert.equal(JSON.parse(api.encodeFactoryWorkerLaunch(d,command(d),{PAPERCLIP_RUNNER_BOOTSTRAP_TICKET:token})).environment.PAPERCLIP_RUNNER_BOOTSTRAP_TICKET,token);
+ for(const value of ['', 'bootstrap_invalid', token+'\n', 'sk-synthetic', 'Bearer synthetic', true])
+  assert.throws(()=>api.encodeFactoryWorkerLaunch(d,command(d),{PAPERCLIP_RUNNER_BOOTSTRAP_TICKET:value}));
+ for(const key of ['OPENAI_API_KEY','CODEX_API_KEY','ANTHROPIC_API_KEY','CLAUDE_CODE_OAUTH_TOKEN','OPENAI_BASE_URL'])
+  assert.throws(()=>api.encodeFactoryWorkerLaunch(d,command(d),{[key]:token}));
+ assert.throws(()=>api.encodeFactoryWorkerLaunch({...d,policy:'factory-worker-scope-v1'},command(d)));
+});
 test('header byte bound includes all arguments',()=>{
  const d=desc();assert.throws(()=>api.encodeFactoryWorkerLaunch(d,[...command(d),...Array(100).fill('x'.repeat(1000))]));
 });

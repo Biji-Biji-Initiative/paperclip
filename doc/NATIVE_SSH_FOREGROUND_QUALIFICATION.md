@@ -203,3 +203,25 @@ are non-null assertions following validated key material, acknowledged admission
 claimed owner state or assigned channel. The Python worker scan and fixture
 failure history are retained in deploy.mereka.io's candidate qualification proof.
 These scans are not an image vulnerability clean bill.
+
+
+## Policy revision2 and real scoped native runner
+
+`factory-worker-scope-v2` additionally accepts only native PRP bootstrap ticket
+syntax `bootstrap_<canonical UUID>`. This is one-use runner authority, not a
+provider account credential. API keys, provider tokens and endpoint overrides
+remain rejected. UUID length is checked explicitly, including trailing-newline
+negatives. Old policy descriptors are refused by the new candidate.
+
+The51 focused lease/foreground cases pass. Both focused harnesses now create
+relative package links so their retained builds work inside disposable Docker
+qualification controllers. Adapter and direct server TypeScript checks pass.
+
+The exact corrected candidate passes real Rust normal and interrupted scripted
+turns inside its scoped lease, with settled checkpoint and foreground release.
+An actual startup disconnect race found and corrected in the worker is covered
+by24 immediate EOF cases and33 Python tests under the actual worker policy.
+The production public PRP route, actual CAAM account connection and full native
+server/browser task continuation are still separate gates; no environment or
+provider account was enrolled. Exact image/source identities and failed runs
+remain in deploy.mereka.io's revision2 qualification proof.

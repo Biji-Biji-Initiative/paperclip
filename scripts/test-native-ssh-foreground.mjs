@@ -59,7 +59,7 @@ void launcher; void opener;
   await writeFile(join(build,'package.json'),'{"type":"module"}\n');
   const packageDir=join(build,'node_modules/@paperclipai/adapter-utils');
   await mkdir(packageDir,{recursive:true});
-  await symlink(join(build,'packages/adapter-utils/src'),join(packageDir,'src'),'dir');
+  await symlink('../../../packages/adapter-utils/src',join(packageDir,'src'),'dir');
   await writeFile(join(packageDir,'package.json'),'{"name":"@paperclipai/adapter-utils","type":"module","exports":{"./*":"./src/*.js"}}\n');
   const testsDir=join(root,'scripts/tests/native-ssh-foreground');
   const tests=(await readdir(testsDir)).filter(p=>p.endsWith('.test.mjs')).sort().map(p=>join(testsDir,p));

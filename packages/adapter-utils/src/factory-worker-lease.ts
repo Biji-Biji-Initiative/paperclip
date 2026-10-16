@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const FACTORY_WORKER_MARKER = "factory-worker-lease-v1" as const;
-export const FACTORY_WORKER_POLICY = "factory-worker-scope-v1" as const;
+export const FACTORY_WORKER_POLICY = "factory-worker-scope-v2" as const;
 export const FACTORY_COMPANY_ID = "740ad7ee-0c28-4e07-b9d1-ca7b35da820d" as const;
 export const FACTORY_LEASE_MAX_HEADER_BYTES = 64 * 1024;
 export const FACTORY_WORKER_BUSY_EXIT = 75;
@@ -59,7 +59,7 @@ export function validateFactoryWorkerLeaseDescriptor(
       value.protocol !== FACTORY_WORKER_MARKER || value.policy !== FACTORY_WORKER_POLICY ||
       value.companyId !== FACTORY_COMPANY_ID) invalid();
   for (const key of ["runId", "leaseId", "workspaceId"]) {
-    if (typeof value[key] !== "string" || !UUID.test(value[key])) invalid();
+    if (typeof value[key] !== "string" || value[key].length !== 36 || !UUID.test(value[key])) invalid();
   }
   if (typeof value.sessionId !== "string" || !SESSION.test(value.sessionId)) invalid();
   const workspace = `/workspace/${FACTORY_COMPANY_ID}/${value.workspaceId}`;
@@ -116,6 +116,8 @@ export function encodeFactoryWorkerLaunch(
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || !cleanString(value, 8192)) invalid();
     if (homeKeys.has(key)) {
       if (!path(value) || !(under(value, descriptor.filesystemDirectory) || under(value, "/home/node/lease"))) invalid();
+    } else if (key === "PAPERCLIP_RUNNER_BOOTSTRAP_TICKET") {
+      if (value.length !== "bootstrap_".length + 36 || !value.startsWith("bootstrap_") || !UUID.test(value.slice("bootstrap_".length))) invalid();
     } else if (key === "PAPERCLIP_PROVIDER_TRACE_PATH") {
       if (!path(value) || !under(value, descriptor.diagnosticsDirectory)) invalid();
     } else if (key === "DO_NOT_TRACK" || key === "PAPERCLIP_RUNNER_TRACE") {

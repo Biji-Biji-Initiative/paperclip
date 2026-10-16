@@ -39,7 +39,7 @@ try {
   await writeFile(join(build,'package.json'),'{"type":"module"}\n');
   const packageDir=join(build,'node_modules/@paperclipai/adapter-utils');
   await mkdir(packageDir,{recursive:true});
-  await symlink(join(build,'packages/adapter-utils/src'),join(packageDir,'src'),'dir');
+  await symlink('../../../packages/adapter-utils/src',join(packageDir,'src'),'dir');
   await writeFile(join(packageDir,'package.json'),'{"name":"@paperclipai/adapter-utils","type":"module","exports":{"./*":"./src/*.js"}}\n');
   const testDir=join(root,'scripts/tests/factory-worker-lease');
   const tests=(await readdir(testDir)).filter(p=>p.endsWith('.test.mjs')).sort().map(p=>join(testDir,p));
