@@ -21,6 +21,12 @@ assert.match(docker, /FROM runner-deps AS runner-build/);
 assert.match(docker, /FROM runner-build AS build/);
 assert.match(docker, /ARG PAPERCLIP_RUNNER_SUBSCRIPTIONS_ONLY=false/);
 
+test("Final image CLI uses the same Codex version as the verified provider pack", () => {
+  const pkg = JSON.parse(readFileSync(new URL("packages/paperclip-runner/package.json", root), "utf8"));
+  const versions = [...docker.matchAll(/@openai\/codex@([0-9.]+)/g)].map(match => match[1]);
+  assert.deepEqual(versions, [pkg.dependencies["@openai/codex"]]);
+});
+
 function fixture() {
   const dir = mkdtempSync("/data/tmp/factory-build-mode-");
   const bin = join(dir, "bin"), work = join(dir, "work");
