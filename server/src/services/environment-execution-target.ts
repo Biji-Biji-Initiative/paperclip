@@ -243,6 +243,10 @@ export async function resolveEnvironmentExecutionTarget(input: {
   // bridge, so the surface stays inert until the host injects a real recorder.
   duplexObservabilityRecorder?: DuplexObservabilityRecorder | null;
 }): Promise<AdapterExecutionTarget | null> {
+  if (input.environment.driver === "ssh" && input.environment.config?.factoryWorkerPolicy !== undefined &&
+      input.adapterType !== "paperclip_runner") {
+    throw new Error("factory_worker_native_backend_required");
+  }
   if (input.environment.driver === "local") {
     return {
       kind: "local",
@@ -651,6 +655,8 @@ export async function resolveEnvironmentExecutionTarget(input: {
   return {
     kind: "remote",
     transport: "ssh",
+    ...(parsed.config.factoryWorkerPolicy ? { factoryWorkerPolicy: parsed.config.factoryWorkerPolicy } : {}),
+    ...(parsed.config.factoryProviderAdmission ? { factoryProviderAdmission: { ...parsed.config.factoryProviderAdmission } } : {}),
     environmentId: input.environment.id ?? null,
     leaseId: input.leaseId ?? null,
     remoteCwd,

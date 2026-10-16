@@ -5,7 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import { githubLauncherSource } from "./github-launcher.js";
+import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
   prepareCommandManagedRuntime,
@@ -136,6 +136,9 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 }
 
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
+  /** Copied only from the persisted, validated SSH environment config. */
+  readonly factoryWorkerPolicy?: "factory-worker-scope-v2";
+  readonly factoryProviderAdmission?: { readonly provider: "codex"; readonly workerPlanSha256: string };
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;
@@ -450,6 +453,9 @@ function isAdapterExecutionTargetInstance(value: unknown): value is AdapterExecu
 export function adapterExecutionTargetToRemoteSpec(
   target: AdapterExecutionTarget | null | undefined,
 ): AdapterRemoteExecutionSpec | null {
+  if (target?.kind === "remote" && target.transport === "ssh" && target.factoryWorkerPolicy) {
+    throw new Error("factory_worker_raw_execution_forbidden");
+  }
   return target?.kind === "remote" && target.transport === "ssh" ? target.spec : null;
 }
 
@@ -1608,6 +1614,21 @@ export async function prepareGitHubExecutionEnvironment(input: {
   hostCredentials: boolean;
   networkAccess: boolean;
 }): Promise<Record<string, string>> {
+  if (input.target?.kind === "remote" && input.target.transport === "ssh" &&
+      input.target.factoryWorkerPolicy === "factory-worker-scope-v2") {
+    if (input.hostCredentials) throw new Error("factory_worker_host_github_forbidden");
+    // A Factory host only accepts scoped native admission. Its image and
+    // private lease home supply the toolchain; do not run an unleased SSH probe
+    // or import controller/host Git roots before that admission.
+    return {
+      ...githubBrokerEnvironment(input.env, { url: "", token: "" }),
+      PAPERCLIP_GITHUB_HOST_HOME: "",
+      PAPERCLIP_GIT_METADATA_ROOTS: "[]",
+      PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
+      PAPERCLIP_GITHUB_AUTH_MODE: "managed",
+      PAPERCLIP_RUNNER_NETWORK_ACCESS: input.networkAccess ? "enabled" : "disabled",
+    };
+  }
   const script = String.raw`
 const fs = require('node:fs');
 const path = require('node:path');

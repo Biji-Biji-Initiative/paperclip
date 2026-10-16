@@ -118,6 +118,25 @@ function launch(owner,d,runner,extra={}){return owner.createLauncher({runner,rem
 const spec=d=>({command:'/unused/controller/path',args:['--ticket','synthetic-bootstrap-only'],cwd:d.workspaceRoot,environment:{HOME:d.filesystemDirectory+'/codex-home'}});
 function channel(exit={exitCode:0}){return {write(){},onData(){},onStderr(){},onExit(fn){fn(exit);},stop(){},async close(){}};}
 
+test('owned checkpoint refuses an unstarted owner without invoking its release callback',async t=>{
+ const {owner}=await ownerFixture(t);let calls=0;
+ await assert.rejects(owner.checkpointOwned('settled',async()=>{calls++;}),/ownership_unverified/);
+ assert.equal(calls,0);
+});
+test('owned checkpoint settles one completed lifetime and memoizes its release proof',async t=>{
+ const {d,owner}=await ownerFixture(t);let calls=0;
+ await launch(owner,d,{async openDuplexChannel(){return channel();}})(spec(d)).completion;
+ await owner.checkpointOwned('settled',async()=>{calls++;});
+ await owner.checkpointOwned('settled',async()=>{calls++;});
+ assert.equal(calls,1);owner.assertAvailable();
+});
+test('verified worker busy is not a positive foreground checkpoint release proof',async t=>{
+ const {d,owner}=await ownerFixture(t);let calls=0;
+ await assert.rejects(launch(owner,d,{async openDuplexChannel(){throw new api.FactoryWorkerBusyError();}})(spec(d)).completion,api.FactoryWorkerBusyError);
+ await assert.rejects(owner.checkpointOwned('settled',async()=>{calls++;}),/ownership_unverified/);
+ assert.equal(calls,0);
+});
+
 test('owner sends runner argv and environment in typed lease seam after staging',async t=>{
  const {root,d,owner}=await ownerFixture(t);let seen,release;const stage=new Promise(r=>release=r);
  const handle=launch(owner,d,{async openDuplexChannel(x){seen=x;return channel();}},{ensureArtifact:()=>stage})(spec(d));
@@ -158,6 +177,30 @@ test('stop before completed staging never opens worker channel',async t=>{
  const {d,owner}=await ownerFixture(t);let finish,opens=0;const stage=new Promise(r=>finish=r);
  const handle=launch(owner,d,{async openDuplexChannel(){opens++;return channel();}},{ensureArtifact:()=>stage})(spec(d));
  handle.child.kill();finish();await assert.rejects(handle.completion,/cancelled_before_dispatch/);assert.equal(opens,0);owner.assertAvailable();
+});
+
+test('descriptor factory runs after staging and its exact fresh descriptor reaches admission',async t=>{
+ const {d,owner}=await ownerFixture(t);let finish,seen,calls=0;
+ const stage=new Promise(r=>finish=r);
+ const fresh={...d,deadlineUnixMs:Date.now()+280000};
+ const handle=launch(owner,d,{async openDuplexChannel(x){seen=x;return channel();}},
+  {workerLease:undefined,ensureArtifact:()=>stage,createWorkerLease:async()=>{calls++;return fresh;}})(spec(d));
+ await pause(5);assert.equal(calls,0);finish();await handle.completion;
+ assert.equal(calls,1);assert.deepEqual(seen.workerLease,fresh);await owner.checkpoint('settled',async()=>{});
+});
+test('descriptor created after staging is still bound to its owner and cannot open on mismatch',async t=>{
+ const {d,owner}=await ownerFixture(t);let opens=0;
+ const handle=launch(owner,d,{async openDuplexChannel(){opens++;return channel();}},
+  {workerLease:undefined,createWorkerLease:async()=>({...d,runId:randomUUID()})})(spec(d));
+ await assert.rejects(handle.completion,/ownership_unverified/);assert.equal(opens,0);
+});
+test('a stalled late descriptor cannot defeat bounded Stop or dispatch when it eventually resolves',async t=>{
+ const {d,options}=await ownerFixture(t),owner=new NativeSshForegroundOwner({...options,cleanupTimeoutMs:30});
+ let finish,started,opens=0;const stage=new Promise(r=>started=r),descriptor=new Promise(r=>finish=r);
+ const handle=launch(owner,d,{async openDuplexChannel(){opens++;return channel();}},
+  {workerLease:undefined,createWorkerLease:()=>{started();return descriptor;}})(spec(d));
+ await stage;handle.child.kill();await assert.rejects(handle.completion,/ownership_unverified/);
+ finish(d);await pause(10);assert.equal(opens,0);assert.throws(()=>owner.assertAvailable());
 });
 
 test('TypeScript header is accepted byte-for-byte by the production Python parser',()=>{

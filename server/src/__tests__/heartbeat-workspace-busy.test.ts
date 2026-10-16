@@ -2,25 +2,30 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   activityLog,
   budgetPolicies,
   companies,
   companySkills,
+  completionContracts,
   createDb,
   environments,
+  documents,
   environmentLeases,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
+  issueDocuments,
   issueRelations,
   issues,
+  nativeRunFinalizations,
   projects,
   projectWorkspaces,
 } from "@paperclipai/db";
@@ -45,6 +50,40 @@ import {
   heartbeatService,
 } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { FactoryWorkspaceStagingBusyError } from "../services/factory-workspace-staging.js";
+import {
+  FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE,
+  isNativeRunnerOwnershipHeld,
+  NativeRunnerOwnershipUnverifiedError,
+} from "../services/native-runtime/native-runner-ownership.js";
+import { parseNativeExecutionInput, type NativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { buildEnvironmentLeaseContext } from "../services/environment-runtime.js";
+
+type AcquireLease = ReturnType<typeof import("../services/environment-runtime.js").environmentRuntimeService>["acquireRunLease"];
+type NativeExecute = typeof import("../services/native-runtime/native-session-executor.js").executePaperclipNativeSession;
+
+const stagingAcquireFault = vi.hoisted(() => ({
+  beforeAcquire: undefined as ((input: { heartbeatRunId: string | null }) => Promise<void>) | undefined,
+  acquireOverride: undefined as AcquireLease | undefined,
+  executeOverride: undefined as NativeExecute | undefined,
+}));
+vi.mock("../services/environment-runtime.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/environment-runtime.js")>();
+  return { ...actual, environmentRuntimeService: (...args: Parameters<typeof actual.environmentRuntimeService>) => {
+    const runtime = actual.environmentRuntimeService(...args);
+    return { ...runtime, acquireRunLease: async (input: Parameters<typeof runtime.acquireRunLease>[0]) => {
+      await stagingAcquireFault.beforeAcquire?.(input);
+      if (stagingAcquireFault.acquireOverride) return stagingAcquireFault.acquireOverride(input);
+      return runtime.acquireRunLease(input);
+    } };
+  } };
+});
+vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
+  return { ...actual, executePaperclipNativeSession: ((input) =>
+    stagingAcquireFault.executeOverride ? stagingAcquireFault.executeOverride(input) : actual.executePaperclipNativeSession(input)) satisfies NativeExecute };
+});
 
 // Exercise the real SSH lease and heartbeat paths without connecting to a host.
 vi.mock("@paperclipai/adapter-utils/ssh", async (importOriginal) => ({
@@ -115,7 +154,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
         testedAt: new Date().toISOString(),
       }),
     });
-  }, 20_000);
+  }, 120_000);
 
   afterEach(async () => {
     // Seeded holder runs are synthetic "running" rows with no real execution
@@ -127,6 +166,9 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       .where(eq(heartbeatRuns.status, "running"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     await cleanupFixture();
+    stagingAcquireFault.beforeAcquire = undefined;
+    stagingAcquireFault.acquireOverride = undefined;
+    stagingAcquireFault.executeOverride = undefined;
     executedRunIds.length = 0;
     executedInputs.clear();
     await instanceSettingsService(db).updateGeneral({ executionMode: "any" });
@@ -151,6 +193,12 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
   }
 
   async function cleanupFixtureOnce() {
+    await db.delete(agentTaskSessions);
+    await db.delete(issueDocuments);
+    await db.delete(documents);
+    await db.delete(nativeRunFinalizations);
+    await db.update(heartbeatRuns).set({ completionContractId: null });
+    await db.delete(completionContracts);
     await db.delete(activityLog);
     await db.delete(environmentLeases);
     await db.delete(issueComments);
@@ -220,6 +268,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
   }
 
   async function seedWorkspaceFixture(input?: {
+    companyId?: string;
     holderIssueWorkspaceSettings?: Record<string, unknown> | null;
     holderProjectWorkspaceId?: string;
     holderActivityAt?: Date;
@@ -228,7 +277,7 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
     agentEnvironmentDriver?: "local" | "ssh" | "sandbox";
   }): Promise<WorkspaceFixture> {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
-    const companyId = randomUUID();
+    const companyId = input?.companyId ?? randomUUID();
     const projectId = randomUUID();
     const projectWorkspaceId = randomUUID();
     const holderAgentId = randomUUID();
@@ -386,6 +435,184 @@ describeEmbeddedPostgres("shared-workspace run serialization", () => {
       nonAssigneeAgentId,
     };
   }
+
+  it.each(["fresh_foreign", "fresh_self", "admitted_foreign", "missing_admitted"] as const)(
+    "Factory staging refusal preserves the correct heartbeat disposition: %s", async scenario => {
+      const fixture = await seedWorkspaceFixture({ agentEnvironmentDriver: "ssh",
+        issueWorkspaceSettings: { sharedWorkspaceConcurrency: "allow" } });
+      await instanceSettingsService(db).updateExperimental({ enableNativeRunner: true });
+      const [agent] = await db.select().from(agents).where(eq(agents.id, fixture.agentId));
+      const workspaceId = randomUUID(), remoteCwd = `/workspace/${fixture.companyId}/${workspaceId}`;
+      await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: fixture.companyId,
+        projectId: fixture.projectId, projectWorkspaceId: fixture.projectWorkspaceId, sourceIssueId: fixture.issueId,
+        mode: "shared_workspace", strategyType: "project_primary", name: "Factory boundary fixture", cwd: workspaceCwd });
+      await db.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, fixture.issueId));
+      await db.update(environments).set({ config: { host: "fixture.invalid", port: 2222, username: "node",
+        remoteWorkspacePath: remoteCwd, factoryWorkerPolicy: "factory-worker-scope-v2",
+        privateKey: null, privateKeySecretRef: null, knownHosts: "fixture-public-pin", strictHostKeyChecking: true,
+      } }).where(eq(environments.id, agent!.defaultEnvironmentId!));
+      await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+        provider: "codex", model: "gpt-6.1-sol", codexPermissionMode: "never", lifecycleMode: "per_turn",
+      } }).where(eq(agents.id, fixture.agentId));
+      let refusedRunId: string | null = null;
+      const refused = vi.fn(async (input: { heartbeatRunId: string | null }) => {
+        refusedRunId = input.heartbeatRunId;
+        throw new FactoryWorkspaceStagingBusyError({ runId: scenario === "fresh_self" ? input.heartbeatRunId! : fixture.holderRunId,
+          agentId: scenario === "fresh_self" ? fixture.agentId : fixture.holderAgentId,
+          issueId: null, issueIdentifier: null, projectWorkspaceId: null });
+      });
+      stagingAcquireFault.beforeAcquire = refused;
+      let runId: string;
+      const admitted = scenario === "admitted_foreign" || scenario === "missing_admitted";
+      if (admitted) {
+        runId = randomUUID();
+        const execution: Extract<NativeExecutionInput, { schema: "paperclip.native-execution-input.v1" }> = {
+          schema: "paperclip.native-execution-input.v1", binding: { companyId: fixture.companyId,
+            agentId: fixture.agentId, issueId: fixture.issueId, runId, executionWorkspaceId: workspaceId },
+          task: { identifier: fixture.issueId, title: "Admitted fixture", description: null, prompt: "No inference", workMode: "standard" },
+          workspace: { cwd: workspaceCwd, repoUrl: null, repoRef: null, branchName: null },
+          provider: { kind: "codex", model: "gpt-6.1-sol" },
+          session: { normalizedSessionId: randomUUID(), driverKind: "codex_app_server", protocolVersion: 1,
+            lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+          completionContract: { id: randomUUID(), sha256: "0".repeat(64), schemaVersion: "paperclip.completion-contract.v1",
+            contract: { revision: "1", objective: "Boundary fixture", criteria: [{ id: "no-dispatch", requirement: "No provider dispatch" }] } },
+          interactionResponses: [], credentialBindings: [],
+        };
+        expect(() => parseNativeExecutionInput(execution)).not.toThrow();
+        await db.insert(heartbeatRuns).values({ id: runId, companyId: fixture.companyId, agentId: fixture.agentId,
+          status: "queued", invocationSource: "assignment", triggerDetail: "system", runtimeMode: "native",
+          runtimeModeResolvedAt: new Date(), nativeIssueId: fixture.issueId, nativeSessionId: execution.session.normalizedSessionId,
+          contextSnapshot: { issueId: fixture.issueId, executionWorkspaceId: workspaceId, wakeReason: "issue_assigned" },
+          runnerProfileJson: scenario === "missing_admitted" ? {} : { nativeExecutionInput: execution } });
+        await db.insert(nativeRunFinalizations).values({ runId, companyId: fixture.companyId,
+          issueId: fixture.issueId, phase: "observed", attempt: 1 });
+        await heartbeat.resumeQueuedRuns();
+      } else {
+        const run = await heartbeat.invoke(fixture.agentId, "assignment", { issueId: fixture.issueId, wakeReason: "issue_assigned" }, "system");
+        expect(run).not.toBeNull(); runId = run!.id;
+      }
+      if (scenario !== "missing_admitted") {
+        await expect.poll(() => refusedRunId, { timeout: 20_000, interval: 50 }).toBe(runId);
+      }
+      if (scenario === "fresh_foreign") {
+        const ended = await waitForRunToLeaveActiveStates(runId, 20_000);
+        expect(ended).toMatchObject({ status: "cancelled", errorCode: WORKSPACE_BUSY_ERROR_CODE });
+        const retry = await waitForRetryRun(runId);
+        expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: WORKSPACE_BUSY_RETRY_REASON });
+        expect(ended?.resultJson?.workspaceBusy).toMatchObject({ holderRunId: fixture.holderRunId, holderIssueId: null, projectWorkspaceId: null });
+      } else {
+        await expect.poll(async () => (await heartbeat.getRun(runId))?.errorCode,
+          { timeout: 20_000, interval: 50 }).toBe(FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE);
+        const heldRun = await heartbeat.getRun(runId);
+        expect(heldRun).not.toBeNull();
+        expect(isNativeRunnerOwnershipHeld(heldRun!)).toBe(true);
+        if (scenario === "fresh_self") {
+          expect(heldRun).toMatchObject({ runtimeMode: "legacy", runtimeModeResolvedAt: null });
+        }
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+      }
+      if (scenario === "missing_admitted") expect(refused).not.toHaveBeenCalled();
+      else expect(refused).toHaveBeenCalledOnce();
+      expect(executedRunIds).not.toContain(runId);
+      const coordinator = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      if (admitted) expect(coordinator[0]?.attempt).toBe(1);
+      else expect(coordinator).toHaveLength(0);
+      await heartbeat.waitForRunExecutionDrain(runId, { timeoutMs: 20_000 });
+    }, 60_000,
+  );
+
+  it("starts a new Factory human turn with fresh authority and the previous artifact handoff", async () => {
+    const fixture = await seedWorkspaceFixture({ companyId: FACTORY_COMPANY_ID, agentEnvironmentDriver: "ssh",
+      issueWorkspaceSettings: { sharedWorkspaceConcurrency: "allow" } });
+    await instanceSettingsService(db).updateExperimental({ enableNativeRunner: true });
+    const [agent] = await db.select().from(agents).where(eq(agents.id, fixture.agentId));
+    const workspaceId = randomUUID(), remoteCwd = `/workspace/${fixture.companyId}/${workspaceId}`;
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: fixture.companyId,
+      projectId: fixture.projectId, projectWorkspaceId: fixture.projectWorkspaceId, sourceIssueId: fixture.issueId,
+      mode: "shared_workspace", strategyType: "project_primary", name: "Factory continuation fixture", cwd: workspaceCwd });
+    await db.update(issues).set({ executionWorkspaceId: workspaceId, executionWorkspacePreference: "reuse_existing" })
+      .where(eq(issues.id, fixture.issueId));
+    await db.update(environments).set({ config: { host: "fixture.invalid", port: 2222, username: "node",
+      remoteWorkspacePath: remoteCwd, factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+      privateKey: null, privateKeySecretRef: null, knownHosts: "fixture-public-pin", strictHostKeyChecking: true,
+    } }).where(eq(environments.id, agent!.defaultEnvironmentId!));
+    await db.update(agents).set({ adapterType: "paperclip_runner", adapterConfig: {
+      provider: "codex", model: "gpt-6.1-sol", codexPermissionMode: "never", lifecycleMode: "per_turn",
+    } }).where(eq(agents.id, fixture.agentId));
+
+    // Keep actual heartbeat selection, persistence, and history reads. Replace
+    // only the external lease/provider boundaries: this test never uses SSH.
+    const leaseIds: string[] = [];
+    stagingAcquireFault.acquireOverride = async input => {
+      const [lease] = await db.insert(environmentLeases).values({ companyId: input.companyId,
+        environmentId: input.environment.id, executionWorkspaceId: input.persistedExecutionWorkspace!.id,
+        issueId: input.issueId, heartbeatRunId: input.heartbeatRunId, provider: "ssh", status: "active",
+        metadata: { remoteCwd, driver: "ssh" } }).returning();
+      leaseIds.push(lease!.id);
+      return { environment: input.environment, lease: lease!, leaseContext: buildEnvironmentLeaseContext(input) };
+    };
+    const dispatched: Parameters<NativeExecute>[0][] = [];
+    let handoff: string | null | undefined;
+    let handoffTiming: unknown;
+    stagingAcquireFault.executeOverride = async input => {
+      dispatched.push(input);
+      if (dispatched.length === 1) {
+        // The substituted native provider completes its proposal. A still-open
+        // task would correctly schedule an autonomous continuation before the
+        // next human message and would test a different admission boundary.
+        await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.issueId));
+        return { exitCode: 0, signal: null, timedOut: false, summary: "First proposal drafted" };
+      }
+      handoff = await input.getFreshSessionHandoff?.();
+      handoffTiming = await db.execute(sql`select
+        (select created_at::text from heartbeat_runs where id = ${input.execution.binding.runId}) as run_time,
+        (select max(created_at)::text from issue_comments where issue_id = ${fixture.issueId}) as comment_time,
+        (select max(updated_at)::text from documents where company_id = ${fixture.companyId}) as document_time`);
+      throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+    };
+    const first = await heartbeat.invoke(fixture.agentId, "assignment", { issueId: fixture.issueId, wakeReason: "issue_assigned" }, "system");
+    expect(first).not.toBeNull();
+    expect((await waitForRunToLeaveActiveStates(first!.id, 30_000))?.status).toBe("succeeded");
+    await heartbeat.waitForRunExecutionDrain(first!.id, { timeoutMs: 30_000 });
+    expect(dispatched).toHaveLength(1);
+    const oldSessionId = dispatched[0]!.execution.session.normalizedSessionId!;
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first!.id));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...finished!.runnerProfileJson,
+      sessionCheckpoint: { semanticResult: { summary: "First proposal drafted; use the saved proposal document" } } },
+    }).where(eq(heartbeatRuns.id, first!.id));
+    await db.insert(agentTaskSessions).values({ companyId: fixture.companyId, agentId: fixture.agentId,
+      adapterType: "paperclip_runner", taskKey: fixture.issueId, lastRunId: first!.id,
+      sessionDisplayId: oldSessionId, sessionParamsJson: { sessionId: oldSessionId, cwd: workspaceCwd },
+    }).onConflictDoUpdate({ target: [agentTaskSessions.companyId, agentTaskSessions.agentId, agentTaskSessions.adapterType, agentTaskSessions.taskKey],
+      set: { lastRunId: first!.id, sessionDisplayId: oldSessionId, sessionParamsJson: { sessionId: oldSessionId, cwd: workspaceCwd } } });
+    const documentId = randomUUID(), commentId = randomUUID();
+    await db.insert(documents).values({ id: documentId, companyId: fixture.companyId, latestBody: "Saved proposal artifact: marketing launch plan" });
+    await db.insert(issueDocuments).values({ companyId: fixture.companyId, issueId: fixture.issueId, documentId, key: "proposal" });
+    await db.insert(issueComments).values({ id: commentId, companyId: fixture.companyId, issueId: fixture.issueId,
+      authorType: "user", authorUserId: "responsible-user", body: "Revise the saved proposal for the LMS marketing team" });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, fixture.issueId));
+    const second = await heartbeat.invoke(fixture.agentId, "on_demand", { issueId: fixture.issueId,
+      wakeReason: "issue_commented", commentId }, "manual", { actorType: "user", actorId: "responsible-user" });
+    expect(second, JSON.stringify(await db.select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, fixture.agentId)))).not.toBeNull();
+    await expect.poll(() => dispatched.length, { timeout: 30_000, interval: 50 }).toBe(2);
+    await heartbeat.waitForRunExecutionDrain(second!.id, { timeoutMs: 30_000 });
+    const next = dispatched[1]!;
+    expect(next.execution.binding).toMatchObject({ runId: second!.id, issueId: fixture.issueId, executionWorkspaceId: workspaceId });
+    expect(next.execution.session).toMatchObject({ lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } });
+    expect(next.execution.session.normalizedSessionId).not.toBe(oldSessionId);
+    expect(next.runnerInstanceId).not.toBe(dispatched[0]!.runnerInstanceId);
+    expect(next.runnerExecutionTarget).toMatchObject({ leaseId: leaseIds[1], factoryWorkerPolicy: FACTORY_WORKER_POLICY });
+    expect(leaseIds[1]).not.toBe(leaseIds[0]);
+    const persisted = await heartbeat.getRun(second!.id);
+    expect(persisted?.contextSnapshot).toMatchObject({ forceFreshSession: true });
+    expect(persisted?.runnerProfileJson).not.toHaveProperty("sessionCheckpoint");
+    expect(handoff).toContain("First proposal drafted");
+    expect(handoff, JSON.stringify(handoffTiming)).toContain("Saved proposal artifact");
+    expect(handoff).toContain(documentId);
+    expect(handoff).toContain("Revise the saved proposal");
+    expect(await db.select().from(documents).where(eq(documents.id, documentId))).toHaveLength(1);
+  }, 120_000);
 
   it("auto dispatches alongside a local holder and adds coordination context", async () => {
     const fixture = await seedWorkspaceFixture({

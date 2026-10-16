@@ -314,6 +314,8 @@ import {
   MAX_EXCERPT_BYTES,
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { FactoryWorkerCapacityDeferredError } from "./native-runtime/factory-worker-capacity.js";
+import { FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -329,6 +331,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
   requiresDurableNativeOwnershipHold,
   NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
+  FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE,
 } from "./native-runtime/native-runner-ownership.js";
 import {
   findNativeChatWorkspaceScope,
@@ -615,7 +618,8 @@ import {
   type ProviderResourceDisposition,
 } from "./environment-runtime.js";
 import { skillVersionSelectionMap } from "./runtime-skill-selections.js";
-import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
+import { environmentRunOrchestrator, EnvironmentRunError } from "./environment-run-orchestrator.js";
+import { FactoryWorkspaceStagingBusyError } from "./factory-workspace-staging.js";
 import { isUnsafeSessionWorkspaceCwd } from "./session-workspace-cwd.js";
 import {
   clearHeartbeatRunRuntimeStatus,
@@ -1030,7 +1034,7 @@ function buildUnresolvedWorkspaceBaseRefResultJson(
 export interface SharedWorkspaceHolder {
   runId: string;
   agentId: string;
-  issueId: string;
+  issueId: string | null;
   issueIdentifier: string | null;
 }
 
@@ -1041,13 +1045,13 @@ export interface SharedWorkspaceHolder {
 export class WorkspaceBusyDeferral extends Error {
   code = WORKSPACE_BUSY_ERROR_CODE;
   holder: SharedWorkspaceHolder;
-  projectWorkspaceId: string;
+  projectWorkspaceId: string | null;
   deferralAttempt: number;
   wasIssueAssignee: boolean;
 
   constructor(input: {
     holder: SharedWorkspaceHolder;
-    projectWorkspaceId: string;
+    projectWorkspaceId: string | null;
     deferralAttempt: number;
     wasIssueAssignee: boolean;
   }) {
@@ -18997,8 +19001,10 @@ export function heartbeatService(
     },
   ) {
     const durableOwnershipHold = requiresDurableNativeOwnershipHold(evidence.reason);
+    const ownershipErrorCode = evidence.reason === "factory_workspace_staging_unverified"
+      ? FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE : NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE;
     if (
-      run.errorCode === NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE &&
+      run.errorCode === ownershipErrorCode &&
       run.error === NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE &&
       (!durableOwnershipHold || isNativeRunnerOwnershipHeld(run))
     )
@@ -19010,7 +19016,7 @@ export function heartbeatService(
       [blockedStatus],
       {
         error: NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE,
-        errorCode: NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
+        errorCode: ownershipErrorCode,
         ...(durableOwnershipHold
           ? {
               nativePhase: "terminal_failure",
@@ -21743,6 +21749,8 @@ export function heartbeatService(
       );
       const useHostGitHub =
         !githubSelection.configured &&
+        !(selectedEnvironmentForConfig?.driver === "ssh" &&
+          selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY) &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
@@ -21966,6 +21974,15 @@ export function heartbeatService(
         const canRefresh = typeof capability === "function" ? capability(runtimeConfig) : capability === true;
         if (!canRefresh) context.forceFreshSession = true;
       }
+      // Factory workers start a cold provider for each new run. Keep history
+      // through the existing bounded handoff, never through a prior lease or
+      // provider checkpoint. A persisted same-run admission (including a
+      // verified capacity refusal) must keep its original identity.
+      if (selectedEnvironmentForConfig?.driver === "ssh" &&
+          selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY &&
+          !persistedNativeExecutionInput && !run.nativeSessionId && !run.runtimeModeResolvedAt) {
+        context.forceFreshSession = true;
+      }
       const wakeSessionResetReason = describeSessionResetReason(context);
       const sessionConfigFreshness = resolveTaskSessionConfigFreshness({
         hasTaskSession: taskSession != null,
@@ -21984,7 +22001,7 @@ export function heartbeatService(
         sessionConfigFreshness.reasons.join("; ") || null;
       const taskSessionForRun = resetTaskSession ? null : taskSession;
       const getFreshSessionHandoff = issueRef ? createNativeSessionHandoffLoader({
-        db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt,
+        db, companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, before: run.createdAt, beforeRunId: run.id,
         throughCommentId: readNonEmptyString(context.conversationReplayThroughCommentId) ?? (context.interactionKind ? null : wakeCommentId),
       }) : undefined;
       const previousSessionParams =
@@ -22684,6 +22701,17 @@ export function heartbeatService(
           .where(eq(heartbeatRuns.id, run.id));
       }
       const environmentAcquireStartedAtMs = Date.now();
+      const factoryWorkspacePreparation = selectedEnvironmentForConfig?.driver === "ssh" &&
+        selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY;
+      if (factoryWorkspacePreparation && run.runtimeModeResolvedAt && run.runtimeMode === "native" &&
+          !persistedNativeExecutionInput) {
+        throw new NativeRunnerOwnershipUnverifiedError("factory_workspace_staging_unverified");
+      }
+      if (factoryWorkspacePreparation && (agent.adapterType !== "paperclip_runner" ||
+          resolvedInstanceSettings.experimental.enableNativeRunner !== true ||
+          (run.runtimeModeResolvedAt && run.runtimeMode !== "native"))) {
+        throw new Error("factory_worker_native_backend_required");
+      }
       let acquiredEnvironment: Awaited<
         ReturnType<typeof envOrchestrator.acquireForRun>
       >;
@@ -22711,6 +22739,25 @@ export function heartbeatService(
           attributes: { adapter: agent.adapterType },
         });
       } catch (error) {
+        const stagingBusy = error instanceof EnvironmentRunError && error.code === "lease_acquire_failed" &&
+          error.cause instanceof FactoryWorkspaceStagingBusyError ? error.cause : null;
+        if (stagingBusy) {
+          // Only a fresh, foreign-holder refusal proves this run never staged or
+          // dispatched. An admitted input or self-holder must retain uncertainty.
+          if (persistedNativeExecutionInput || stagingBusy.holder.runId === run.id) {
+            throw new NativeRunnerOwnershipUnverifiedError("factory_workspace_staging_unverified");
+          }
+          throw new WorkspaceBusyDeferral({ holder: stagingBusy.holder,
+            projectWorkspaceId: stagingBusy.holder.projectWorkspaceId,
+            deferralAttempt: run.scheduledRetryReason === WORKSPACE_BUSY_RETRY_REASON ? run.scheduledRetryAttempt ?? 0 : 0,
+            wasIssueAssignee: issueContext?.assigneeAgentId === agent.id });
+        }
+        if (factoryWorkspacePreparation) {
+          // A rejected remote preparation is not proof that its uploader died.
+          // This hold must survive before the native envelope exists, without
+          // rewriting the still-owned legacy preparation controller lease.
+          throw new NativeRunnerOwnershipUnverifiedError("factory_workspace_staging_unverified");
+        }
         nativeRunnerPreparationSpans.push({
           name: "environment.acquire",
           parentName: "task.run",
@@ -25228,6 +25275,10 @@ export function heartbeatService(
             nativeSessionResumeScheduled = true;
             throw adapterErr;
           }
+          if (adapterErr instanceof FactoryWorkerCapacityDeferredError) {
+            nativeSessionResumeScheduled = true;
+            throw adapterErr;
+          }
           if (adapterErr instanceof NativeRunnerOwnershipUnverifiedError) {
             nativeOwnershipHeld = true;
             throw adapterErr;
@@ -26099,6 +26150,15 @@ export function heartbeatService(
           wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         });
       } catch (err) {
+        if (err instanceof FactoryWorkerCapacityDeferredError) {
+          nativeSessionResumeScheduled = true;
+          await appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "info",
+            message: "Worker capacity is busy; no provider turn was dispatched. Retrying the same reserved attempt.",
+            payload: { code: "factory_worker_busy", dispatchAttempted: false, fallbackSuppressed: true,
+              nextAttemptAt: err.nextAttemptAt.toISOString() } }).catch(() => undefined);
+          scheduleNativeSessionResumeDispatch(run.id, err.nextAttemptAt);
+          return;
+        }
         if (err instanceof NativeControllerDetachedForRestartError) {
           nativeSessionResumeScheduled = true;
           return;

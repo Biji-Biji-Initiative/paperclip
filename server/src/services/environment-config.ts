@@ -37,7 +37,11 @@ const secretRefSchema = z.object({
   version: z.union([z.literal("latest"), z.number().int().positive()]).optional().default("latest"),
 }).strict();
 
-const sshEnvironmentConfigSchema = z.object({
+const sshEnvironmentConfigBaseSchema = z.object({
+  factoryWorkerPolicy: z.literal("factory-worker-scope-v2").optional(),
+  factoryProviderAdmission: z.object({ provider: z.literal("codex"),
+    workerPlanSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  }).strict().optional(),
   host: z.string({ error: "SSH environments require a host." }).trim().min(1, "SSH environments require a host."),
   port: z.coerce.number().int().min(1).max(65535).default(22),
   username: z.string({ error: "SSH environments require a username." }).trim().min(1, "SSH environments require a username."),
@@ -56,15 +60,19 @@ const sshEnvironmentConfigSchema = z.object({
     .transform((value) => (value && value.length > 0 ? value : null)),
   strictHostKeyChecking: z.boolean().optional().default(true),
 }).strict();
+const hasFactoryProviderPolicy = (value: { factoryProviderAdmission?: unknown; factoryWorkerPolicy?: string }) =>
+  !value.factoryProviderAdmission || value.factoryWorkerPolicy === "factory-worker-scope-v2";
+const sshEnvironmentConfigSchema = sshEnvironmentConfigBaseSchema.refine(hasFactoryProviderPolicy,
+  "Provider admission requires the Factory worker policy.");
 
-const sshEnvironmentConfigProbeSchema = sshEnvironmentConfigSchema.extend({
+const sshEnvironmentConfigProbeSchema = sshEnvironmentConfigBaseSchema.extend({
   privateKey: z
     .string()
     .trim()
     .optional()
     .nullable()
     .transform((value) => (value && value.length > 0 ? value : null)),
-}).strict();
+}).strict().refine(hasFactoryProviderPolicy, "Provider admission requires the Factory worker policy.");
 
 const sshEnvironmentConfigPersistenceSchema = sshEnvironmentConfigProbeSchema;
 

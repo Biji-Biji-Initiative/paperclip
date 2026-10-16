@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -90,8 +91,100 @@ const support = await getEmbeddedPostgresTestSupport();
       { companyId, agentId, status: "succeeded", runtimeMode: "legacy", contextSnapshot: { issueId: randomUUID(), conversationSessionGeneration: 2 },
         resultJson: { summary: "UNRELATED TASK ANSWER" }, createdAt: new Date(14_000), finishedAt: new Date(15_000) },
     ]);
-  });
+  }, 120_000);
   afterAll(async () => database?.cleanup());
+
+  async function microsecondHistory() {
+    const taskId = randomUUID(), currentRunId = randomUUID(), priorRunId = randomUUID();
+    const ids = Array.from({ length: 7 }, () => randomUUID()).sort();
+    const boundary = ids[1]!, cutoff = ids[4]!, artifactId = randomUUID();
+    const at = (fraction: string) => sql`${`2026-10-16T00:00:00.${fraction}Z`}::timestamptz`;
+    await db.insert(issues).values({ id: taskId, companyId, title: "Exact timestamp history", status: "in_progress",
+      assigneeAgentId: agentId, conversationAgentId: agentId, conversationUserId: taskId,
+      conversationState: "active", conversationSessionGeneration: 3 });
+    await db.insert(issueComments).values([
+      { id: ids[0], companyId, issueId: taskId, authorUserId: "user", body: "OLD BOUNDARY TIE", createdAt: at("000200") },
+      { id: boundary, companyId, issueId: taskId, authorUserId: "user", body: "/new PRIVATE RESET", createdAt: at("000200") },
+      { id: ids[2], companyId, issueId: taskId, authorUserId: "user", body: "NEW BOUNDARY TIE", createdAt: at("000200") },
+      { id: ids[3], companyId, issueId: taskId, authorUserId: "user", body: "EARLIER CUTOFF TIE", createdAt: at("000500") },
+      { id: cutoff, companyId, issueId: taskId, authorUserId: "user", body: "EXACT LATEST REQUEST", createdAt: at("000500") },
+      { id: ids[5], companyId, issueId: taskId, authorUserId: "user", body: "LATER CUTOFF TIE", createdAt: at("000500") },
+      { id: ids[6], companyId, issueId: taskId, authorUserId: "user", body: "AFTER CURRENT RUN", createdAt: at("000900") },
+    ]);
+    await db.update(issues).set({ conversationBoundaryCommentId: boundary }).where(eq(issues.id, taskId));
+    await db.insert(documents).values({ id: artifactId, companyId, latestBody: "MICROSECOND PROPOSAL ARTIFACT",
+      createdAt: at("000450"), updatedAt: at("000450") });
+    await db.insert(issueDocuments).values({ companyId, issueId: taskId, documentId: artifactId, key: "proposal", createdAt: at("000450") });
+    await db.insert(heartbeatRuns).values([
+      { id: priorRunId, companyId, agentId, status: "succeeded", nativeIssueId: taskId,
+        contextSnapshot: { issueId: taskId, conversationSessionGeneration: 3 }, createdAt: at("000300"), finishedAt: at("000450"),
+        runnerProfileJson: { sessionCheckpoint: { semanticResult: { summary: "MICROSECOND COMPLETED PROPOSAL" } } } },
+      { id: currentRunId, companyId, agentId, status: "queued", nativeIssueId: taskId,
+        contextSnapshot: { issueId: taskId, conversationSessionGeneration: 3, commentId: cutoff }, createdAt: at("000800") },
+    ]);
+    const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, currentRunId));
+    expect(current!.createdAt.toISOString()).toBe("2026-10-16T00:00:00.000Z");
+    return { taskId, currentRunId, cutoff, artifactId, before: current!.createdAt, futureCommentId: ids[6]! };
+  }
+
+  it("keeps exact PostgreSQL microsecond wake and reset tuple boundaries", async () => {
+    const f = await microsecondHistory();
+    const result = await buildNativeSessionHandoff({ db, companyId, agentId, issueId: f.taskId,
+      before: f.before, beforeRunId: f.currentRunId, throughCommentId: f.cutoff });
+    expect(result).toContain("NEW BOUNDARY TIE");
+    expect(result).toContain("EARLIER CUTOFF TIE");
+    expect(result).toContain("EXACT LATEST REQUEST");
+    expect(result).toContain("MICROSECOND PROPOSAL ARTIFACT");
+    expect(result).toContain(f.artifactId);
+    expect(result).toContain("MICROSECOND COMPLETED PROPOSAL");
+    expect(result).not.toContain("OLD BOUNDARY TIE");
+    expect(result).not.toContain("PRIVATE RESET");
+    expect(result).not.toContain("LATER CUTOFF TIE");
+    expect(result).not.toContain("AFTER CURRENT RUN");
+  }, 60_000);
+
+  it("anchors the exact current-run cutoff and refuses missing or foreign run authority", async () => {
+    const f = await microsecondHistory();
+    const scope = { db, companyId, agentId, issueId: f.taskId, before: f.before };
+    const result = await buildNativeSessionHandoff({ ...scope, beforeRunId: f.currentRunId });
+    expect(result).toContain("EXACT LATEST REQUEST");
+    expect(result).toContain("LATER CUTOFF TIE");
+    expect(result).not.toContain("AFTER CURRENT RUN");
+    // Date-only callers retain their explicit millisecond cutoff semantics.
+    expect(await buildNativeSessionHandoff(scope)).toBeNull();
+    expect(await buildNativeSessionHandoff({ ...scope, beforeRunId: randomUUID() })).toBeNull();
+    const foreignRunId = randomUUID(), otherAgentId = randomUUID();
+    await db.insert(agents).values({ id: otherAgentId, companyId, name: "Other history owner", adapterType: "paperclip_runner" });
+    await db.insert(heartbeatRuns).values({ id: foreignRunId, companyId, agentId: otherAgentId,
+      nativeIssueId: f.taskId, status: "queued" });
+    expect(await buildNativeSessionHandoff({ ...scope, beforeRunId: foreignRunId })).toBeNull();
+    await db.update(heartbeatRuns).set({ agentId, nativeIssueId: issueId }).where(eq(heartbeatRuns.id, foreignRunId));
+    expect(await buildNativeSessionHandoff({ ...scope, beforeRunId: foreignRunId })).toBeNull();
+  }, 60_000);
+
+  it("includes an accepted wake coalesced into an older queue while excluding newer and current-run history", async () => {
+    const f = await microsecondHistory();
+    await db.update(heartbeatRuns).set({ createdAt: sql`'2026-10-16T00:00:00.000300Z'::timestamptz`,
+      finishedAt: sql`'2026-10-16T00:00:00.000400Z'::timestamptz`, status: "succeeded",
+      runnerProfileJson: { sessionCheckpoint: { semanticResult: { summary: "CURRENT RUN SUMMARY EXCLUDED" } } },
+    }).where(eq(heartbeatRuns.id, f.currentRunId));
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: f.currentRunId, seq: 1,
+      eventType: "item.completed", createdAt: sql`'2026-10-16T00:00:00.000400Z'::timestamptz`,
+      payload: { prpEvent: { payload: { kind: "agentMessage", channel: "final", text: "CURRENT RUN REPLY EXCLUDED" } } } });
+    const scope = { db, companyId, agentId, issueId: f.taskId, before: f.before,
+      beforeRunId: f.currentRunId, throughCommentId: f.cutoff };
+    const result = await buildNativeSessionHandoff(scope);
+    expect(result).toContain("EXACT LATEST REQUEST");
+    expect(result).toContain("MICROSECOND PROPOSAL ARTIFACT");
+    expect(result).not.toContain("LATER CUTOFF TIE");
+    expect(result).not.toContain("AFTER CURRENT RUN");
+    expect(result).not.toContain("CURRENT RUN SUMMARY EXCLUDED");
+    expect(result).not.toContain("CURRENT RUN REPLY EXCLUDED");
+    // A different scoped comment is not authority to extend this run's history.
+    expect(await buildNativeSessionHandoff({ ...scope, throughCommentId: f.futureCommentId })).toBeNull();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.taskId } }).where(eq(heartbeatRuns.id, f.currentRunId));
+    expect(await buildNativeSessionHandoff(scope)).toBeNull();
+  }, 60_000);
   it("preserves the original goal and prior answer while excluding reset, deleted and future history", async () => {
     const result = await buildNativeSessionHandoff({ db, companyId, issueId, agentId, before: new Date(20_000) });
     expect(result).toContain("Build a GitHub PR review bot");

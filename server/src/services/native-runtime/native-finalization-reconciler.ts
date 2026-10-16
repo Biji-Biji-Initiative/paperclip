@@ -2,6 +2,7 @@ import { recoverLegacyUnsafeWorkspaceExports } from "./native-workspace-export-r
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
+import { hasFactoryBusyReceipt } from "./factory-worker-capacity.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -419,6 +420,8 @@ export async function claimNativeSessionResumptions(input: {
         .limit(1)
         .then((rows) => rows[0] ?? null);
       const checkpointRecord = record(checkpoint);
+      const capacityRetry = hasFactoryBusyReceipt(row.coordinator, row.run.id) &&
+        !!persistedInput && !providerEvent;
       const checkpointHasProviderIdentity =
         (typeof checkpointRecord.providerSessionId === "string"
           && checkpointRecord.providerSessionId.length > 0)
@@ -431,7 +434,7 @@ export async function claimNativeSessionResumptions(input: {
         && failureDetail.providerSessionEstablished === false;
       if (
         !persistedInput
-        || (!checkpoint && !bootstrapRetry)
+        || (!checkpoint && !bootstrapRetry && !capacityRetry)
         || (!!checkpoint && !checkpointHasProviderIdentity)
       ) {
         const failureCode = originalFailureCode;
@@ -502,8 +505,8 @@ export async function claimNativeSessionResumptions(input: {
         phase: "observed",
         leaseOwner,
         leaseExpiresAt,
-        failureCode: null,
-        failureDetail: null,
+        failureCode: capacityRetry ? row.coordinator.failureCode : null,
+        failureDetail: capacityRetry ? row.coordinator.failureDetail : null,
         nextAttemptAt: null,
         updatedAt: now,
       }).where(and(

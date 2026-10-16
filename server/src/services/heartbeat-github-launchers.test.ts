@@ -11,6 +11,26 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "daytona", remoteCwd: "/workspace" };
 
 describe("heartbeat GitHub launcher lifetime", () => {
+  it("keeps unconfigured Factory preparation free of raw staging and broker capabilities", async () => {
+    const factory = { kind: "remote" as const, transport: "ssh" as const,
+      factoryWorkerPolicy: "factory-worker-scope-v2" as const, remoteCwd: "/workspace/factory",
+      spec: { host: "fixture.invalid", port: 22, username: "node", remoteCwd: "/workspace/factory",
+        remoteWorkspacePath: "/workspace/factory", privateKey: null, knownHosts: null, strictHostKeyChecking: true } };
+    const prepare = vi.fn();
+    const cleanup = vi.fn();
+    const mint = vi.fn();
+    const input = { native: true, githubConfigured: false, target: factory, agentId: "agent-a", runId: "run-a",
+      cwd: "/missing/controller", env: { GH_TOKEN: "synthetic-stale" }, brokerUrl: "https://unused.invalid", createBrokerToken: mint };
+    const result = await prepareHeartbeatGitHubLaunchers(input, prepare, cleanup);
+    expect(result.cleanupLocation).toBeNull();
+    expect(result.env).toMatchObject({ GH_TOKEN: "", PAPERCLIP_GITHUB_BROKER_TOKEN: "", PAPERCLIP_GITHUB_BROKER_URL: "" });
+    for (const invalid of [{ ...input, githubConfigured: true }, { ...input, native: false }]) {
+      await expect(prepareHeartbeatGitHubLaunchers(invalid, prepare, cleanup)).rejects.toThrow("factory_worker_github_not_qualified");
+    }
+    expect(prepare).not.toHaveBeenCalled();
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(mint).not.toHaveBeenCalled();
+  });
   it.each([target, null])("defers native managed authorization/staging to the session owner (%j)", async (target) => {
     const prepare = vi.fn();
     const mint = vi.fn();

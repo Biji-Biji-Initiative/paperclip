@@ -1,4 +1,5 @@
 import { isFactoryWorkerBusyError, type FactoryWorkerLeaseDescriptor } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { encodeFactoryProviderLaunch, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
 import {
   closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, renameSync, writeFileSync,
@@ -42,6 +43,7 @@ export interface ForegroundCommandRunner {
     command: readonly string[];
     signal?: AbortSignal;
     workerLease?: FactoryWorkerLeaseDescriptor;
+    providerAdmission?: FactoryProviderBinding;
     environment?: Readonly<Record<string, string>>;
   }): Promise<Channel>;
 }
@@ -175,17 +177,26 @@ export class NativeSshForegroundOwner {
     ensureArtifact: () => Promise<void>;
     /** Passed only after operator-selected worker/run metadata has been bound. */
     workerLease?: FactoryWorkerLeaseDescriptor;
-    onDispatched?: () => void;
+    /** Invoked only after staging; absolute worker deadlines must not age during upload. */
+    createWorkerLease?: () => Promise<FactoryWorkerLeaseDescriptor>;
+    /** DB-current explicit provider mode; resolved together after staging. */
+    createWorkerAdmission?: () => Promise<{ workerLease: FactoryWorkerLeaseDescriptor; providerAdmission?: FactoryProviderBinding }>;
+    onVerifiedBusy?: (error: Error) => void;
+    onDispatched?: () => void | Promise<void>;
   }): (spec: LaunchSpec) => ProcessHandle {
     if (!input.runner.openDuplexChannel) throw new Error("native_ssh_foreground_channel_required");
     if (![input.remoteBinary, input.remoteCwd, input.diagnosticsDirectory].every((p) => p.startsWith("/") && !p.includes("\0"))) {
       throw new Error("Invalid native SSH foreground launch path");
     }
-    const workerLease = input.workerLease ? structuredClone(input.workerLease) : undefined;
-    if (workerLease && (workerLease.runId !== this.options.runId ||
-        workerLease.workspaceRoot !== input.remoteCwd || workerLease.diagnosticsDirectory !== input.diagnosticsDirectory)) {
-      throw new Error("factory_worker_lease_owner_mismatch");
+    if ([input.workerLease, input.createWorkerLease, input.createWorkerAdmission].filter(Boolean).length > 1) {
+      throw new Error("factory_worker_lease_source_conflict");
     }
+    const validateLeaseOwner = (lease: FactoryWorkerLeaseDescriptor | undefined) => {
+      if (lease && (lease.runId !== this.options.runId || lease.workspaceRoot !== input.remoteCwd ||
+          lease.diagnosticsDirectory !== input.diagnosticsDirectory)) throw new Error("factory_worker_lease_owner_mismatch");
+    };
+    const suppliedLease = input.workerLease ? structuredClone(input.workerLease) : undefined;
+    validateLeaseOwner(suppliedLease);
     return (spec) => {
       this.assertAvailable();
       this.claim();
@@ -224,6 +235,19 @@ export class NativeSshForegroundOwner {
             cancelledBeforeDispatch = true;
             throw new Error("native_ssh_cancelled_before_dispatch");
           }
+          const admission = input.createWorkerAdmission
+            ? structuredClone(await Promise.race([bounded(input.createWorkerAdmission(), this.options.openTimeoutMs ?? 20_000,
+              this.options.ownershipError), stopExpired])) : undefined;
+          const workerLease = admission?.workerLease ?? (input.createWorkerLease
+            ? await Promise.race([bounded(input.createWorkerLease(), this.options.openTimeoutMs ?? 20_000, this.options.ownershipError), stopExpired])
+            : suppliedLease);
+          const providerAdmission = admission?.providerAdmission;
+          if (input.createWorkerAdmission && !workerLease) throw this.options.ownershipError();
+          validateLeaseOwner(workerLease);
+          if (stopped) {
+            this.release(); cancelledBeforeDispatch = true;
+            throw new Error("native_ssh_cancelled_before_dispatch");
+          }
           const args = [...spec.args];
           const index = args.indexOf("--diagnostics-directory");
           if (index >= 0) {
@@ -240,10 +264,16 @@ export class NativeSshForegroundOwner {
             ["/usr/bin/env", ...env.map(([key, value]) => `${key}=${value}`),
               "/bin/sh", "-c", 'set -eu; umask 077; mkdir -p -- "$1"; cd -- "$2"; shift 2; exec "$@"',
               "paperclip-ssh-foreground", input.diagnosticsDirectory, input.remoteCwd, input.remoteBinary, ...args];
+          if (providerAdmission) {
+            if (!workerLease || providerAdmission.runnerInstanceId !== this.options.runnerInstanceId) throw this.options.ownershipError();
+            // Validates exact native run/lease/session/runner argv before transport.
+            encodeFactoryProviderLaunch(workerLease, providerAdmission, command, Object.fromEntries(env));
+          }
           this.update("dispatched");
           dispatchAttempted = true;
           const opening = input.runner.openDuplexChannel!({ command, signal: abort.signal,
             ...(workerLease ? {workerLease, environment: Object.fromEntries(env)} : {}),
+            ...(providerAdmission ? {providerAdmission} : {}),
           });
           let openingExpired = false;
           // A delayed provider implementation must not orphan a late-open channel.
@@ -260,13 +290,14 @@ export class NativeSshForegroundOwner {
               this.update("exited", 75);
               this.release();
               safeBusyRefusal = error;
+              input.onVerifiedBusy?.(error);
               throw error;
             }
             abort.abort(); throw error;
           }
           if (stopped) this.channel.stop();
           // Dispatch notification is not an authenticated remote-PID claim.
-          input.onDispatched?.();
+          await input.onDispatched?.();
           this.channel.onData(() => {});
           this.channel.onStderr?.(() => {}); // Raw transport diagnostics can contain argv secrets.
           const exit = await Promise.race([
@@ -311,6 +342,12 @@ export class NativeSshForegroundOwner {
       this.handle = handle;
       return handle;
     };
+  }
+
+  /** Require a positively owned foreground lifetime before releasing another authority. */
+  checkpointOwned(settlement: "settled" | "unsettled", checkpoint: () => Promise<void>): Promise<void> {
+    if (!this.active && !this.checkpointPromise) return Promise.reject(this.options.ownershipError());
+    return this.checkpoint(settlement, checkpoint);
   }
 
   /** Called by the existing PRP checkpoint/release path, not by SSH exit alone. */

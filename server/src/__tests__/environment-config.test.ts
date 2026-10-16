@@ -3,6 +3,13 @@ import { HttpError } from "../errors.js";
 import { normalizeEnvironmentConfig, parseEnvironmentDriverConfig } from "../services/environment-config.ts";
 
 describe("environment config helpers", () => {
+  it("preserves only the explicit qualified Factory worker policy", () => {
+    const config = { host: "fixture.invalid", username: "node", remoteWorkspacePath: "/workspace/fixture" };
+    expect(normalizeEnvironmentConfig({ driver: "ssh", config: { ...config,
+      factoryWorkerPolicy: "factory-worker-scope-v2" } })).toMatchObject({ factoryWorkerPolicy: "factory-worker-scope-v2" });
+    expect(() => normalizeEnvironmentConfig({ driver: "ssh", config: { ...config,
+      factoryWorkerPolicy: "factory-worker-scope-v1" } })).toThrow(HttpError);
+  });
   it("normalizes SSH config into its canonical stored shape", () => {
     const config = normalizeEnvironmentConfig({
       driver: "ssh",

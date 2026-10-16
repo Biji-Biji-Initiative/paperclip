@@ -7,6 +7,9 @@ import { buildSshArgvCommand, quoteSshArgument } from "./ssh-command.js";
 import { createSshProcessChannel, type SshProcessChannel } from "./ssh-process-channel.js";
 import { FACTORY_WORKER_MARKER, encodeFactoryWorkerLaunch, isFactoryWorkerBusyError, type FactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
 import { admitFactoryWorkerLease } from "./factory-worker-lease-channel.js";
+import { FACTORY_PROVIDER_MARKER, encodeFactoryProviderLaunch, signFactoryControllerAdmission,
+  type FactoryProviderBinding } from "./factory-provider-admission.js";
+import { admitFactoryProviderLease } from "./factory-provider-lease-channel.js";
 
 export interface DedicatedSshTarget {
   host: string;
@@ -22,6 +25,8 @@ export interface SshDuplexOpenInput {
   signal?: AbortSignal;
   /** Explicit Factory opt-in only. Generic/control calls never acquire a slot. */
   workerLease?: FactoryWorkerLeaseDescriptor;
+  /** Explicit provider opt-in from authorized runtime metadata; never a default. */
+  providerAdmission?: FactoryProviderBinding;
   environment?: Readonly<Record<string, string>>;
 }
 
@@ -77,14 +82,18 @@ export async function openDedicatedSshDuplex(
   // retarget the request after validation. Bootstrap argv stays on stdin, never
   // in the SSH command string, receipt or diagnostics.
   const workerLease = input.workerLease ? structuredClone(input.workerLease) : undefined;
+  const providerAdmission = input.providerAdmission ? structuredClone(input.providerAdmission) : undefined;
+  if (providerAdmission && !workerLease) throw new Error("factory_provider_requires_worker_lease");
   if (workerLease && config.remoteCwd !== workerLease.workspaceRoot) {
     throw new Error("factory_worker_lease_cwd_mismatch");
   }
   if (!workerLease && input.environment !== undefined) {
     throw new Error("factory_worker_environment_requires_explicit_lease");
   }
-  const header = workerLease ? encodeFactoryWorkerLaunch(workerLease, input.command, input.environment) : undefined;
-  const command = workerLease ? FACTORY_WORKER_MARKER : `/bin/sh -c ${quoteSshArgument(buildSshArgvCommand({
+  const header = workerLease ? (providerAdmission
+    ? encodeFactoryProviderLaunch(workerLease, providerAdmission, input.command, input.environment)
+    : encodeFactoryWorkerLaunch(workerLease, input.command, input.environment)) : undefined;
+  const command = providerAdmission ? FACTORY_PROVIDER_MARKER : workerLease ? FACTORY_WORKER_MARKER : `/bin/sh -c ${quoteSshArgument(buildSshArgvCommand({
     command: input.command[0]!, args: input.command.slice(1), cwd: config.remoteCwd,
   }))}`;
   if (input.signal?.aborted) throw new Error("native_ssh_open_cancelled_before_dispatch");
@@ -106,6 +115,10 @@ export async function openDedicatedSshDuplex(
     const channel = createSshProcessChannel(child, { cleanup, signal: input.signal });
     // Keep stdin open after the header. Rust's authenticated dial_wss channel
     // carries work; EOF on this owning channel cancels the worker namespace.
+    if (workerLease && providerAdmission && header) {
+      return await admitFactoryProviderLease(channel, workerLease, providerAdmission, header,
+        (record, signal) => signFactoryControllerAdmission(record, keyPath, signal), { signal: input.signal });
+    }
     return workerLease && header ? await admitFactoryWorkerLease(channel, workerLease, header) : channel;
   } catch (error) {
     await cleanup();

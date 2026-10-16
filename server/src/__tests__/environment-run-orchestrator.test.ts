@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // ---------------------------------------------------------------------------
 
 const mockResolveEnvironmentExecutionTarget = vi.hoisted(() => vi.fn());
+const mockResolveEnvironmentExecutionTransport = vi.hoisted(() => vi.fn().mockResolvedValue(null));
 const mockAdapterExecutionTargetToRemoteSpec = vi.hoisted(() => vi.fn());
 const mockBuildWorkspaceRealizationRequest = vi.hoisted(() => vi.fn());
 const mockUpdateLeaseMetadata = vi.hoisted(() => vi.fn());
@@ -15,7 +16,7 @@ const mockGetEnvironment = vi.hoisted(() => vi.fn());
 
 vi.mock("../services/environment-execution-target.js", () => ({
   resolveEnvironmentExecutionTarget: mockResolveEnvironmentExecutionTarget,
-  resolveEnvironmentExecutionTransport: vi.fn().mockResolvedValue(null),
+  resolveEnvironmentExecutionTransport: mockResolveEnvironmentExecutionTransport,
 }));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
@@ -747,6 +748,44 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
 
 describe("native runner lifecycle changes before lease acquisition", () => {
+  const factoryEnvironment = () => ({ ...makeEnvironment("ssh"), config: {
+    host: "fixture.invalid", port: 2222, username: "node", remoteWorkspacePath: "/workspace/fixture",
+    privateKey: null, privateKeySecretRef: null, knownHosts: "fixture-public-pin", strictHostKeyChecking: true,
+    factoryWorkerPolicy: "factory-worker-scope-v2",
+  } });
+  it("acquires and realizes an enrolled native Factory target without serializing any raw SSH spec", async () => {
+    vi.clearAllMocks();
+    const environment = factoryEnvironment(), lease = makeLease({ provider: "ssh", metadata: { remoteCwd: "/workspace/fixture" } });
+    mockGetEnvironment.mockResolvedValue(environment);
+    const acquireRunLease = vi.fn().mockResolvedValue({ environment, lease, leaseContext: {} });
+    mockResolveEnvironmentExecutionTransport.mockRejectedValueOnce(new Error("raw transport must not be requested"));
+    mockAdapterExecutionTargetToRemoteSpec.mockImplementationOnce(() => { throw new Error("raw converter must not be requested"); });
+    const target = { kind: "remote", transport: "ssh", factoryWorkerPolicy: "factory-worker-scope-v2",
+      environmentId: environment.id, leaseId: lease.id, remoteCwd: "/workspace/fixture", spec: {} };
+    mockResolveEnvironmentExecutionTarget.mockResolvedValue(target);
+    mockBuildWorkspaceRealizationRequest.mockReturnValue({ runtimeOverlay: { provisionCommand: null } });
+    mockUpdateLeaseMetadata.mockResolvedValue(null);
+    const orchestrator = environmentRunOrchestrator({} as never, { environmentRuntime: makeMockRuntime({ acquireRunLease }) });
+    const acquisition = await orchestrator.acquireForRun({ companyId: "company-1", selectedEnvironmentId: environment.id,
+      localEnvironmentId: "local", adapterType: "paperclip_runner", issueId: "task-1", heartbeatRunId: "run-1",
+      agentId: "agent-1", persistedExecutionWorkspace: null, executionWorkspaceSettings: null });
+    expect(acquisition.executionTransport).toBeNull(); expect(acquireRunLease).toHaveBeenCalledOnce();
+    const realization = await orchestrator.realizeForRun({ ...makeRealizeInput({ environment, lease }), adapterType: "paperclip_runner" });
+    expect(realization.executionTarget).toMatchObject(target); expect(realization.remoteExecution).toBeNull();
+    expect(mockResolveEnvironmentExecutionTransport).not.toHaveBeenCalled();
+    expect(mockAdapterExecutionTargetToRemoteSpec).not.toHaveBeenCalled();
+    mockResolveEnvironmentExecutionTransport.mockReset().mockResolvedValue(null);
+    mockAdapterExecutionTargetToRemoteSpec.mockReset();
+  });
+  it.each(["claude_local", "codex_local"])("rejects Factory %s before acquiring or preparing its workspace", async adapterType => {
+    const environment = factoryEnvironment(); mockGetEnvironment.mockResolvedValue(environment);
+    const acquireRunLease = vi.fn();
+    const orchestrator = environmentRunOrchestrator({} as never, { environmentRuntime: makeMockRuntime({ acquireRunLease }) });
+    await expect(orchestrator.acquireForRun({ companyId: "company-1", selectedEnvironmentId: environment.id,
+      localEnvironmentId: "local", adapterType, issueId: "task-1", heartbeatRunId: "run-1", agentId: "agent-1",
+      persistedExecutionWorkspace: null, executionWorkspaceSettings: null })).rejects.toMatchObject({ code: "unsupported_adapter_environment" });
+    expect(acquireRunLease).not.toHaveBeenCalled();
+  });
   it("requests a reusable lease when an existing task switches from per-turn to warm", async () => {
     const environment = { ...makeEnvironment("sandbox"), config: { provider: "daytona", reuseLease: false } };
     mockGetEnvironment.mockResolvedValue(environment);

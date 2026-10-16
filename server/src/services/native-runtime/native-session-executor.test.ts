@@ -39,7 +39,10 @@ import {
   type NativeExecutionInput,
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { DatabaseSync } from "node:sqlite";
 import { nativeSha256 } from "./canonical.js";
 import * as noLaunchProofModule from "./native-maintenance-no-launch.js";
@@ -302,6 +305,7 @@ import {
   parseRemoteExecutableCandidate,
   buildRemoteCodexLauncherCommand,
   mayUsePreinstalledRunnerArtifact,
+  prepareFactoryCodexFromImage,
   nativeUsageCostUsd,
   nativeUsageBiller,
   normalizeNativeUsage,
@@ -6962,7 +6966,9 @@ describe("native warm session supervision", () => {
           normalizedSessionId: "session-runnerd-warm-authority",
           driverKind: "codex_app_server" as const,
           protocolVersion: 1 as const,
-          lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 500 },
+          // Replacement scenarios exercise authority validation, not the idle
+          // timer racing filesystem fixture setup on a loaded host.
+          lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: replacesProvider ? 30_000 : 500 },
         },
       } as NativeExecutionInputV1;
       const second = {
@@ -8220,6 +8226,111 @@ describe("runnerd provider runtime wiring", () => {
       process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
     }
     await rm(isolatedStateDirectory, { recursive: true, force: true });
+  });
+
+  it.each(["old_run", "old_lease", "incoming_lease", "same_identity"] as const)(
+    "fences Factory durable authority before staging: %s", async mode => {
+      const current = { ...execution, binding: { ...execution.binding, companyId: FACTORY_COMPANY_ID,
+        runId: randomUUID(), executionWorkspaceId: randomUUID() },
+        session: { ...execution.session, normalizedSessionId: randomUUID() } };
+      const runnerInstanceId = randomUUID(), leaseId = randomUUID();
+      await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const root = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+      await mkdir(join(root, "control-plane"), { recursive: true });
+      await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState({
+        runId: mode === "old_run" ? randomUUID() : current.binding.runId,
+        normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
+        environmentLeaseId: mode === "old_lease" ? randomUUID() : leaseId,
+      })));
+      const remoteCwd = `/workspace/${FACTORY_COMPANY_ID}/${current.binding.executionWorkspaceId}`;
+      const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+        environmentId: randomUUID(), leaseId, remoteCwd,
+        spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd, remoteWorkspacePath: remoteCwd,
+          privateKey: "fixture-only-not-a-key", knownHosts: "fixture-public-pin", strictHostKeyChecking: true } };
+      const authorizationBoundary = new Error("reached_current_database_authorization");
+      const select = vi.fn(() => { throw authorizationBoundary; });
+      const db = { select } as unknown as Db;
+      state.createBackend.mockClear(); state.createTransport.mockClear();
+      const attempt = createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerExecutionTarget: target,
+        durableEnvironmentLeaseId: mode === "incoming_lease" ? randomUUID() : leaseId });
+      if (mode === "same_identity") {
+        // A same-run capacity retry keeps its current authority and reaches DB
+        // authorization; this guard never invents a replacement session/lease.
+        await expect(attempt).rejects.toBe(authorizationBoundary);
+        expect(select).toHaveBeenCalledOnce();
+      } else {
+        await expect(attempt).rejects.toThrow("native_execution_ownership_unverified");
+        expect(select).not.toHaveBeenCalled();
+      }
+      expect(state.createBackend).not.toHaveBeenCalled();
+      expect(state.createTransport).not.toHaveBeenCalled();
+    },
+  );
+
+  it("routes Factory directory staging through the confined uploader before generic syncIn", async () => {
+    const remoteCwd = `/workspace/${FACTORY_COMPANY_ID}/${randomUUID()}`;
+    const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", remoteCwd,
+      factoryWorkerPolicy: FACTORY_WORKER_POLICY, environmentId: randomUUID(), leaseId: randomUUID(),
+      spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd, remoteWorkspacePath: remoteCwd,
+        privateKey: "fixture-only-not-a-key", knownHosts: "fixture-public-pin", strictHostKeyChecking: true } };
+    const syncIn = vi.fn<NonNullable<CommandManagedRuntimeRunner["syncIn"]>>(async () => ({ operations: [] }));
+    expect(mayUsePreinstalledRunnerArtifact(undefined, target)).toBe(false);
+    expect(mayUsePreinstalledRunnerArtifact(undefined, { ...target, factoryWorkerPolicy: undefined })).toBe(true);
+    const execute = vi.fn(async (_input: Parameters<CommandManagedRuntimeRunner["execute"]>[0]) =>
+      ({ exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false, stdout: "", stderr: "" }));
+    await writeFile(join(isolatedStateDirectory, "trusted-build-file"), "fixture artifact");
+    await stageRemoteRunnerDirectory({ target, runner: { syncIn, execute }, sourcePath: isolatedStateDirectory,
+      targetPath: `${remoteCwd}/.paperclip-runtime/paperclip-runner/provider-pack`, mode: 0o700 });
+    expect(syncIn).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0]?.[0]).toMatchObject({ command: "/usr/bin/python3", bypassSession: true });
+    expect(execute.mock.calls[0]?.[0].args?.slice(0, 3)).toEqual(["-I", "-S", "-c"]);
+  });
+
+  it.each(["/usr/local/bin/codex", "/opt/paperclip-runner/bin/codex"])(
+    "stages a verified immutable Factory Codex launcher atomically: %s", async sourcePath => {
+      const workspaceRoot = `/workspace/${FACTORY_COMPANY_ID}/${randomUUID()}`;
+      const targetPath = `${workspaceRoot}/.paperclip-runtime/paperclip-runner/harnesses/codex/codex`;
+      const result = { exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false, stdout: "", stderr: "" };
+      const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>()
+        .mockResolvedValueOnce({ ...result, stdout: `${sourcePath}\n` }).mockResolvedValueOnce(result);
+      const verify = vi.fn(async (_sourcePath: string) => undefined);
+      await prepareFactoryCodexFromImage({ runner: { execute }, workspaceRoot, targetPath, verify });
+      expect(verify).toHaveBeenCalledOnce();
+      expect(verify).toHaveBeenCalledWith(sourcePath);
+      expect(execute).toHaveBeenCalledTimes(2);
+      const [discovery, stage] = execute.mock.calls.map(([request]) => request);
+      expect(discovery?.command).toBe("sh");
+      expect(discovery?.args?.join(" ")).not.toMatch(/HOME|command -v|npm/);
+      expect(stage).toMatchObject({ command: "/usr/bin/python3", bypassSession: true });
+      expect(stage?.args?.slice(0, 3)).toEqual(["-I", "-S", "-c"]);
+      expect(Buffer.from(stage!.stdin!, "base64").toString("utf8")).toBe(`#!/bin/sh\nexec '${sourcePath}' "$@"\n`);
+      expect(JSON.parse(stage!.args!.at(-1)!)).toMatchObject({ workspaceRoot, mode: 0o700, kind: "file" });
+    },
+  );
+
+  it.each(["", "/home/node/.local/bin/codex", "/tmp/codex"])(
+    "refuses unqualified Factory Codex discovery without npm or raw launcher fallback: %s", async stdout => {
+      const workspaceRoot = `/workspace/${FACTORY_COMPANY_ID}/${randomUUID()}`;
+      const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>().mockResolvedValue({ exitCode: 0, signal: null,
+        pid: null, startedAt: null, timedOut: false, stdout, stderr: "" });
+      const verify = vi.fn(async (_sourcePath: string) => undefined);
+      await expect(prepareFactoryCodexFromImage({ runner: { execute }, workspaceRoot,
+        targetPath: `${workspaceRoot}/.paperclip-runtime/paperclip-runner/codex`, verify })).rejects.toThrow("factory_worker_codex_install_forbidden");
+      expect(execute).toHaveBeenCalledOnce();
+      expect(verify).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects an unverified Factory image CLI before launcher staging or npm fallback", async () => {
+    const workspaceRoot = `/workspace/${FACTORY_COMPANY_ID}/${randomUUID()}`;
+    const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>().mockResolvedValue({ exitCode: 0, signal: null,
+      pid: null, startedAt: null, timedOut: false, stdout: "/usr/local/bin/codex\n", stderr: "" });
+    const verify = vi.fn(async () => { throw new Error("unverified_image_version"); });
+    await expect(prepareFactoryCodexFromImage({ runner: { execute }, workspaceRoot,
+      targetPath: `${workspaceRoot}/.paperclip-runtime/paperclip-runner/codex`, verify })).rejects.toThrow("unverified_image_version");
+    expect(execute).toHaveBeenCalledOnce();
   });
 
   it.each([

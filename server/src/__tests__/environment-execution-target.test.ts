@@ -96,6 +96,12 @@ function recordParentContext() {
 }
 
 describe("resolveEnvironmentExecutionTarget", () => {
+  it.each(["claude_local", "codex_local", "process"])("rejects %s for an explicitly enrolled Factory environment before raw transport resolution", async (adapterType) => {
+    await expect(resolveEnvironmentExecutionTarget({ db: {} as never, companyId: "company", adapterType,
+      environment: { id: "factory", driver: "ssh", config: { factoryWorkerPolicy: "factory-worker-scope-v2" } },
+      leaseMetadata: null })).rejects.toThrow("factory_worker_native_backend_required");
+    expect(mockResolveEnvironmentDriverConfigForRuntime).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     mockResolveEnvironmentDriverConfigForRuntime.mockReset();
     delete process.env.PAPERCLIP_API_URL;

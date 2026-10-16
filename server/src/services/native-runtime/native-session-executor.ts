@@ -95,6 +95,12 @@ import {
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { NativeSshForegroundOwner } from "./native-ssh-foreground-owner.js";
+import { authorizeFactoryWorker, assertFactoryWorkerColdExecution, assertFactoryWorkerCredentialBoundary, createAuthorizedFactoryWorkerAdmission,
+  isFactoryWorkerTarget, type FactoryWorkerAttempt } from "./factory-worker-runtime.js";
+import { deferFactoryWorkerCapacity, factoryProviderAttempt, hasFactoryBusyReceipt } from "./factory-worker-capacity.js";
+import { ensureFactoryRemoteRunnerDirectory, stageFactoryRemoteRunnerText, stageFactoryRemoteRunnerFile, stageFactoryRemoteRunnerDirectory } from "./factory-remote-staging.js";
+import { FACTORY_LEASE_FIXED_ENV, isFactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { assertFactoryWorkspaceStagingOwned, settleFactoryWorkspaceStaging } from "../factory-workspace-staging.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import {
   resolvePaperclipRunnerTransport,
@@ -5236,6 +5242,30 @@ function loadRunnerdDurableBinding(
   };
 }
 
+/** A cold worker cannot inherit another turn's durable runner or lease. */
+function assertFactoryWorkerCurrentDurableAuthority(input: {
+  execution: NativeExecutionInput;
+  runnerInstanceId: string;
+  runnerExecutionTarget?: AdapterExecutionTarget | null;
+  durableEnvironmentLeaseId?: string;
+}): void {
+  if (!isFactoryWorkerTarget(input.runnerExecutionTarget)) return;
+  const leaseId = input.runnerExecutionTarget.leaseId;
+  if (!leaseId || (input.durableEnvironmentLeaseId !== undefined && input.durableEnvironmentLeaseId !== leaseId)) {
+    throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+  }
+  for (const root of [scopedRunnerdStateRoot(input.execution),
+    legacyCompanyRunnerdStateRoot(input.execution), legacyRunnerdStateRoot(input.execution)]) {
+    const identity = readRunnerdDurableIdentity(root);
+    // Existing migration rejects unreadable/unsafe roots. Check readable
+    // authority before it can be migrated, rebound, or used for any upload.
+    if (identity && (!durableIdentityMatchesExecution(identity, input.execution) ||
+        identity.environmentLeaseId !== leaseId || identity.runnerInstanceId !== input.runnerInstanceId)) {
+      throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+    }
+  }
+}
+
 function nativeSessionConfigDigest(
   execution: NativeExecutionInput,
   executionTargetKind: "local" | "remote" = "local",
@@ -7223,6 +7253,8 @@ function startNativeSessionExecutionLeaseRenewal(input: {
 }
 
 export async function executePaperclipNativeSession(input: {
+  /** Host-private authority latch; never comes from the adapter configuration. */
+  factoryWorkerAttempt?: FactoryWorkerAttempt;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
   refreshTools?: boolean;
@@ -7295,6 +7327,15 @@ export async function executePaperclipNativeSession(input: {
     },
   ) => Promise<unknown>;
 }): Promise<AdapterExecutionResult> {
+  if (isFactoryWorkerTarget(input.runnerExecutionTarget)) {
+    assertFactoryWorkerCurrentDurableAuthority(input);
+    assertFactoryWorkerColdExecution(input.execution, input.restartRecovery);
+    assertFactoryWorkerCredentialBoundary(input.runnerEnvironment, input.managedAiCredentialHome);
+    if (!input.useRunnerd || input.backend) throw new Error("factory_worker_native_backend_required");
+    await authorizeFactoryWorker({ db: input.db, execution: input.execution,
+      target: input.runnerExecutionTarget, beforeClaim: true });
+    input = { ...input, factoryWorkerAttempt: { runId: input.execution.binding.runId } };
+  }
   const runId = input.execution.binding.runId;
   if (nativeSessionStartups.has(runId)) {
     throw new Error("native_session_supervisor_busy");
@@ -7574,6 +7615,10 @@ async function executePaperclipNativeSessionWithinScope(
             .then((rows) => rows[0] ?? null);
           if (!coordinator)
             throw new Error("native_finalization_coordinator_missing");
+          if (isFactoryWorkerTarget(input.runnerExecutionTarget) && coordinator.attempt > 0 &&
+              !hasFactoryBusyReceipt(coordinator, input.execution.binding.runId)) {
+            throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+          }
           const leaseNow = new Date();
           const leaseExpiresAt = new Date(
             leaseNow.getTime() + NATIVE_SESSION_EXECUTION_LEASE_TTL_MS,
@@ -7687,7 +7732,8 @@ async function executePaperclipNativeSessionWithinScope(
               throw new Error("native_replacement_lineage_invalid");
             incidentAttempts = Math.max(incidentAttempts, predecessor.attempt);
           }
-          const nextAttempt = nextNativeProviderAttempt(
+          const nextAttempt = (isFactoryWorkerTarget(input.runnerExecutionTarget)
+            ? factoryProviderAttempt(coordinator, input.execution.binding.runId) : undefined) ?? nextNativeProviderAttempt(
             incidentAttempts,
             recovering?.kind,
           );
@@ -8646,6 +8692,29 @@ async function executePaperclipNativeSessionWithinScope(
       // with a retry or release the still-live runner's lease.
       throw new NativeControllerDetachedForRestartError();
     }
+    if (isFactoryWorkerTarget(input.runnerExecutionTarget)) {
+      await leaseRenewal.stop().catch(() => undefined);
+      liveQuestions.close();
+      activeNativeSessions.delete(input.execution.binding.runId);
+      clearSteeringDeliveries(input.execution.binding.runId);
+      clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
+      const busy = input.factoryWorkerAttempt?.busy;
+      if (isFactoryWorkerBusyError(busy)) {
+        let deferred;
+        try {
+          deferred = await deferFactoryWorkerCapacity({ db: input.db,
+            ...input.execution.binding, leaseOwner, attempt, error: busy });
+        } catch {
+          throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+        }
+        await trace.finish("ok").catch(() => undefined);
+        throw deferred;
+      }
+      // Every post-admission failure retains the original run. No automatic
+      // fresh environment lease can authorize replay of the worker run journal.
+      await trace.finish("failed").catch(() => undefined);
+      throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+    }
     const protocolIntegrityFailure =
       error instanceof NativeSessionProtocolIntegrityError ? error : null;
     const ownershipUnverified =
@@ -9390,6 +9459,37 @@ export function buildRemoteCodexLauncherCommand(
   );
 }
 
+const FACTORY_CODEX_IMAGE_PATHS = ["/usr/local/bin/codex", "/opt/paperclip-runner/bin/codex"] as const;
+
+async function discoverFactoryPreinstalledCodex(input: { runner: CommandManagedRuntimeRunner; cwd: string }): Promise<string | null> {
+  const result = await input.runner.execute({ command: "sh", args: ["-c",
+    'for candidate in /usr/local/bin/codex /opt/paperclip-runner/bin/codex; do if [ -x "$candidate" ]; then printf \'%s\\n\' "$candidate"; exit 0; fi; done'],
+    cwd: input.cwd, bypassSession: true, timeoutMs: 10_000 });
+  if (result.exitCode !== 0 || result.timedOut) return null;
+  const candidate = parseRemoteExecutableCandidate(result.stdout);
+  return FACTORY_CODEX_IMAGE_PATHS.some(path => path === candidate) ? candidate : null;
+}
+
+async function stageFactoryPreinstalledCodexLauncher(input: {
+  runner: CommandManagedRuntimeRunner; workspaceRoot: string; sourcePath: string; targetPath: string;
+}): Promise<void> {
+  if (!FACTORY_CODEX_IMAGE_PATHS.some(path => path === input.sourcePath)) {
+    throw new Error("factory_worker_preinstalled_artifact_forbidden");
+  }
+  await stageFactoryRemoteRunnerText({ runner: input.runner, workspaceRoot: input.workspaceRoot, targetPath: input.targetPath,
+    mode: 0o700, content: `#!/bin/sh\nexec '${input.sourcePath}' "$@"\n` });
+}
+
+export async function prepareFactoryCodexFromImage(input: {
+  runner: CommandManagedRuntimeRunner; workspaceRoot: string; targetPath: string;
+  verify: (sourcePath: string) => Promise<void>;
+}): Promise<void> {
+  const sourcePath = await discoverFactoryPreinstalledCodex({ runner: input.runner, cwd: input.workspaceRoot });
+  if (!sourcePath) throw new Error("factory_worker_codex_install_forbidden");
+  await input.verify(sourcePath);
+  await stageFactoryPreinstalledCodexLauncher({ ...input, sourcePath });
+}
+
 export function parseRemoteExecutableCandidate(stdout: string): string | null {
   const lines = stdout
     .split(/\r?\n/)
@@ -9409,8 +9509,9 @@ export function parseRemoteExecutableCandidate(stdout: string): string | null {
 
 export function mayUsePreinstalledRunnerArtifact(
   configuredRemoteBinaryPath: string | null | undefined,
+  target?: AdapterExecutionTarget | null,
 ): boolean {
-  return !configuredRemoteBinaryPath?.trim();
+  return !isFactoryWorkerTarget(target) && !configuredRemoteBinaryPath?.trim();
 }
 
 const RUNNERD_BUILD_METADATA_SCHEMA =
@@ -9703,6 +9804,9 @@ async function stageRemoteRunnerFile(input: {
   targetPath: string;
   mode: number;
 }): Promise<void> {
+  if (isFactoryWorkerTarget(input.target)) {
+    return stageFactoryRemoteRunnerFile({ ...input, workspaceRoot: input.target.remoteCwd });
+  }
   const runner = input.runner;
   if (runner.syncIn) {
     await runner.syncIn([
@@ -9765,6 +9869,9 @@ export async function stageRemoteRunnerDirectory(input: {
   mode: number;
   excludeEntries?: readonly string[];
 }): Promise<void> {
+  if (isFactoryWorkerTarget(input.target)) {
+    return stageFactoryRemoteRunnerDirectory({ ...input, workspaceRoot: input.target.remoteCwd });
+  }
   const excludeArgs = archiveExcludeArgs(input.excludeEntries ?? []);
   if (input.runner.syncIn) {
     let stagingRoot: string | null = null;
@@ -10640,6 +10747,8 @@ export function remoteCheckpointIncompleteFailure(
 
 /** Production runnerd backend seam, exported so provider wiring can be regression tested. */
 export async function createRunnerdBackend(input: {
+  factoryWorkerAttempt?: FactoryWorkerAttempt;
+  turnTimeoutMs?: number;
   db: Db;
   execution: NativeExecutionInput;
   runnerInstanceId: string;
@@ -10682,6 +10791,14 @@ export async function createRunnerdBackend(input: {
     },
   ) => Promise<unknown>;
 }): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
+  if (isFactoryWorkerTarget(input.runnerExecutionTarget)) {
+    assertFactoryWorkerCurrentDurableAuthority(input);
+    assertFactoryWorkerColdExecution(input.execution, input.restartRecovery);
+    assertFactoryWorkerCredentialBoundary(input.runnerEnvironment, input.managedAiCredentialHome);
+    await authorizeFactoryWorker({ db: input.db, execution: input.execution, target: input.runnerExecutionTarget });
+    await assertFactoryWorkspaceStagingOwned({ db: input.db, companyId: input.execution.binding.companyId,
+      runId: input.execution.binding.runId, leaseId: input.runnerExecutionTarget.leaseId! });
+  }
   const sessionScopeId = nativeSessionScopeKey(input.execution);
   const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
   if (scopeOwner && scopeOwner !== input.execution.binding.runId) {
@@ -10849,9 +10966,10 @@ async function createRunnerdBackendWithinSessionClaim(
     : durableIdentityMatchesSession(durableIdentity, input.execution)
       ? durableIdentity
       : null;
+  assertFactoryWorkerCurrentDurableAuthority(input);
   const effectiveRunnerInstanceId =
     durableBinding?.runnerInstanceId ?? input.runnerInstanceId;
-  const effectiveEnvironmentLeaseId =
+  const effectiveEnvironmentLeaseId = isFactoryWorkerTarget(target) ? target.leaseId! :
     durableBinding?.environmentLeaseId ??
     input.durableEnvironmentLeaseId ??
     input.execution.binding.executionWorkspaceId;
@@ -11133,6 +11251,9 @@ async function createRunnerdBackendWithinSessionClaim(
     name: "paperclip-runnerd" | "codex",
   ) => {
     if (!remoteTarget || !remoteCommandRunner) return null;
+    if (isFactoryWorkerTarget(remoteTarget)) {
+      return name === "codex" ? discoverFactoryPreinstalledCodex({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd }) : null;
+    }
     const result = await remoteCommandRunner.execute({
       command: "sh",
       args: [
@@ -11154,6 +11275,11 @@ async function createRunnerdBackendWithinSessionClaim(
     targetPath: string,
   ) => {
     if (!remoteTarget || !remoteCommandRunner) return;
+    if (isFactoryWorkerTarget(remoteTarget)) {
+      if (targetPath !== remoteCodexBinary) throw new Error("factory_worker_preinstalled_artifact_forbidden");
+      return stageFactoryPreinstalledCodexLauncher({ runner: remoteCommandRunner, workspaceRoot: remoteTarget.remoteCwd,
+        sourcePath, targetPath });
+    }
     const escapedSource = sourcePath.replaceAll("'", "'\\''");
     const escapedTarget = targetPath.replaceAll("'", "'\\''");
     const escapedDirectory = posix.dirname(targetPath).replaceAll("'", "'\\''");
@@ -11234,7 +11360,7 @@ async function createRunnerdBackendWithinSessionClaim(
       );
     }
     const explicitRemoteBinary = input.runnerRemoteBinaryPath?.trim() || null;
-    if (!runnerArtifactPrepared && mayUsePreinstalledRunnerArtifact(explicitRemoteBinary)) {
+    if (!runnerArtifactPrepared && mayUsePreinstalledRunnerArtifact(explicitRemoteBinary, remoteTarget)) {
       const preinstalledRunner = await measureNativeRunnerSpan(
         input.trace,
         "runner.artifact.discover",
@@ -11335,7 +11461,12 @@ async function createRunnerdBackendWithinSessionClaim(
       });
       await verifyRemoteCodex();
     }
-    if (remoteCodexBinary && remoteCodexNpmSpec) {
+    if (remoteCodexBinary && isFactoryWorkerTarget(remoteTarget) && !explicitRemoteCodex) {
+      await prepareFactoryCodexFromImage({ runner: remoteCommandRunner, workspaceRoot: remoteTarget.remoteCwd,
+        targetPath: remoteCodexBinary, verify: sourcePath => verifyRemoteCodex(sourcePath) });
+      await verifyRemoteCodex();
+    }
+    if (remoteCodexBinary && remoteCodexNpmSpec && !isFactoryWorkerTarget(remoteTarget)) {
       let usedPreinstalledCodex = false;
       const preinstalledCodex = await measureNativeRunnerSpan(
         input.trace,
@@ -11394,7 +11525,7 @@ async function createRunnerdBackendWithinSessionClaim(
         () => verifyRemoteCodex(),
       );
     }
-    if (remoteCodexBinary && !explicitRemoteCodex && !remoteCodexNpmSpec) {
+    if (remoteCodexBinary && !explicitRemoteCodex && !remoteCodexNpmSpec && !isFactoryWorkerTarget(remoteTarget)) {
       const preinstalledCodex = await measureNativeRunnerSpan(
         input.trace,
         "harness.artifact.discover",
@@ -11428,99 +11559,107 @@ async function createRunnerdBackendWithinSessionClaim(
       configuredProviderPackRoot &&
       stagedRemoteProviderPackRoot
     ) {
-      const packSource = await prepareVerifiedRemoteProviderPack({
-        verifyStaged: () => measureNativeRunnerSpan(
-          input.trace,
-          "provider_pack.verify",
-          () => verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
-        ),
-        usePreinstalled: async () => {
-          let preinstalledProviderPack = await discoverPreinstalledProviderPack();
-          if (preinstalledProviderPack) {
-            try {
-              await measureNativeRunnerSpan(
-                input.trace,
-                "provider_pack.verify_preinstalled",
-                () => verifyRemoteProviderPack(preinstalledProviderPack!),
-              );
-              const escapedSource = preinstalledProviderPack.replaceAll(
-                "'",
-                "'\\''",
-              );
-              const escapedTarget = stagedRemoteProviderPackRoot.replaceAll(
-                "'",
-                "'\\''",
-              );
-              const escapedParent = posix
-                .dirname(stagedRemoteProviderPackRoot)
-                .replaceAll("'", "'\\''");
-              const linked = await remoteCommandRunner.execute({
-                command: "sh",
-                args: [
-                  "-c",
-                  `umask 077; mkdir -p '${escapedParent}' && rm -rf '${escapedTarget}' && ln -s '${escapedSource}' '${escapedTarget}'`,
-                ],
-                cwd: remoteTarget.remoteCwd,
-                bypassSession: true,
-                timeoutMs: 10_000,
-              });
-              if (linked.exitCode !== 0 || linked.timedOut) {
-                throw new Error(
-                  "runner_remote_provider_artifact_incompatible: preinstalled provider pack could not be linked",
+      if (isFactoryWorkerTarget(remoteTarget)) {
+        // The manifest-matched image pack is immutable. Never create a link
+        // through a previous model's writable runtime tree or use its HOME.
+        const imagePackRoot = "/opt/paperclip-runner/provider-pack";
+        await verifyRemoteProviderPack(imagePackRoot);
+        activeRemoteProviderPackRoot = imagePackRoot;
+      } else {
+        const packSource = await prepareVerifiedRemoteProviderPack({
+          verifyStaged: () => measureNativeRunnerSpan(
+            input.trace,
+            "provider_pack.verify",
+            () => verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
+          ),
+          usePreinstalled: async () => {
+            let preinstalledProviderPack = await discoverPreinstalledProviderPack();
+            if (preinstalledProviderPack) {
+              try {
+                await measureNativeRunnerSpan(
+                  input.trace,
+                  "provider_pack.verify_preinstalled",
+                  () => verifyRemoteProviderPack(preinstalledProviderPack!),
                 );
+                const escapedSource = preinstalledProviderPack.replaceAll(
+                  "'",
+                  "'\\''",
+                );
+                const escapedTarget = stagedRemoteProviderPackRoot.replaceAll(
+                  "'",
+                  "'\\''",
+                );
+                const escapedParent = posix
+                  .dirname(stagedRemoteProviderPackRoot)
+                  .replaceAll("'", "'\\''");
+                const linked = await remoteCommandRunner.execute({
+                  command: "sh",
+                  args: [
+                    "-c",
+                    `umask 077; mkdir -p '${escapedParent}' && rm -rf '${escapedTarget}' && ln -s '${escapedSource}' '${escapedTarget}'`,
+                  ],
+                  cwd: remoteTarget.remoteCwd,
+                  bypassSession: true,
+                  timeoutMs: 10_000,
+                });
+                if (linked.exitCode !== 0 || linked.timedOut) {
+                  throw new Error(
+                    "runner_remote_provider_artifact_incompatible: preinstalled provider pack could not be linked",
+                  );
+                }
+                activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
+                await input.onLog?.(
+                  "stderr",
+                  "[paperclip-runner] using manifest-matched provider pack from the sandbox image\n",
+                );
+              } catch {
+                preinstalledProviderPack = null;
               }
-              activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
-              await input.onLog?.(
-                "stderr",
-                "[paperclip-runner] using manifest-matched provider pack from the sandbox image\n",
-              );
-            } catch {
-              preinstalledProviderPack = null;
             }
-          }
-          return preinstalledProviderPack !== null;
-        },
-        stageAndVerify: async () => {
-          if (!remoteCommandRunner.syncIn) {
-            throw new Error(
-              "runner_remote_provider_artifact_incompatible: this remote transport cannot stage a provider pack; preinstall the exact manifest-matched pack",
+            return preinstalledProviderPack !== null;
+          },
+          stageAndVerify: async () => {
+            if (!remoteCommandRunner.syncIn) {
+              throw new Error(
+                "runner_remote_provider_artifact_incompatible: this remote transport cannot stage a provider pack; preinstall the exact manifest-matched pack",
+              );
+            }
+            const escapedPackRoot = stagedRemoteProviderPackRoot.replaceAll(
+              "'",
+              "'\\''",
             );
-          }
-          const escapedPackRoot = stagedRemoteProviderPackRoot.replaceAll(
-            "'",
-            "'\\''",
-          );
-          const cleared = await remoteCommandRunner.execute({
-            command: "sh",
-            args: ["-c", `rm -rf '${escapedPackRoot}'`],
-            cwd: remoteTarget.remoteCwd,
-            bypassSession: true,
-            timeoutMs: 10_000,
-          });
-          if (cleared.exitCode !== 0 || cleared.timedOut) {
-            throw new Error(
-              "runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced",
+            const cleared = await remoteCommandRunner.execute({
+              command: "sh",
+              args: ["-c", `rm -rf '${escapedPackRoot}'`],
+              cwd: remoteTarget.remoteCwd,
+              bypassSession: true,
+              timeoutMs: 10_000,
+            });
+            if (cleared.exitCode !== 0 || cleared.timedOut) {
+              throw new Error(
+                "runner_remote_provider_artifact_incompatible: stale provider pack could not be replaced",
+              );
+            }
+            await stageRemoteRunnerDirectory({
+              target: remoteTarget,
+              runner: remoteCommandRunner,
+              sourcePath: configuredProviderPackRoot,
+              targetPath: stagedRemoteProviderPackRoot,
+              mode: 0o700,
+            });
+            await measureNativeRunnerSpan(input.trace, "provider_pack.verify", () =>
+              verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
             );
-          }
-          await stageRemoteRunnerDirectory({
-            target: remoteTarget,
-            runner: remoteCommandRunner,
-            sourcePath: configuredProviderPackRoot,
-            targetPath: stagedRemoteProviderPackRoot,
-            mode: 0o700,
-          });
-          await measureNativeRunnerSpan(input.trace, "provider_pack.verify", () =>
-            verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
+            activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
+          },
+        });
+        activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
+        if (packSource === "staged") {
+          await input.onLog?.(
+            "stderr",
+            "[paperclip-runner] reusing manifest-matched provider pack from the workspace\n",
           );
-          activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
-        },
-      });
-      activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
-      if (packSource === "staged") {
-        await input.onLog?.(
-          "stderr",
-          "[paperclip-runner] reusing manifest-matched provider pack from the workspace\n",
-        );
+        }
       }
     }
     remotePrepared = true;
@@ -11799,21 +11938,29 @@ async function createRunnerdBackendWithinSessionClaim(
       if (directory.location !== "filesystem") continue;
       const targetPath = remotePersistencePath(directory);
       if (!targetPath) throw new Error("runner_harness_state_mismatch: bootstrap_target_unavailable");
-      const escapedTarget = targetPath.replaceAll("'", "'\\''");
-      const created = await remoteCommandRunner.execute({
-        command: "sh",
-        args: ["-c", `umask 077; install -d -m 0700 '${escapedTarget}'`],
-        bypassSession: true,
-        timeoutMs: 10_000,
-      });
-      if (created.exitCode !== 0 || created.timedOut) {
-        throw new Error("runner_remote_directory_staging_failed");
+      if (isFactoryWorkerTarget(remoteTarget)) {
+        await ensureFactoryRemoteRunnerDirectory({ runner: remoteCommandRunner, workspaceRoot: remoteTarget.remoteCwd,
+          targetPath, mode: 0o700 });
+      } else {
+        const escapedTarget = targetPath.replaceAll("'", "'\\''");
+        const created = await remoteCommandRunner.execute({
+          command: "sh",
+          args: ["-c", `umask 077; install -d -m 0700 '${escapedTarget}'`],
+          bypassSession: true,
+          timeoutMs: 10_000,
+        });
+        if (created.exitCode !== 0 || created.timedOut) {
+          throw new Error("runner_remote_directory_staging_failed");
+        }
       }
 
       // Codex launch credentials are intentionally excluded from failover
       // backups. Re-materialize only those launch-time files into a fresh or
       // replacement sandbox after the durable history has been restored.
       if (directory.name !== "codex-home") continue;
+      // Factory credentials arrive through its separately qualified capability
+      // path. Old host auth/config files never become worker launch assets.
+      if (isFactoryWorkerTarget(remoteTarget)) continue;
       const localDirectory = resolve(root, directory.name);
       for (const name of ["auth.json", "config.toml"] as const) {
         const sourcePath = resolve(localDirectory, name);
@@ -11830,6 +11977,10 @@ async function createRunnerdBackendWithinSessionClaim(
   };
 
   const ensureRemoteRunner = async (stageLaunchAssets = true) => {
+    if (isFactoryWorkerTarget(target)) {
+      await assertFactoryWorkspaceStagingOwned({ db: input.db, companyId: input.execution.binding.companyId,
+        runId: input.execution.binding.runId, leaseId: target.leaseId! });
+    }
     await measureNativeRunnerSpan(
       input.trace,
       "stage.sync",
@@ -12275,10 +12426,22 @@ async function createRunnerdBackendWithinSessionClaim(
     }
   };
 
-  const checkpointRemoteRunner = (settlement: "settled" | "unsettled") =>
-    sshForegroundOwner
+  let factoryStagingSettlement: Promise<void> | undefined;
+  const checkpointRemoteRunner = (settlement: "settled" | "unsettled") => {
+    if (isFactoryWorkerTarget(target)) {
+      if (!sshForegroundOwner) throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+      // A missing foreground owner, busy receipt or completed upload alone cannot
+      // release the workspace. Keep the same gate across nondispatched busy retries.
+      const checkpoint = () => sshForegroundOwner.checkpointOwned(settlement, () => checkpointRemoteRunnerState(settlement));
+      if (settlement !== "settled") return checkpoint();
+      return factoryStagingSettlement ??= settleFactoryWorkspaceStaging({ db: input.db,
+        companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
+        leaseId: target.leaseId!, verifyQuiescence: checkpoint });
+    }
+    return sshForegroundOwner
       ? sshForegroundOwner.checkpoint(settlement, () => checkpointRemoteRunnerState(settlement))
       : checkpointRemoteRunnerState(settlement);
+  };
 
   const prepareExternalRunnerState =
     remoteTarget && remoteCommandRunner
@@ -12349,7 +12512,21 @@ async function createRunnerdBackendWithinSessionClaim(
             remoteCwd: remoteTarget.remoteCwd,
             diagnosticsDirectory: posix.join(remoteSessionRoot!, "diagnostics"),
             ensureArtifact: ensureRemoteRunner,
-            onDispatched: () => resolveRemoteRunnerProcessSpawned?.(),
+          ...(isFactoryWorkerTarget(remoteTarget) ? {
+            createWorkerAdmission: () => createAuthorizedFactoryWorkerAdmission({ db: input.db,
+              execution: input.execution, target: remoteTarget, sessionId: nativeSessionKey(input.execution),
+              runnerInstanceId: effectiveRunnerInstanceId, durableEnvironmentLeaseId: input.durableEnvironmentLeaseId,
+              timeoutMs: input.turnTimeoutMs }),
+            onVerifiedBusy: (error: Error) => {
+              if (!input.factoryWorkerAttempt || input.factoryWorkerAttempt.runId !== input.execution.binding.runId ||
+                  !isFactoryWorkerBusyError(error)) throw new Error("factory_worker_capacity_authority_missing");
+              input.factoryWorkerAttempt.busy = error;
+            },
+          } : {}),
+            onDispatched: () => {
+              if (input.factoryWorkerAttempt) input.factoryWorkerAttempt.busy = undefined;
+              resolveRemoteRunnerProcessSpawned?.();
+            },
           })
         : createRemoteRunnerProcessLauncher({
           target: remoteTarget,
@@ -12380,7 +12557,7 @@ async function createRunnerdBackendWithinSessionClaim(
     : input.execution;
   const isGrok = input.execution.provider.kind === "acpx" && input.execution.provider.agent === "grok";
   let effectiveRunnerEnvironmentBase: NodeJS.ProcessEnv = {
-    ...(isGrok
+    ...(isFactoryWorkerTarget(target) ? { ...FACTORY_LEASE_FIXED_ENV, ...(input.runnerEnvironment ?? {}) } : isGrok
       ? input.runnerEnvironment ?? {}
       : resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment)),
   };
@@ -12634,7 +12811,7 @@ async function createRunnerdBackendWithinSessionClaim(
         archiveExternalRunnerState,
         runnerBinary: controllerRunnerBinary,
         codexCommand: remoteCodexBinary ?? undefined,
-        sourceCodexHome: remoteTarget
+        sourceCodexHome: isFactoryWorkerTarget(target) ? "" : remoteTarget
           ? resolveSourceCodexHome(resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment))
           : undefined,
         runnerProcessLauncher: remoteProcessLauncher,

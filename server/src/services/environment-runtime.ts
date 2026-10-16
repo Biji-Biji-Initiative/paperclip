@@ -32,6 +32,8 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
+import { FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { acquireFactoryWorkspaceStagingLease } from "./factory-workspace-staging.js";
 import {
   getActiveStepContext,
   runWithRuntimeParent,
@@ -1192,6 +1194,18 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
       }
 
+      if (parsed.config.factoryWorkerPolicy === FACTORY_WORKER_POLICY) {
+        if (!input.heartbeatRunId || !input.executionWorkspaceId || !input.agentId) {
+          throw new Error("factory_workspace_staging_ownership_unverified");
+        }
+        return toEnvironmentLeaseSnapshot(await acquireFactoryWorkspaceStagingLease({
+          db, companyId: input.companyId, environmentId: input.environment.id,
+          executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId ?? null,
+          runId: input.heartbeatRunId, agentId: input.agentId,
+          executionWorkspaceMode: input.executionWorkspaceMode, config: parsed.config,
+          prepareWorkspace: () => ensureSshWorkspaceReady(parsed.config),
+        }));
+      }
       const { remoteCwd } = await ensureSshWorkspaceReady(parsed.config);
       return await environmentsSvc.acquireLease({
         companyId: input.companyId,

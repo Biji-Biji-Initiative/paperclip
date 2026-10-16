@@ -15,6 +15,15 @@ export async function prepareHeartbeatGitHubLaunchers(
   prepareLaunchers = prepareGitHubOperationLaunchers,
   cleanupLaunchers = cleanupGitHubOperationLaunchers,
 ) {
+  if (input.target?.kind === "remote" && input.target.transport === "ssh" &&
+      input.target.factoryWorkerPolicy === "factory-worker-scope-v2") {
+    if (!input.native || input.githubConfigured) {
+      throw new Error("factory_worker_github_not_qualified");
+    }
+    // No host Git identity exists in the private Factory lease. Do not stage
+    // generic wrappers or mint a broker token outside the native admission.
+    return { env: githubBrokerEnvironment(input.env, { url: "", token: "" }), cleanupLocation: null };
+  }
   // Native configured access is owned by the provider session supervisor.
   // Defer staging until it has acquired that session; never mutate a live
   // process's authorization from heartbeat preparation.

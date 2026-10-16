@@ -12,6 +12,10 @@ export interface LocalEnvironmentConfig {
 }
 
 export interface SshEnvironmentConfig {
+  /** Explicit, versioned enrollment in the isolated Factory worker protocol. */
+  factoryWorkerPolicy?: "factory-worker-scope-v2";
+  /** Operator enrollment only; absent preserves credential-free execution. */
+  factoryProviderAdmission?: { provider: "codex"; workerPlanSha256: string };
   host: string;
   port: number;
   username: string;

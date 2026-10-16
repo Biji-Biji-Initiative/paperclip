@@ -26,6 +26,8 @@ import type {
   IssueExecutionWorkspaceSettings,
 } from "@paperclipai/shared";
 import { resolveRunnerEnvironmentForRun } from "./runner-environment-lifecycle.js";
+import { parseEnvironmentDriverConfig } from "./environment-config.js";
+import { FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
 import { environmentService } from "./environments.js";
 import {
   environmentRuntimeService,
@@ -152,6 +154,20 @@ function formatProvisionFailureDetail(result: {
 // Service factory
 // ---------------------------------------------------------------------------
 
+function isNativeFactoryEnvironment(environment: Environment, adapterType: string): boolean {
+  if (environment.driver !== "ssh" || environment.config?.factoryWorkerPolicy === undefined) return false;
+  if (adapterType !== "paperclip_runner") throw new EnvironmentRunError(
+    "unsupported_adapter_environment", "Factory workers require the native Paperclip Runner.",
+    { environmentId: environment.id, driver: environment.driver },
+  );
+  const parsed = parseEnvironmentDriverConfig(environment);
+  if (parsed.driver !== "ssh" || parsed.config.factoryWorkerPolicy !== FACTORY_WORKER_POLICY) {
+    throw new EnvironmentRunError("unsupported_environment", "Factory worker policy is not qualified.",
+      { environmentId: environment.id, driver: environment.driver });
+  }
+  return true;
+}
+
 export function environmentRunOrchestrator(
   db: Db,
   options: {
@@ -237,6 +253,9 @@ export function environmentRunOrchestrator(
     leaseMetadata: Record<string, unknown> | null;
   }): Promise<Record<string, unknown> | null> {
     try {
+      // The native target retains policy, acquired lease and staging ownership.
+      // A legacy SSH spec drops those authorities and must never be serialized.
+      if (isNativeFactoryEnvironment(input.environment, input.adapterType)) return null;
       return await resolveEnvironmentExecutionTransport({
         db,
         companyId: input.companyId,
@@ -284,6 +303,7 @@ export function environmentRunOrchestrator(
     const environment = resolveRunnerEnvironmentForRun(
       selectedEnvironment, input.adapterType, input.adapterConfig, input.admittedLifecycleMode,
     );
+    isNativeFactoryEnvironment(environment, input.adapterType);
 
     // Step 2: Acquire lease
     const leaseRecord = await acquireLease({
@@ -374,6 +394,7 @@ export function environmentRunOrchestrator(
       effectiveExecutionWorkspaceMode,
     } = input;
     let { lease, persistedExecutionWorkspace } = input;
+    const nativeFactory = isNativeFactoryEnvironment(environment, adapterType);
 
     // Step 1: Build workspace realization request
     const workspaceRealizationRequest = buildWorkspaceRealizationRequest({
@@ -529,6 +550,10 @@ export function environmentRunOrchestrator(
         environmentRuntime,
         duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
       });
+      if (nativeFactory && (executionTarget?.kind !== "remote" || executionTarget.transport !== "ssh" ||
+          executionTarget.factoryWorkerPolicy !== FACTORY_WORKER_POLICY)) {
+        throw new Error("factory_worker_native_target_required");
+      }
       const realizationMode = workspaceRealization.mode === "in_place" ? "in_place" : "copy";
       const authoritativeRoot =
         typeof workspaceRealization.authoritativeRoot === "string" && workspaceRealization.authoritativeRoot.trim().length > 0
@@ -574,7 +599,7 @@ export function environmentRunOrchestrator(
       lease,
       workspaceRealization,
       executionTarget,
-      remoteExecution: adapterExecutionTargetToRemoteSpec(executionTarget),
+      remoteExecution: nativeFactory ? null : adapterExecutionTargetToRemoteSpec(executionTarget),
       persistedExecutionWorkspace,
     };
   }

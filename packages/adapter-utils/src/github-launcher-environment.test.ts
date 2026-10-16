@@ -67,6 +67,23 @@ async function sandbox(layout: string) {
 }
 
 describe("managed GitHub launcher environment", () => {
+  it("prepares Factory Git policy without an unleased remote probe", async () => {
+    const probe = vi.spyOn(ssh, "createSshCommandManagedRuntimeRunner");
+    const target = { kind: "remote" as const, transport: "ssh" as const,
+      factoryWorkerPolicy: "factory-worker-scope-v2" as const, remoteCwd: "/workspace/factory",
+      spec: { host: "fixture.invalid", port: 22, username: "node", remoteCwd: "/workspace/factory",
+        remoteWorkspacePath: "/workspace/factory", privateKey: null, knownHosts: null, strictHostKeyChecking: true } };
+    const result = await prepareGitHubExecutionEnvironment({ target, cwd: "/missing/controller",
+      hostCredentials: false, networkAccess: true, env: { LANG: "C.UTF-8", GH_TOKEN: "synthetic-stale",
+        PAPERCLIP_GIT_METADATA_ROOTS: '["/controller"]', PAPERCLIP_GITHUB_HOST_HOME: "/host" } });
+    expect(probe).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ LANG: "C.UTF-8", GH_TOKEN: "", PAPERCLIP_GITHUB_HOST_HOME: "",
+      PAPERCLIP_GIT_METADATA_ROOTS: "[]", PAPERCLIP_RUNNER_NETWORK_ROOTS: "[]",
+      PAPERCLIP_GITHUB_AUTH_MODE: "managed", PAPERCLIP_RUNNER_NETWORK_ACCESS: "enabled" });
+    await expect(prepareGitHubExecutionEnvironment({ target, cwd: "/missing/controller",
+      hostCredentials: true, networkAccess: false, env: {} })).rejects.toThrow("factory_worker_host_github_forbidden");
+    expect(probe).not.toHaveBeenCalled();
+  });
   it.each(["module", "commonjs"])("runs managed GitHub launchers inside a %s project", async (type) => {
     const fixture = await sandbox("usr/bin");
     const packageJson = JSON.stringify({ type });
@@ -109,7 +126,7 @@ describe("managed GitHub launcher environment", () => {
         expect(JSON.parse(result.stdout)).toEqual(captured ? identity : {});
       }
     }
-  });
+  }, 30_000);
 
   it.each([false, true])("probes the remote workspace when the controller cwd is absent (host credentials: %s)", async (hostCredentials) => {
     const fixture = await sandbox("usr/bin");

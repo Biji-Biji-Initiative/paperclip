@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, lte, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lte, ne, or, sql, type SQL } from "drizzle-orm";
 import { documents, heartbeatRunEvents, heartbeatRuns, issueComments, issueDocuments, issues, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { buildLowTrustSourceTrust, redactQuarantinedBodyForHigherTrust, sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
@@ -48,6 +48,8 @@ export function renderNativeSessionHandoff(input: {
 /** All reads are company/task scoped, row bounded and text bounded in SQL. */
 export async function buildNativeSessionHandoff(input: {
   db: Db; companyId: string; issueId: string; agentId: string; before: Date;
+  /** Internal current-run authority; keeps the database's sub-millisecond cutoff. */
+  beforeRunId?: string;
   throughCommentId?: string | null;
 }): Promise<string | null> {
   const { db, companyId, issueId, agentId } = input;
@@ -57,15 +59,38 @@ export async function buildNativeSessionHandoff(input: {
     generation: issues.conversationSessionGeneration, boundaryId: issues.conversationBoundaryCommentId,
   }).from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, companyId), eq(issues.assigneeAgentId, agentId))).limit(1);
   if (!issue || (issue.conversationAgentId && issue.conversationAgentId !== agentId)) return null;
-  const [boundary] = issue.boundaryId ? await db.select({ id: issueComments.id, createdAt: issueComments.createdAt })
+  const [boundary] = issue.boundaryId ? await db.select({ id: issueComments.id })
     .from(issueComments).where(and(eq(issueComments.id, issue.boundaryId), eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId))).limit(1) : [];
   // An invalid reset boundary must never expose the earlier conversation.
   if (issue.boundaryId && !boundary) return null;
-  const [cutoff] = input.throughCommentId ? await db.select({ id: issueComments.id, createdAt: issueComments.createdAt })
+  const [cutoff] = input.throughCommentId ? await db.select({ id: issueComments.id })
     .from(issueComments).where(and(eq(issueComments.id, input.throughCommentId), eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId))).limit(1) : [];
   if (input.throughCommentId && !cutoff) return null;
+  // PostgreSQL timestamps retain microseconds that JavaScript Date cannot.
+  // Keep each persisted boundary in SQL, including exact same-timestamp ties.
+  const exactCommentTime = (id: string) => sql`(${db.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
+    eq(issueComments.id, id), eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+  )).limit(1)})`;
+  const boundaryTime = boundary ? exactCommentTime(boundary.id) : null;
+  const cutoffTime = cutoff ? exactCommentTime(cutoff.id) : null;
+  // Keep the greatest timestamp inside the authority-selecting subquery so a
+  // removed/mismatched owner remains NULL rather than falling back to the wake.
+  const runBoundary = input.beforeRunId ? db.select({ createdAt: cutoffTime
+    ? sql`greatest(${heartbeatRuns.createdAt}, ${cutoffTime})` : heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.beforeRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
+    or(eq(heartbeatRuns.nativeIssueId, issueId), and(isNull(heartbeatRuns.nativeIssueId),
+      or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}`))),
+    cutoff ? or(sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${cutoff.id}`,
+      sql`${heartbeatRuns.contextSnapshot}->>'commentId' = ${cutoff.id}`,
+      sql`${heartbeatRuns.contextSnapshot}->>'conversationReplayThroughCommentId' = ${cutoff.id}`,
+      sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> jsonb_build_array(${cutoff.id}::text)`) : undefined,
+  )).limit(1) : null;
+  if (runBoundary && (await runBoundary).length === 0) return null;
+  // A queued run may accept a later authenticated wake. Its persisted comment
+  // binding permits that exact wake's history, never arbitrary newer input.
+  const before = runBoundary ? sql`(${runBoundary})` : input.before;
   const afterBoundary = (date: typeof issueComments.createdAt | typeof issueThreadInteractions.createdAt | typeof heartbeatRuns.createdAt | typeof issueDocuments.createdAt) =>
-    boundary ? sql`${date} > ${boundary.createdAt.toISOString()}::timestamptz` : undefined;
+    boundaryTime ? sql`${date} > ${boundaryTime}` : undefined;
   const excerpt = (body: SQL) => sql<string>`case when length(${body}) > ${ENTRY_MAX_CHARS}
     then left(${body}, 2900) || ${"\n[content omitted]\n"} || right(${body}, 900) else ${body} end`;
   const commentFields = {
@@ -75,9 +100,9 @@ export async function buildNativeSessionHandoff(input: {
     createdAt: issueComments.createdAt,
   };
   const commentScope = and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), isNull(issueComments.deletedAt),
-    lte(issueComments.createdAt, input.before),
-    boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundary.createdAt.toISOString()}::timestamptz, ${boundary.id}::uuid)` : undefined,
-    cutoff ? sql`(${issueComments.createdAt}, ${issueComments.id}) <= (${cutoff.createdAt.toISOString()}::timestamptz, ${cutoff.id}::uuid)` : undefined);
+    lte(issueComments.createdAt, before),
+    boundary ? sql`(${issueComments.createdAt}, ${issueComments.id}) > (${boundaryTime}, ${boundary.id}::uuid)` : undefined,
+    cutoff ? sql`(${issueComments.createdAt}, ${issueComments.id}) <= (${cutoffTime}, ${cutoff.id}::uuid)` : undefined);
   const runIssueScope = or(eq(heartbeatRuns.nativeIssueId, issueId), and(isNull(heartbeatRuns.nativeIssueId),
     or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issueId}`)));
   const runSummaryBody = sql`coalesce(${heartbeatRuns.runnerProfileJson} #>> '{sessionCheckpoint,semanticResult,summary}',
@@ -98,8 +123,8 @@ export async function buildNativeSessionHandoff(input: {
       eq(issueThreadInteractions.createdByAgentId, agentId), sql`${issueThreadInteractions.status} <> 'pending'`,
       sql`${issueThreadInteractions.kind} in ('ask_user_questions', 'request_confirmation', 'request_checkbox_confirmation', 'connection_intent')`,
       sql`not (${issueThreadInteractions.payload} ?| array['toolAction', 'secretProposal', 'connectionAuthorization'])`,
-      lte(issueThreadInteractions.resolvedAt, input.before), afterBoundary(issueThreadInteractions.createdAt),
-      cutoff ? and(lte(issueThreadInteractions.createdAt, cutoff.createdAt), lte(issueThreadInteractions.resolvedAt, cutoff.createdAt)) : undefined,
+      lte(issueThreadInteractions.resolvedAt, before), afterBoundary(issueThreadInteractions.createdAt),
+      cutoffTime ? and(lte(issueThreadInteractions.createdAt, cutoffTime), lte(issueThreadInteractions.resolvedAt, cutoffTime)) : undefined,
     )).orderBy(desc(issueThreadInteractions.resolvedAt), desc(issueThreadInteractions.id)).limit(9),
     db.select({ id: sql<string>`${heartbeatRunEvents.id}::text`, runId: heartbeatRuns.id,
       executionPolicy: sql<unknown>`${heartbeatRuns.contextSnapshot}->'executionPolicy'`,
@@ -107,28 +132,30 @@ export async function buildNativeSessionHandoff(input: {
       truncated: sql<boolean>`length(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,text}') > ${ENTRY_MAX_CHARS}`,
     }).from(heartbeatRunEvents).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, heartbeatRunEvents.runId), eq(heartbeatRuns.companyId, companyId)))
       .where(and(eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.agentId, agentId), eq(heartbeatRuns.agentId, agentId),
+        input.beforeRunId ? ne(heartbeatRuns.id, input.beforeRunId) : undefined,
         runIssueScope, eq(heartbeatRunEvents.eventType, "item.completed"),
         sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`, sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,channel}' = 'final'`,
         sql`nullif(${heartbeatRunEvents.payload} #>> '{prpEvent,payload,text}', '') is not null`,
-        lte(heartbeatRunEvents.createdAt, input.before), afterBoundary(heartbeatRuns.createdAt),
+        lte(heartbeatRunEvents.createdAt, before), afterBoundary(heartbeatRuns.createdAt),
         issue.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration' = ${String(issue.generation)}` : undefined,
-        cutoff ? and(lte(heartbeatRuns.createdAt, cutoff.createdAt), lte(heartbeatRunEvents.createdAt, cutoff.createdAt)) : undefined,
+        cutoffTime ? and(lte(heartbeatRuns.createdAt, cutoffTime), lte(heartbeatRunEvents.createdAt, cutoffTime)) : undefined,
       )).orderBy(desc(heartbeatRunEvents.createdAt), desc(heartbeatRunEvents.id)).limit(5),
     db.select({ id: documents.id, key: issueDocuments.key, revisionId: documents.latestRevisionId,
       body: excerpt(sql`${documents.latestBody}`),
       truncated: sql<boolean>`length(${documents.latestBody}) > ${ENTRY_MAX_CHARS}`, sourceTrust: documents.sourceTrust,
     }).from(issueDocuments).innerJoin(documents, and(eq(documents.id, issueDocuments.documentId), eq(documents.companyId, companyId)))
-      .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issueId), lte(documents.updatedAt, input.before), afterBoundary(issueDocuments.createdAt),
-        cutoff ? lte(documents.updatedAt, cutoff.createdAt) : undefined))
+      .where(and(eq(issueDocuments.companyId, companyId), eq(issueDocuments.issueId, issueId), lte(documents.updatedAt, before), afterBoundary(issueDocuments.createdAt),
+        cutoffTime ? lte(documents.updatedAt, cutoffTime) : undefined))
       .orderBy(sql`case when ${issueDocuments.key} = 'plan' then 0 else 1 end`, desc(documents.updatedAt)).limit(4),
     db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
       executionPolicy: sql<unknown>`${heartbeatRuns.contextSnapshot}->'executionPolicy'`,
       body: excerpt(runSummaryBody),
       truncated: sql<boolean>`length(${runSummaryBody}) > ${ENTRY_MAX_CHARS}`,
     }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId), runIssueScope,
-      lte(heartbeatRuns.finishedAt, input.before), afterBoundary(heartbeatRuns.createdAt),
+      input.beforeRunId ? ne(heartbeatRuns.id, input.beforeRunId) : undefined,
+      lte(heartbeatRuns.finishedAt, before), afterBoundary(heartbeatRuns.createdAt),
       issue.conversationAgentId ? sql`${heartbeatRuns.contextSnapshot}->>'conversationSessionGeneration' = ${String(issue.generation)}` : undefined,
-      cutoff ? and(lte(heartbeatRuns.createdAt, cutoff.createdAt), lte(heartbeatRuns.finishedAt, cutoff.createdAt)) : undefined,
+      cutoffTime ? and(lte(heartbeatRuns.createdAt, cutoffTime), lte(heartbeatRuns.finishedAt, cutoffTime)) : undefined,
     )).orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.id)).limit(3),
   ]);
   const entries: HandoffEntry[] = [];
