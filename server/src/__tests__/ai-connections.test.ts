@@ -49,6 +49,36 @@ beforeAll(async () => {
 afterAll(async () => { await database?.cleanup(); vi.unstubAllEnvs(); if (home) await rm(home, { recursive: true, force: true }); });
 
 describe("managed AI connections", () => {
+  it("subscription-only policy rejects the actual API default despite a subscription method hint", async () => {
+    const previous = process.env.PAPERCLIP_AI_BILLING_POLICY;
+    const owner = "billing-policy-owner";
+    try {
+      vi.stubEnv("PAPERCLIP_AI_BILLING_POLICY", undefined);
+      await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+      const account = await create(owner, "Billing policy fixture");
+      await service.setDefault(companyId, owner, account.grantId);
+      const hinted = { ...input, userId: owner, binding: { ...binding, method: "subscription" as const } };
+      expect((await service.select(hinted)).attribution.method).toBe("api_key");
+      vi.stubEnv("PAPERCLIP_AI_BILLING_POLICY", "subscriptions_only");
+      await expect(service.select(hinted)).rejects.toThrow("subscription AI accounts only");
+      await expect(prepareManagedAiRuntime(db, { ...hinted, responsibleUserId: owner, config: {} })).rejects.toThrow("subscription AI accounts only");
+      await expect(create(owner, "Rejected API reconnect")).rejects.toThrow("subscription AI accounts only");
+      await expect(service.setDefault(companyId, owner, account.grantId)).rejects.toThrow("subscription AI accounts only");
+      await expect(toolAccessService(db).updateConnection(account.connectionId, { enabled: false, status: "active" })).resolves.toMatchObject({ enabled: false });
+      await expect(toolAccessService(db).updateConnection(account.connectionId, { enabled: true })).rejects.toThrow("subscription AI accounts only");
+    } finally { vi.stubEnv("PAPERCLIP_AI_BILLING_POLICY", previous); }
+  });
+
+  it("subscription-only credential boundary refuses before touching credential references", async () => {
+    const previous = process.env.PAPERCLIP_AI_BILLING_POLICY;
+    try {
+      vi.stubEnv("PAPERCLIP_AI_BILLING_POLICY", "subscriptions_only");
+      const row = { connection: { config: { ai: { provider: "openai", method: "api_key" } } },
+        grant: { get credentialSecretRefs(): never { throw new Error("credential references touched"); } } };
+      await expect(service.credential(row as Parameters<typeof service.credential>[0])).rejects.toThrow("subscription AI accounts only");
+    } finally { vi.stubEnv("PAPERCLIP_AI_BILLING_POLICY", previous); }
+  });
+
   it.each([false, true])("reports the authoritative connection-manager capability for custom grants (manager: %s)", async (manager) => {
     const userId = `custom-manager-${manager}`;
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member" });

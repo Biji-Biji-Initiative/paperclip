@@ -1,4 +1,5 @@
 import { aiConnectionRouterService, poolMemberRuntimeConfig } from "../services/ai-connection-router.js";
+import { assertAiBillingRuntime, subscriptionsOnly } from "../services/ai-billing-policy.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
@@ -3501,6 +3502,12 @@ export function agentRoutes(
     if (!selection) return undefined;
     if (test) {
       const testEnvironmentId = await resolveAdapterTestEnvironmentId(companyId, environmentId);
+      if (subscriptionsOnly() && testEnvironmentId) {
+        const billingEnvironment = await environmentsSvc.getById(testEnvironmentId);
+        assertAiBillingRuntime({ managedConnectionSelected: true,
+          protectedWorkerSelected: billingEnvironment?.driver === "ssh" &&
+            billingEnvironment.config?.factoryWorkerPolicy === "factory-worker-scope-v2" });
+      }
       if (testEnvironmentId) await assertAdapterTestEnvironmentForCompany(companyId, testEnvironmentId);
       const target = await resolveAdapterTestExecutionContext({ companyId, adapterType, environmentId: testEnvironmentId });
       let managed: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
@@ -3547,6 +3554,12 @@ export function agentRoutes(
         res.json({ adapterType: type, status: "warn", testedAt: new Date().toISOString(), checks: [{ code: "ai_connection_pool_task_test_required", level: "warn", message: "Pool configuration is available. Run a task to verify the selected account and harness; this preview does not allocate a task or contact a provider." }] });
         return;
       }
+      assertAiBillingRuntime({ managedConnectionSelected: Boolean(aiBinding) });
+      if (subscriptionsOnly() && aiBinding) await aiConnectionService(db).select({ companyId, agentId: savedAgentId ?? "",
+        userId: responsibleUserForAiRequest(req), adapterType: type, binding: aiBinding,
+        model: req.body.adapterConfig?.model, runnerProvider: req.body.adapterConfig?.provider,
+        acpxAgent: req.body.adapterConfig?.acpxAgent, allowUninstalledPersonal: !savedAgentId, allowLegacyValidation: true,
+        allowUninstalledShared: !savedAgentId && await canInstallSharedAiConnectionForNewAgent(db, req, companyId, aiBinding) });
       const requestedEnvironmentId = await resolveAdapterTestEnvironmentId(
         companyId,
         // Omission tests the saved selection. Explicit null tests a prospective
@@ -3555,6 +3568,12 @@ export function agentRoutes(
           ? savedAgent?.defaultEnvironmentId
           : asNonEmptyString(req.body.environmentId),
       );
+      if (subscriptionsOnly() && requestedEnvironmentId) {
+        const billingEnvironment = await environmentsSvc.getById(requestedEnvironmentId);
+        assertAiBillingRuntime({ managedConnectionSelected: Boolean(aiBinding),
+          protectedWorkerSelected: billingEnvironment?.driver === "ssh" &&
+            billingEnvironment.config?.factoryWorkerPolicy === "factory-worker-scope-v2" });
+      }
       // Fail closed on a foreign environment before any secret resolution, env
       // merge, target resolution, sandbox lease, or adapter test runs.
       if (requestedEnvironmentId) {

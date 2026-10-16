@@ -1,6 +1,7 @@
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, inArray, or } from "drizzle-orm";
+import { assertAiBillingMethod } from "./ai-billing-policy.js";
 import {
   type Db,
   authUsers,
@@ -197,6 +198,7 @@ export function aiConnectionService(db: Db) {
       const metadata = aiConnectionMetadataSchema.parse(
         row.connection.config.ai,
       );
+      assertAiBillingMethod(metadata.method);
       // Keep old servers' method preferences intact during an additive rollout.
       await tx.insert(aiConnectionDefaults)
         .values({ companyId, userId, ...metadata, grantId })
@@ -223,6 +225,7 @@ export function aiConnectionService(db: Db) {
     const row = visible[0]!;
     const metadata = aiConnectionMetadataSchema.safeParse(row.connection.config.ai);
     if (!metadata.success) throw notFound("AI connection not found");
+    assertAiBillingMethod(metadata.data.method);
     const identity = { connectionId: row.connection.id, grantId: row.grant.id, ...metadata.data };
     const empty = { ...identity, checkedAt: new Date().toISOString(), source: null, planType: null, limits: [], overage: null };
     if (row.grant.status !== "active" || !row.connection.enabled || row.connection.status !== "active" ||
@@ -306,6 +309,7 @@ export function aiConnectionService(db: Db) {
       });
     const { connection, grant } = row;
     const metadata = aiConnectionMetadataSchema.safeParse(connection.config.ai);
+    if (metadata.success) assertAiBillingMethod(metadata.data.method);
     if (
       !metadata.success ||
       metadata.data.provider !== binding.provider ||
@@ -401,6 +405,7 @@ export function aiConnectionService(db: Db) {
     };
   }
   async function credential(row: Pick<Awaited<ReturnType<typeof select>>, "connection" | "grant">) {
+    assertAiBillingMethod(aiConnectionMetadataSchema.safeParse(row.connection.config.ai).data?.method);
     const ref = row.grant.credentialSecretRefs.find(
       (r) => r.configPath === "ai.credential",
     );
@@ -464,6 +469,7 @@ export function aiConnectionService(db: Db) {
     sessionId?: string,
     attemptStartedAt = new Date(),
   ) {
+    assertAiBillingMethod(input.method);
     if (!(await membership(companyId, userId)))
       throw forbidden("An active company member must own this connection");
     const reconnect = input.connectionId

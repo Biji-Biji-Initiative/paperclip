@@ -75,6 +75,8 @@ services:
       PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL: "${PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL:-}"
       PAPERCLIP_ENABLE_COMPANY_DELETION: "false"
       PAPERCLIP_MIGRATION_AUTO_APPLY: "true"
+      # Operator policy: CAAM subscriptions; never select paid API accounts.
+      PAPERCLIP_AI_BILLING_POLICY: "subscriptions_only"
       HEARTBEAT_SCHEDULER_ENABLED: "false"
       PAPERCLIP_DB_BACKUP_ENABLED: "false"
 

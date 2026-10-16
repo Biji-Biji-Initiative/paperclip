@@ -1,5 +1,6 @@
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
 import { readVerifiedLocalAiCredential } from "../services/local-ai-credentials.js";
+import { assertAiBillingMethod } from "../services/ai-billing-policy.js";
 import { localAiLoginService } from "../services/local-ai-login.js";
 import { z } from "zod";
 import { Router, type Request } from "express";
@@ -139,6 +140,7 @@ export async function validateAiApiKey(
   key: string,
   request: typeof fetch = fetch,
 ) {
+  assertAiBillingMethod("api_key");
   const endpoints = {
     anthropic: "https://api.anthropic.com/v1/models?limit=1",
     openai: "https://api.openai.com/v1/models",
@@ -317,6 +319,7 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
     async (req, res) => {
       const companyId = req.params.companyId as string;
       const input = createAiConnectionSchema.parse(req.body);
+      assertAiBillingMethod(input.method);
       const userId = await assertAiConnectionCreateAccess(
         db,
         req,

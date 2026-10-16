@@ -16,6 +16,7 @@ import { isMemoryConnectorId, isRemoteMcpConnectorMethod, connectionPurposeTrans
 import { instanceSettingsService } from "./instance-settings.js";
 import { githubBotRequest } from "./chat-github-client.js";
 import { syncConnectionCredentialBindings } from "./connection-credential-bindings.js";
+import { assertAiBillingMethod } from "./ai-billing-policy.js";
 import {
   emitConnectionCreated,
   emitConnectionUpdated,
@@ -18747,6 +18748,9 @@ export function toolAccessService(
       input: UpdateToolConnection,
     ): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId);
+      if (existing.connectionPurpose === "ai" && input.enabled !== false && (input.enabled === true || input.status === "active")) {
+        assertAiBillingMethod(asRecord(existing.config.ai).method);
+      }
       if (existing.connectionPurpose === "ai" && (input.config || input.transportConfig || input.credentialRefs || input.credentialSecretRefs || (input.credentialPolicy && input.credentialPolicy !== existing.credentialPolicy))) throw badRequest("Use AI account reconnect to change credentials. Provider, sign-in method, and ownership cannot be changed.");
       const config = normalizeGoogleSheetsConnectionConfig(
         input.config ?? input.transportConfig ?? existing.config,

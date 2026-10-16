@@ -1,4 +1,5 @@
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { assertAiBillingRuntime, assertProtectedSubscriptionConfig, prepareAiBillingRuntime } from "./ai-billing-policy.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
 import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 import { externalObjectService } from "./external-objects.js";
@@ -21563,6 +21564,16 @@ export function heartbeatService(
           : selectedEnvironmentId
             ? await environmentsSvc.getById(selectedEnvironmentId)
             : null;
+      const protectedWorkerSelected =
+        selectedEnvironmentForConfig?.driver === "ssh" &&
+        selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY;
+      const protectedSubscription = agent.adapterType === "paperclip_runner" && protectedWorkerSelected &&
+        parseObject(selectedEnvironmentForConfig?.config?.factoryProviderAdmission).provider === "codex" &&
+        typeof parseObject(selectedEnvironmentForConfig?.config?.factoryProviderAdmission).workerPlanSha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(String(parseObject(selectedEnvironmentForConfig?.config?.factoryProviderAdmission).workerPlanSha256));
+      assertAiBillingRuntime({ managedConnectionSelected: Boolean(aiBinding), protectedSubscription, protectedWorkerSelected });
+      if (protectedSubscription) assertProtectedSubscriptionConfig(config.env, selectedEnvironmentForConfig?.envVars,
+        projectContext?.env, routineEnvContext.env);
       const nativeChatWorkspaceScope = await findNativeChatWorkspaceScope(db, {
         adapterType: agent.adapterType,
         environmentDriver: selectedEnvironmentForConfig?.driver ?? null,
@@ -21756,6 +21767,8 @@ export function heartbeatService(
           selectedEnvironmentForConfig?.driver ?? "local",
         );
 
+      if (protectedSubscription) assertProtectedSubscriptionConfig(executionRunConfig.env,
+        selectedEnvironmentForConfig?.envVars, projectContext?.env, routineEnvContext.env);
       const { resolvedConfig, secretKeys, secretManifest } =
         await resolveExecutionRunAdapterConfig({
           managedAiCredentials: Boolean(aiBinding),
@@ -21780,7 +21793,8 @@ export function heartbeatService(
       readFailureReportSecrets = () => collectRunFailureSecretValues(resolvedConfig.env, secretKeys);
       if (aiBinding) {
         try {
-          managedAiRuntime = await prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig });
+          managedAiRuntime = await prepareAiBillingRuntime({ managedConnectionSelected: true, protectedWorkerSelected },
+            () => prepareManagedAiRuntime(db, { companyId: agent.companyId, agentId: agent.id, responsibleUserId, adapterType: agent.adapterType, binding: aiBinding, config: resolvedConfig }));
         } catch (error) {
           // Only fresh executions can receive a pre-provider wait receipt. A
           // persisted native input may already have provider effects to recover.
