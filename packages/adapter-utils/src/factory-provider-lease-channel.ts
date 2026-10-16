@@ -11,7 +11,7 @@ type SignAdmission = (record: FactoryControllerAdmission, signal: AbortSignal) =
 /** New opt-in only. The scoped private key remains entirely on the controller. */
 export async function admitFactoryProviderLease(raw: SshProcessChannel, descriptor: FactoryWorkerLeaseDescriptor,
   binding: FactoryProviderBinding, header: Uint8Array, sign: SignAdmission,
-  options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<SshProcessChannel> {
+  options: { timeoutMs?: number; signal?: AbortSignal; beforeSign?: () => Promise<void> } = {}): Promise<SshProcessChannel> {
   const lease = structuredClone(descriptor), provider = structuredClone(binding), launch = Buffer.from(header);
   try { validateFactoryProviderBinding(provider); validateFactoryWorkerLeaseDescriptor(lease); }
   catch { launch.fill(0); raw.stop(); await raw.close().catch(() => undefined); throw new SshTransportUnverifiedError(); }
@@ -102,6 +102,8 @@ export async function admitFactoryProviderLease(raw: SshProcessChannel, descript
     }
     if ((stage as string) !== "signing" || exit || signing.signal.aborted) throw new SshTransportUnverifiedError();
     const record = createFactoryControllerAdmission(lease, provider, challenge);
+    if (options.beforeSign) await Promise.race([options.beforeSign(), accepted.then(() => { throw new SshTransportUnverifiedError(); })]);
+    if ((stage as string) !== "signing" || exit || signing.signal.aborted) throw new SshTransportUnverifiedError();
     const signature = await Promise.race([sign(record, signing.signal), accepted.then(() => { throw new SshTransportUnverifiedError(); })]);
     if ((stage as string) !== "signing" || exit || signing.signal.aborted ||
         Object.keys(signature).length !== 3 || signature.schema !== FACTORY_ADMISSION_SIGNED_SCHEMA ||

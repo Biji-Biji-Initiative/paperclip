@@ -44,6 +44,7 @@ export interface ForegroundCommandRunner {
     signal?: AbortSignal;
     workerLease?: FactoryWorkerLeaseDescriptor;
     providerAdmission?: FactoryProviderBinding;
+    revalidateProviderAdmission?: () => Promise<void>;
     environment?: Readonly<Record<string, string>>;
   }): Promise<Channel>;
 }
@@ -180,7 +181,8 @@ export class NativeSshForegroundOwner {
     /** Invoked only after staging; absolute worker deadlines must not age during upload. */
     createWorkerLease?: () => Promise<FactoryWorkerLeaseDescriptor>;
     /** DB-current explicit provider mode; resolved together after staging. */
-    createWorkerAdmission?: () => Promise<{ workerLease: FactoryWorkerLeaseDescriptor; providerAdmission?: FactoryProviderBinding }>;
+    createWorkerAdmission?: () => Promise<{ workerLease: FactoryWorkerLeaseDescriptor; providerAdmission?: FactoryProviderBinding;
+      revalidateProviderAdmission?: () => Promise<void> }>;
     onVerifiedBusy?: (error: Error) => void;
     onDispatched?: () => void | Promise<void>;
   }): (spec: LaunchSpec) => ProcessHandle {
@@ -236,12 +238,13 @@ export class NativeSshForegroundOwner {
             throw new Error("native_ssh_cancelled_before_dispatch");
           }
           const admission = input.createWorkerAdmission
-            ? structuredClone(await Promise.race([bounded(input.createWorkerAdmission(), this.options.openTimeoutMs ?? 20_000,
-              this.options.ownershipError), stopExpired])) : undefined;
-          const workerLease = admission?.workerLease ?? (input.createWorkerLease
+            ? await Promise.race([bounded(input.createWorkerAdmission(), this.options.openTimeoutMs ?? 20_000,
+              this.options.ownershipError), stopExpired]) : undefined;
+          const workerLease = admission ? structuredClone(admission.workerLease) : (input.createWorkerLease
             ? await Promise.race([bounded(input.createWorkerLease(), this.options.openTimeoutMs ?? 20_000, this.options.ownershipError), stopExpired])
             : suppliedLease);
-          const providerAdmission = admission?.providerAdmission;
+          const providerAdmission = admission?.providerAdmission ? structuredClone(admission.providerAdmission) : undefined;
+          const revalidateProviderAdmission = admission?.revalidateProviderAdmission;
           if (input.createWorkerAdmission && !workerLease) throw this.options.ownershipError();
           validateLeaseOwner(workerLease);
           if (stopped) {
@@ -265,7 +268,8 @@ export class NativeSshForegroundOwner {
               "/bin/sh", "-c", 'set -eu; umask 077; mkdir -p -- "$1"; cd -- "$2"; shift 2; exec "$@"',
               "paperclip-ssh-foreground", input.diagnosticsDirectory, input.remoteCwd, input.remoteBinary, ...args];
           if (providerAdmission) {
-            if (!workerLease || providerAdmission.runnerInstanceId !== this.options.runnerInstanceId) throw this.options.ownershipError();
+            if (!workerLease || providerAdmission.runnerInstanceId !== this.options.runnerInstanceId ||
+                typeof revalidateProviderAdmission !== "function") throw this.options.ownershipError();
             // Validates exact native run/lease/session/runner argv before transport.
             encodeFactoryProviderLaunch(workerLease, providerAdmission, command, Object.fromEntries(env));
           }
@@ -273,7 +277,7 @@ export class NativeSshForegroundOwner {
           dispatchAttempted = true;
           const opening = input.runner.openDuplexChannel!({ command, signal: abort.signal,
             ...(workerLease ? {workerLease, environment: Object.fromEntries(env)} : {}),
-            ...(providerAdmission ? {providerAdmission} : {}),
+            ...(providerAdmission ? {providerAdmission, revalidateProviderAdmission} : {}),
           });
           let openingExpired = false;
           // A delayed provider implementation must not orphan a late-open channel.

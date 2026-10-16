@@ -14,7 +14,9 @@ function fixture() {
   const descriptor = createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID, runId: randomUUID(), leaseId: randomUUID(),
     workspaceId, workspaceRoot: `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`, sessionId: "worker-session", deadlineUnixMs: Date.now() + 60000 });
   const binding: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v2", provider: "codex", admissionId: randomUUID(),
-    capabilityId: randomUUID(), normalizedSessionId: "native-session", runnerInstanceId: "runner-fixture", workerPlanSha256: "a".repeat(64) };
+    capabilityId: randomUUID(), normalizedSessionId: "native-session", runnerInstanceId: "runner-fixture", workerPlanSha256: "a".repeat(64),
+    authorization: { schema: "factory.direct-board-wakeup.v1", actorType: "user", actorId: "synthetic-user", actorEmail: "synthetic@example.invalid",
+      wakeupRequestId: randomUUID(), agentId: randomUUID(), requestedAtUnixMs: Date.now() - 1000 } };
   const prepared = { protocol: FACTORY_PROVIDER_MARKER, provider: binding.provider, type: "preparation", status: "prepared", companyId: descriptor.companyId,
     runId: descriptor.runId, leaseId: descriptor.leaseId, sessionId: descriptor.sessionId, ownerNonce: "b".repeat(32), bootId: randomUUID(),
     createdUnixMs: Date.now(), deadlineUnixMs: descriptor.deadlineUnixMs, workerPlanSha256: binding.workerPlanSha256, dispatchAttempted: false };
@@ -27,6 +29,21 @@ const cleanups: string[] = [];
 afterEach(async () => { for (const path of cleanups.splice(0)) await rm(path, { recursive: true, force: true }); });
 
 describe("explicit provider launch and immutable controller record", () => {
+  it.each(["codex", "claude"] as const)("requires closed authenticated own-run evidence for %s", provider => {
+    const f = fixture(); f.binding.provider = provider; f.prepared.provider = provider;
+    for (const authorization of [undefined, null, { ...f.binding.authorization, actorType: "agent" },
+      { ...f.binding.authorization, actorId: "" }, { ...f.binding.authorization, actorEmail: "private\nvalue" },
+      { ...f.binding.authorization, wakeupRequestId: "foreign" }, { ...f.binding.authorization, requestedAtUnixMs: Date.now() + 60_000 },
+      { ...f.binding.authorization, token: "synthetic-extra-denied" }]) {
+      expect(() => validateFactoryProviderBinding({ ...f.binding, authorization })).toThrow("factory_provider_admission_invalid");
+    }
+    const record = createFactoryControllerAdmission(f.descriptor, f.binding, f.prepared);
+    expect(record.authorization).toEqual(f.binding.authorization);
+    expect(record.authorization).not.toBe(f.binding.authorization);
+    const encoded = encodeFactoryControllerAdmission(record).toString();
+    expect(encoded.indexOf('"actorEmail"')).toBeLessThan(encoded.indexOf('"actorId"'));
+    expect(JSON.parse(encoded).authorization).toEqual(f.binding.authorization);
+  });
   it("binds native argv while retaining credential-free environment validation", () => {
     const f = fixture(), bootstrap = "bootstrap_" + randomUUID();
     const header = JSON.parse(encodeFactoryProviderLaunch(f.descriptor, f.binding, f.command,

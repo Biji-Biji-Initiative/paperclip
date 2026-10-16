@@ -8,6 +8,16 @@ export const FACTORY_PROVIDER_POLICY = "factory-worker-provider-scope-v2" as con
 export const FACTORY_ADMISSION_NAMESPACE = "factory-provider-admission-v2@mereka.io" as const;
 export const FACTORY_ADMISSION_SIGNED_SCHEMA = "factory.provider-controller-signed.v2" as const;
 export type FactoryAdmissionProvider = "codex" | "claude";
+/** Public controller assertion, derived only from the exact authenticated DB wake. */
+export interface FactoryOwnRunAuthorization {
+  schema: "factory.direct-board-wakeup.v1";
+  actorType: "user";
+  actorId: string;
+  actorEmail: string;
+  wakeupRequestId: string;
+  agentId: string;
+  requestedAtUnixMs: number;
+}
 export interface FactoryProviderBinding {
   schema: "factory.provider-worker-binding.v2";
   provider: FactoryAdmissionProvider;
@@ -16,6 +26,7 @@ export interface FactoryProviderBinding {
   normalizedSessionId: string;
   runnerInstanceId: string;
   workerPlanSha256: string;
+  authorization: FactoryOwnRunAuthorization;
 }
 export interface FactoryPreparedReceipt {
   protocol: typeof FACTORY_PROVIDER_MARKER;
@@ -49,17 +60,19 @@ export interface FactoryControllerAdmission {
   bootId: string;
   createdUnixMs: number;
   admittedUntilUnixMs: number;
+  authorization: FactoryOwnRunAuthorization;
 }
 export interface FactorySignedAdmission {
   schema: typeof FACTORY_ADMISSION_SIGNED_SCHEMA;
   payload: string;
   signature: string;
 }
-const bindingKeys = ["schema", "provider", "admissionId", "capabilityId", "normalizedSessionId", "runnerInstanceId", "workerPlanSha256"];
+const authorizationKeys = ["schema", "actorType", "actorId", "actorEmail", "wakeupRequestId", "agentId", "requestedAtUnixMs"];
+const bindingKeys = ["schema", "provider", "admissionId", "capabilityId", "normalizedSessionId", "runnerInstanceId", "workerPlanSha256", "authorization"];
 const preparedKeys = ["protocol", "provider", "type", "status", "companyId", "runId", "leaseId", "sessionId", "ownerNonce", "bootId",
   "createdUnixMs", "deadlineUnixMs", "workerPlanSha256", "dispatchAttempted"];
 const admissionKeys = ["schema", "provider", "admissionId", "companyId", "capabilityId", "runId", "environmentLeaseId", "workerSessionId",
-  "normalizedSessionId", "runnerInstanceId", "workerOwnerNonce", "workerPlanSha256", "bootId", "createdUnixMs", "admittedUntilUnixMs"];
+  "normalizedSessionId", "runnerInstanceId", "workerOwnerNonce", "workerPlanSha256", "bootId", "createdUnixMs", "admittedUntilUnixMs", "authorization"];
 const ID = /^[A-Za-z0-9_.:@+-]{1,128}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 function invalid(): never { throw new Error("factory_provider_admission_invalid"); }
@@ -73,10 +86,20 @@ function provider(value: unknown): value is FactoryAdmissionProvider { return va
 function id(value: unknown): value is string { return typeof value === "string" && ID.test(value); }
 function integer(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value); }
 
+export function validateFactoryOwnRunAuthorization(value: unknown): asserts value is FactoryOwnRunAuthorization {
+  if (!exact(value, authorizationKeys) || value.schema !== "factory.direct-board-wakeup.v1" || value.actorType !== "user" ||
+      !id(value.actorId) || typeof value.actorEmail !== "string" || value.actorEmail.length > 254 ||
+      !/^[\x21-\x3f\x41-\x7e]+@[\x21-\x3f\x41-\x7e]+$/.test(value.actorEmail) ||
+      typeof value.wakeupRequestId !== "string" || !UUID.test(value.wakeupRequestId) ||
+      typeof value.agentId !== "string" || !UUID.test(value.agentId) ||
+      !integer(value.requestedAtUnixMs) || value.requestedAtUnixMs <= 0 || value.requestedAtUnixMs > Date.now()) invalid();
+}
+
 export function validateFactoryProviderBinding(value: unknown): asserts value is FactoryProviderBinding {
   if (!exact(value, bindingKeys) || value.schema !== "factory.provider-worker-binding.v2" || !provider(value.provider) ||
       ["admissionId", "capabilityId", "normalizedSessionId", "runnerInstanceId"].some(key => !id(value[key])) ||
       typeof value.workerPlanSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.workerPlanSha256)) invalid();
+  validateFactoryOwnRunAuthorization(value.authorization);
 }
 
 export function encodeFactoryProviderLaunch(descriptor: FactoryWorkerLeaseDescriptor, binding: FactoryProviderBinding,
@@ -119,7 +142,8 @@ export function createFactoryControllerAdmission(descriptor: FactoryWorkerLeaseD
     environmentLeaseId: descriptor.leaseId, workerSessionId: descriptor.sessionId,
     normalizedSessionId: binding.normalizedSessionId, runnerInstanceId: binding.runnerInstanceId,
     workerOwnerNonce: prepared.ownerNonce, workerPlanSha256: binding.workerPlanSha256,
-    bootId: prepared.bootId, createdUnixMs: prepared.createdUnixMs, admittedUntilUnixMs: descriptor.deadlineUnixMs };
+    bootId: prepared.bootId, createdUnixMs: prepared.createdUnixMs, admittedUntilUnixMs: descriptor.deadlineUnixMs,
+    authorization: structuredClone(binding.authorization) };
 }
 
 export function encodeFactoryControllerAdmission(value: FactoryControllerAdmission): Buffer {
@@ -131,7 +155,10 @@ export function encodeFactoryControllerAdmission(value: FactoryControllerAdmissi
       typeof value.bootId !== "string" || !UUID.test(value.bootId) || !integer(value.createdUnixMs) || value.createdUnixMs <= 0 ||
       value.createdUnixMs > Date.now() + 5000 || !integer(value.admittedUntilUnixMs) ||
       value.admittedUntilUnixMs <= Date.now() || value.admittedUntilUnixMs > Date.now() + 300000) invalid();
-  return Buffer.from(JSON.stringify(Object.fromEntries([...admissionKeys].sort().map(key => [key, value[key as keyof FactoryControllerAdmission]]))) + "\n");
+  validateFactoryOwnRunAuthorization(value.authorization);
+  const authorization = Object.fromEntries([...authorizationKeys].sort().map(key => [key, value.authorization[key as keyof FactoryOwnRunAuthorization]]));
+  return Buffer.from(JSON.stringify(Object.fromEntries([...admissionKeys].sort().map(key =>
+    [key, key === "authorization" ? authorization : value[key as keyof FactoryControllerAdmission]]))) + "\n");
 }
 
 type StartSigner = (args: readonly string[], environment: NodeJS.ProcessEnv) => ChildProcessWithoutNullStreams;

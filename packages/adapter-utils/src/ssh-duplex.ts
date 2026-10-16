@@ -27,6 +27,8 @@ export interface SshDuplexOpenInput {
   workerLease?: FactoryWorkerLeaseDescriptor;
   /** Explicit provider opt-in from authorized runtime metadata; never a default. */
   providerAdmission?: FactoryProviderBinding;
+  /** Controller-owned DB check; never serialized into the worker launch. */
+  revalidateProviderAdmission?: () => Promise<void>;
   environment?: Readonly<Record<string, string>>;
 }
 
@@ -83,6 +85,7 @@ export async function openDedicatedSshDuplex(
   // in the SSH command string, receipt or diagnostics.
   const workerLease = input.workerLease ? structuredClone(input.workerLease) : undefined;
   const providerAdmission = input.providerAdmission ? structuredClone(input.providerAdmission) : undefined;
+  const revalidateProviderAdmission = input.revalidateProviderAdmission;
   if (providerAdmission && !workerLease) throw new Error("factory_provider_requires_worker_lease");
   if (workerLease && config.remoteCwd !== workerLease.workspaceRoot) {
     throw new Error("factory_worker_lease_cwd_mismatch");
@@ -117,7 +120,8 @@ export async function openDedicatedSshDuplex(
     // carries work; EOF on this owning channel cancels the worker namespace.
     if (workerLease && providerAdmission && header) {
       return await admitFactoryProviderLease(channel, workerLease, providerAdmission, header,
-        (record, signal) => signFactoryControllerAdmission(record, keyPath, signal), { signal: input.signal });
+        (record, signal) => signFactoryControllerAdmission(record, keyPath, signal),
+        { signal: input.signal, beforeSign: revalidateProviderAdmission });
     }
     return workerLease && header ? await admitFactoryWorkerLease(channel, workerLease, header) : channel;
   } catch (error) {

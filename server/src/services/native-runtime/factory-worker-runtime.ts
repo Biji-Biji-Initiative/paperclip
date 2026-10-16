@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { environmentLeases, environments, executionWorkspaces, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, authUsers, environmentLeases, environments, executionWorkspaces, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget, AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, createFactoryWorkerLeaseDescriptor,
   type FactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
@@ -8,7 +8,7 @@ import { hasFactoryBusyReceipt } from "./factory-worker-capacity.js";
 import { validateDedicatedSshTarget } from "@paperclipai/adapter-utils/ssh-duplex";
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import { randomUUID } from "node:crypto";
-import { validateFactoryProviderBinding, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
+import { validateFactoryOwnRunAuthorization, validateFactoryProviderBinding, type FactoryOwnRunAuthorization, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
 
 export interface FactoryWorkerAttempt {
   readonly runId: string;
@@ -114,6 +114,34 @@ function descriptor(input: {
     workspaceRoot: input.target.remoteCwd, deadlineUnixMs });
 }
 
+/** The manual marker is stripped from caller payloads and minted by authenticated board wake routes. */
+export async function readFactoryOwnRunAuthorization(db: Db, binding: NativeExecutionInput["binding"]): Promise<FactoryOwnRunAuthorization> {
+  const fail = (): never => { throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified"); };
+  const [row] = await db.select({ run: heartbeatRuns, wake: agentWakeupRequests,
+    user: { id: authUsers.id, email: authUsers.email } }).from(heartbeatRuns).innerJoin(agentWakeupRequests, and(
+    eq(agentWakeupRequests.id, heartbeatRuns.wakeupRequestId), eq(agentWakeupRequests.companyId, heartbeatRuns.companyId),
+    eq(agentWakeupRequests.agentId, heartbeatRuns.agentId), eq(agentWakeupRequests.runId, heartbeatRuns.id),
+  )).innerJoin(authUsers, eq(authUsers.id, agentWakeupRequests.requestedByActorId)).where(and(
+    eq(heartbeatRuns.id, binding.runId), eq(heartbeatRuns.companyId, binding.companyId),
+    eq(heartbeatRuns.agentId, binding.agentId),
+  ));
+  if (!row) fail();
+  const { run, wake, user } = row!;
+  if (!run || !run.wakeupRequestId || run.status !== "running" || run.runtimeMode !== "native" ||
+      run.invocationSource !== "on_demand" || run.triggerDetail !== "manual" || run.retryOfRunId !== null ||
+      (run.continuationAttempt ?? 0) !== 0 || (run.processLossRetryCount ?? 0) !== 0 ||
+      (run.scheduledRetryAttempt ?? 0) !== 0) fail();
+  if (!wake || wake.status !== "claimed" || wake.finishedAt !== null || wake.coalescedCount !== 0 ||
+      wake.source !== "on_demand" || wake.triggerDetail !== "manual" || wake.payload?.manualUserWake !== true ||
+      wake.requestedByActorType !== "user" || !wake.requestedByActorId) fail();
+  if (!user || user.id !== wake!.requestedByActorId) fail();
+  const authorization: FactoryOwnRunAuthorization = { schema: "factory.direct-board-wakeup.v1", actorType: "user",
+    actorId: user!.id, actorEmail: user!.email, wakeupRequestId: wake!.id, agentId: binding.agentId,
+    requestedAtUnixMs: wake!.requestedAt.getTime() };
+  try { validateFactoryOwnRunAuthorization(authorization); } catch { fail(); }
+  return authorization;
+}
+
 /** One DB-current, post-staging authorization; caller supplies actual native identity. */
 export async function createAuthorizedFactoryWorkerAdmission(input: {
   db: Db; execution: NativeExecutionInput; target: AdapterSshExecutionTarget; sessionId: string;
@@ -141,7 +169,15 @@ export async function createAuthorizedFactoryWorkerAdmission(input: {
     schema: "factory.provider-worker-binding.v2", provider: "codex",
     admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: nativeSession,
     runnerInstanceId: attempt.runnerInstanceId, workerPlanSha256: providerMode.workerPlanSha256,
+    authorization: await readFactoryOwnRunAuthorization(input.db, attempt.execution.binding),
   };
   validateFactoryProviderBinding(providerAdmission);
-  return { workerLease, providerAdmission };
+  const frozenAuthorization = JSON.stringify(providerAdmission.authorization);
+  return { workerLease, providerAdmission, revalidateProviderAdmission: async (): Promise<void> => {
+    // Re-run all native identity, enrollment, lease and originating-wake checks
+    // after the worker's prepared challenge, immediately before signing.
+    const current = await createAuthorizedFactoryWorkerAdmission(attempt);
+    if (!current.providerAdmission || JSON.stringify(current.providerAdmission.authorization) !== frozenAuthorization ||
+        workerLease.deadlineUnixMs <= Date.now()) fail();
+  } };
 }

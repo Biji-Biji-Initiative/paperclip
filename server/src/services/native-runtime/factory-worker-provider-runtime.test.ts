@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { environmentLeases, environments, executionWorkspaces, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agentWakeupRequests, authUsers, environmentLeases, environments, executionWorkspaces, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
@@ -23,14 +23,22 @@ function fixture(mode = true) {
     remoteCwd: cwd, spec: { host: config.host, port: config.port, username: config.username, remoteCwd: cwd, remoteWorkspacePath: cwd,
       knownHosts: config.knownHosts, strictHostKeyChecking: true, privateKey: "synthetic-not-read" } };
   const run = { id: runId, companyId: FACTORY_COMPANY_ID, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
+    wakeupRequestId: randomUUID(), invocationSource: "on_demand", triggerDetail: "manual", retryOfRunId: null,
     runnerInstanceId, runnerProfileJson: { nativeExecutionInput: structuredClone(execution) }, executionControlDeadlineAt: new Date(Date.now() + 60_000) };
   const lease = { id: leaseId, environmentId, heartbeatRunId: runId, executionWorkspaceId: workspaceId, issueId,
     status: "active", provider: "ssh", releasedAt: null, expiresAt: null, metadata: { remoteCwd: cwd } };
   const environment = { driver: "ssh", status: "active", config };
+  const wake = { id: run.wakeupRequestId, companyId: FACTORY_COMPANY_ID, agentId, runId, status: "claimed", finishedAt: null,
+    coalescedCount: 0, source: "on_demand", triggerDetail: "manual", payload: { manualUserWake: true },
+    requestedByActorType: "user", requestedByActorId: "synthetic-user", requestedAt: new Date(Date.now() - 1000) };
+  const user = { id: "synthetic-user", email: "synthetic@example.invalid" };
   const rows = new Map<unknown, unknown>([[heartbeatRuns, run], [environmentLeases, lease],
-    [environments, environment], [executionWorkspaces, { status: "active" }]]);
-  const db = { select: () => ({ from: (table: unknown) => ({ where: async () => [rows.get(table)] }) }) } as unknown as Db;
-  return { db, execution, target, sessionId, runnerInstanceId, run, lease, environment };
+    [environments, environment], [executionWorkspaces, { status: "active" }], [agentWakeupRequests, wake], [authUsers, user]]);
+  const db = { select: () => ({ from: (table: unknown) => {
+    const joined = { innerJoin: () => joined, where: async () => [{ run, wake, user }] };
+    return { where: async () => [rows.get(table)], innerJoin: () => joined };
+  } }) } as unknown as Db;
+  return { db, execution, target, sessionId, runnerInstanceId, run, lease, environment, wake, user };
 }
 
 describe("Factory provider DB-current admission", () => {
@@ -48,6 +56,26 @@ describe("Factory provider DB-current admission", () => {
     expect(a.providerAdmission!.admissionId).not.toBe(b.providerAdmission!.admissionId);
     expect(a.providerAdmission!.capabilityId).not.toBe(b.providerAdmission!.capabilityId);
     expect(a.workerLease.deadlineUnixMs).toBe(f.run.executionControlDeadlineAt.getTime());
+    expect(a.providerAdmission!.authorization).toEqual({ schema: "factory.direct-board-wakeup.v1", actorType: "user",
+      actorId: f.user.id, actorEmail: f.user.email, wakeupRequestId: f.wake.id, agentId: f.run.agentId,
+      requestedAtUnixMs: f.wake.requestedAt.getTime() });
+    await expect(a.revalidateProviderAdmission!()).resolves.toBeUndefined();
+    f.user.email = "changed@example.invalid";
+    await expect(a.revalidateProviderAdmission!()).rejects.toThrow("native_execution_ownership_unverified");
+  });
+  it("rechecks source wake cancellation, actor identity and current lease before signing", async () => {
+    for (const change of [
+      (f: ReturnType<typeof fixture>) => { f.wake.status = "cancelled"; },
+      (f: ReturnType<typeof fixture>) => { f.wake.payload.manualUserWake = false; },
+      (f: ReturnType<typeof fixture>) => { f.wake.requestedByActorType = "agent"; },
+      (f: ReturnType<typeof fixture>) => { f.wake.requestedByActorId = "different-user"; },
+      (f: ReturnType<typeof fixture>) => { f.wake.coalescedCount = 1; },
+      (f: ReturnType<typeof fixture>) => { f.lease.status = "released"; },
+    ]) {
+      const f = fixture(), admitted = await createAuthorizedFactoryWorkerAdmission(f);
+      change(f);
+      await expect(admitted.revalidateProviderAdmission!()).rejects.toThrow("native_execution_ownership_unverified");
+    }
   });
   it.each(["registration", "execution", "stored execution"])("keeps %s Codex-only despite the low-level Claude v2 contract", async boundary => {
     const f = fixture();

@@ -16,12 +16,15 @@ function fixture() {
   const workerLease = createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID, runId, leaseId,
     workspaceId, workspaceRoot, sessionId, deadlineUnixMs: Date.now() + 60_000 });
   const providerAdmission: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v2", provider: "codex",
-    admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: sessionId, runnerInstanceId, workerPlanSha256: "a".repeat(64) };
+    admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: sessionId, runnerInstanceId, workerPlanSha256: "a".repeat(64),
+    authorization: { schema: "factory.direct-board-wakeup.v1", actorType: "user", actorId: "synthetic-user", actorEmail: "synthetic@example.invalid",
+      wakeupRequestId: randomUUID(), agentId: randomUUID(), requestedAtUnixMs: Date.now() - 1000 } };
   const owner = new NativeSshForegroundOwner({ directory, runId, runnerInstanceId, ownershipError: () => new Error("ownership-held") });
   const remoteBinary = workspaceRoot + "/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd";
   const spec = { command: remoteBinary, cwd: workspaceRoot, environment: {}, args: ["--run-id", runId,
     "--environment-lease-id", leaseId, "--session-id", sessionId, "--runner-id", runnerInstanceId] };
-  return { owner, workerLease, providerAdmission, remoteBinary, spec };
+  const revalidateProviderAdmission = vi.fn(async () => {});
+  return { owner, workerLease, providerAdmission, remoteBinary, spec, revalidateProviderAdmission };
 }
 
 describe("post-staging Factory provider caller", () => {
@@ -31,11 +34,13 @@ describe("post-staging Factory provider caller", () => {
     const launch = f.owner.createLauncher({ runner: { openDuplexChannel }, remoteBinary: f.remoteBinary,
       remoteCwd: f.workerLease.workspaceRoot, diagnosticsDirectory: f.workerLease.diagnosticsDirectory,
       ensureArtifact: async () => { events.push("stage"); }, createWorkerAdmission: async () => {
-        events.push("authorize"); return { workerLease: f.workerLease, providerAdmission: f.providerAdmission };
+        events.push("authorize"); return { workerLease: f.workerLease, providerAdmission: f.providerAdmission,
+          revalidateProviderAdmission: f.revalidateProviderAdmission };
       } });
     await expect(launch(f.spec).completion).rejects.toBeInstanceOf(FactoryWorkerBusyError);
     expect(events).toEqual(["stage", "authorize", "open"]);
     expect(openDuplexChannel.mock.calls[0]?.[0]).toMatchObject({ workerLease: f.workerLease, providerAdmission: f.providerAdmission });
+    expect(openDuplexChannel.mock.calls[0]?.[0]).toHaveProperty("revalidateProviderAdmission", f.revalidateProviderAdmission);
   });
   it("rejects substituted runner/argv before transport", async () => {
     for (const substitute of ["owner", "argv"]) {
@@ -44,10 +49,19 @@ describe("post-staging Factory provider caller", () => {
       else f.spec.args[3] = randomUUID();
       const launch = f.owner.createLauncher({ runner: { openDuplexChannel }, remoteBinary: f.remoteBinary,
         remoteCwd: f.workerLease.workspaceRoot, diagnosticsDirectory: f.workerLease.diagnosticsDirectory,
-        ensureArtifact: async () => {}, createWorkerAdmission: async () => ({ workerLease: f.workerLease, providerAdmission: f.providerAdmission }) });
+        ensureArtifact: async () => {}, createWorkerAdmission: async () => ({ workerLease: f.workerLease, providerAdmission: f.providerAdmission,
+          revalidateProviderAdmission: f.revalidateProviderAdmission }) });
       await expect(launch(f.spec).completion).rejects.toThrow("ownership-held");
       expect(openDuplexChannel).not.toHaveBeenCalled();
     }
+  });
+  it("refuses a provider admission lacking controller-owned pre-sign revalidation", async () => {
+    const f = fixture(), openDuplexChannel = vi.fn();
+    const launch = f.owner.createLauncher({ runner: { openDuplexChannel }, remoteBinary: f.remoteBinary,
+      remoteCwd: f.workerLease.workspaceRoot, diagnosticsDirectory: f.workerLease.diagnosticsDirectory,
+      ensureArtifact: async () => {}, createWorkerAdmission: async () => ({ workerLease: f.workerLease, providerAdmission: f.providerAdmission }) });
+    await expect(launch(f.spec).completion).rejects.toThrow("ownership-held");
+    expect(openDuplexChannel).not.toHaveBeenCalled();
   });
   it("keeps legacy callback free of provider binding", async () => {
     const f = fixture(), openDuplexChannel = vi.fn(async (_input: unknown) => { throw new FactoryWorkerBusyError(); });

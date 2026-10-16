@@ -11,7 +11,9 @@ function fixture() {
   const descriptor = createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID, runId: randomUUID(), leaseId: randomUUID(),
     workspaceId, workspaceRoot: `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`, sessionId: "worker-session", deadlineUnixMs: Date.now() + 60000 });
   const binding: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v2", provider: "codex", admissionId: randomUUID(),
-    capabilityId: randomUUID(), normalizedSessionId: "native-session", runnerInstanceId: "runner-fixture", workerPlanSha256: "a".repeat(64) };
+    capabilityId: randomUUID(), normalizedSessionId: "native-session", runnerInstanceId: "runner-fixture", workerPlanSha256: "a".repeat(64),
+    authorization: { schema: "factory.direct-board-wakeup.v1", actorType: "user", actorId: "synthetic-user", actorEmail: "synthetic@example.invalid",
+      wakeupRequestId: randomUUID(), agentId: randomUUID(), requestedAtUnixMs: Date.now() - 1000 } };
   const prepared = { protocol: FACTORY_PROVIDER_MARKER, provider: binding.provider, type: "preparation", status: "prepared", companyId: descriptor.companyId,
     runId: descriptor.runId, leaseId: descriptor.leaseId, sessionId: descriptor.sessionId, ownerNonce: "b".repeat(32), bootId: randomUUID(),
     createdUnixMs: Date.now(), deadlineUnixMs: descriptor.deadlineUnixMs, workerPlanSha256: binding.workerPlanSha256, dispatchAttempted: false };
@@ -39,6 +41,30 @@ function signed(record: FactoryControllerAdmission) {
 }
 
 describe("explicit preparing → signed admission → dispatch handshake", () => {
+  it("revalidates controller-owned authority after prepared and before signing", async () => {
+    const f = fixture(), raw = rawChannel(), order: string[] = [];
+    raw.writeHook(count => queueMicrotask(() => raw.send(count === 1 ? f.prepared : f.accepted)));
+    const beforeSign = vi.fn(async () => { order.push("revalidate"); });
+    const sign = vi.fn(async (record: FactoryControllerAdmission) => { order.push("sign"); return signed(record); });
+    await admitFactoryProviderLease(raw.raw, f.descriptor, f.binding, f.header, sign, { beforeSign });
+    expect(order).toEqual(["revalidate", "sign"]);
+    expect(beforeSign).toHaveBeenCalledOnce();
+  });
+  it("revocation or owner exit during revalidation never signs or sends admission", async () => {
+    for (const mode of ["revoked", "exited"] as const) {
+      const f = fixture(), raw = rawChannel(), sign = vi.fn(async (record: FactoryControllerAdmission) => signed(record));
+      raw.writeHook(() => queueMicrotask(() => raw.send(f.prepared)));
+      const beforeSign = async () => {
+        if (mode === "revoked") throw new Error("SYNTHETIC_PRIVATE_DB_ERROR");
+        raw.finish({ exitCode: 76 });
+        return new Promise<void>(() => {});
+      };
+      await expect(admitFactoryProviderLease(raw.raw, f.descriptor, f.binding, f.header, sign, { beforeSign }))
+        .rejects.toThrow("transport_unverified");
+      expect(sign).not.toHaveBeenCalled(); expect(raw.writes).toHaveLength(1);
+      expect(raw.stop).toHaveBeenCalled(); expect(raw.close).toHaveBeenCalled();
+    }
+  });
   it.each(["codex", "claude"] as const)("accepts split %s preparation, signs metadata only, and preserves coalesced completion", async provider => {
     const f = fixture(), raw = rawChannel();
     f.binding.provider = provider; f.prepared.provider = provider;
