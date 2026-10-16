@@ -94,6 +94,7 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
+import { NativeSshForegroundOwner } from "./native-ssh-foreground-owner.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import {
   resolvePaperclipRunnerTransport,
@@ -10738,6 +10739,7 @@ async function createRunnerdBackendWithinSessionClaim(
       ? createNativeSshCommandRunner({
           spec: remoteTarget.spec,
           defaultCwd: remoteTarget.remoteCwd,
+          executionMode: "owned_foreground",
         })
       : remoteTarget.runner
     : null;
@@ -10745,6 +10747,20 @@ async function createRunnerdBackendWithinSessionClaim(
     throw new Error(
       "runner_transport_ineligible: remote process runner is unavailable",
     );
+  }
+  const sshForegroundOwner = remoteTarget?.transport === "ssh"
+    ? new NativeSshForegroundOwner({
+        directory: runnerdStateRoot(input.execution),
+        runId: input.execution.binding.runId,
+        runnerInstanceId: input.runnerInstanceId,
+        ownershipError: () => new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified"),
+      })
+    : null;
+  // The SSH channel cannot be adopted across controller processes. A stale
+  // receipt or automatic recovery request is a hold, never a PID-based replay.
+  sshForegroundOwner?.assertAvailable();
+  if (sshForegroundOwner && (input.restartRecovery || retainedTransition)) {
+    throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
   }
   const currentWakeComments = await resolveCurrentWakeCommentsBinding(
     input.db,
@@ -12087,7 +12103,7 @@ async function createRunnerdBackendWithinSessionClaim(
     );
   };
 
-  const checkpointRemoteRunner = async (
+  const checkpointRemoteRunnerState = async (
     settlement: "settled" | "unsettled",
   ) => {
     if (
@@ -12259,6 +12275,11 @@ async function createRunnerdBackendWithinSessionClaim(
     }
   };
 
+  const checkpointRemoteRunner = (settlement: "settled" | "unsettled") =>
+    sshForegroundOwner
+      ? sshForegroundOwner.checkpoint(settlement, () => checkpointRemoteRunnerState(settlement))
+      : checkpointRemoteRunnerState(settlement);
+
   const prepareExternalRunnerState =
     remoteTarget && remoteCommandRunner
       ? async () => {
@@ -12321,7 +12342,16 @@ async function createRunnerdBackendWithinSessionClaim(
 
   const remoteProcessLauncher =
     remoteTarget && remoteCommandRunner && remoteBinary && remoteStateDirectory
-      ? createRemoteRunnerProcessLauncher({
+      ? sshForegroundOwner
+        ? sshForegroundOwner.createLauncher({
+            runner: remoteCommandRunner,
+            remoteBinary,
+            remoteCwd: remoteTarget.remoteCwd,
+            diagnosticsDirectory: posix.join(remoteSessionRoot!, "diagnostics"),
+            ensureArtifact: ensureRemoteRunner,
+            onDispatched: () => resolveRemoteRunnerProcessSpawned?.(),
+          })
+        : createRemoteRunnerProcessLauncher({
           target: remoteTarget,
           runner: remoteCommandRunner,
           remoteBinary,
@@ -12389,6 +12419,7 @@ async function createRunnerdBackendWithinSessionClaim(
         PAPERCLIP_WORKSPACE_CWD: input.execution.workspace.cwd,
       };
   const archiveContinuityState = async () => {
+    sshForegroundOwner?.assertAvailable();
     if (hasRetainedWarmTransitionEvidence(root)) {
       throw new Error("native_runner_warm_transition_recovery_unproven");
     }

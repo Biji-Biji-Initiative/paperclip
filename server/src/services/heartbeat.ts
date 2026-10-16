@@ -327,6 +327,7 @@ import {
   NativeRunnerOwnershipUnverifiedError,
   isNativeRunnerOwnershipHeld,
   nativeRunnerOwnershipNotHeldCondition,
+  requiresDurableNativeOwnershipHold,
   NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
 } from "./native-runtime/native-runner-ownership.js";
 import {
@@ -18990,15 +18991,12 @@ export function heartbeatService(
       reason:
         | "live_process_identifier"
         | "observed_owner_unverified"
-        | "adopted_runner_authentication_timeout"
-        | "native_chat_workspace_scope_mismatch";
+        | NativeRunnerOwnershipUnverifiedError["reason"];
       processPidAlive?: boolean;
       processGroupAlive?: boolean;
     },
   ) {
-    const durableOwnershipHold =
-      evidence.reason === "adopted_runner_authentication_timeout" ||
-      evidence.reason === "native_chat_workspace_scope_mismatch";
+    const durableOwnershipHold = requiresDurableNativeOwnershipHold(evidence.reason);
     if (
       run.errorCode === NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE &&
       run.error === NATIVE_OWNERSHIP_UNVERIFIED_MESSAGE &&

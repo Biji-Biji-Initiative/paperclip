@@ -11,11 +11,21 @@ export class NativeRunnerOwnershipUnverifiedError extends Error {
   constructor(
     readonly reason:
       | "adopted_runner_authentication_timeout"
+      | "ssh_foreground_ownership_unverified"
       | "native_chat_workspace_scope_mismatch" = "adopted_runner_authentication_timeout",
   ) {
     super(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
     this.name = "NativeRunnerOwnershipUnverifiedError";
   }
+}
+
+/** Transport uncertainty must survive a reaper finding no local process. */
+export function requiresDurableNativeOwnershipHold(
+  reason: NativeRunnerOwnershipUnverifiedError["reason"]
+    | "live_process_identifier"
+    | "observed_owner_unverified",
+): boolean {
+  return reason !== "live_process_identifier" && reason !== "observed_owner_unverified";
 }
 
 export function isNativeRunnerOwnershipHeld(run: {

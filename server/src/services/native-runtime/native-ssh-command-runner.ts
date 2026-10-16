@@ -3,7 +3,7 @@ import { MAX_REMOTE_DELIVERABLE_BYTES } from "./remote-deliverable-file.js";
 
 /** The command transport used by a native session on an operator-bound SSH host. */
 export function createNativeSshCommandRunner(
-  input: Pick<Parameters<typeof createSshCommandManagedRuntimeRunner>[0], "spec" | "defaultCwd">,
+  input: Pick<Parameters<typeof createSshCommandManagedRuntimeRunner>[0], "spec" | "defaultCwd" | "executionMode">,
 ) {
   return createSshCommandManagedRuntimeRunner({
     ...input,

@@ -31,6 +31,8 @@ import type { DirectorySnapshot } from "./workspace-restore-merge.js";
  */
 export interface DuplexChannelOpenInput {
   command: readonly string[];
+  /** Honored by native SSH foreground ownership; not a new sandbox capability. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -44,6 +46,8 @@ export interface CommandManagedDuplexChannel {
   write(data: Uint8Array): void;
   /** Registers the one data listener. The channel streams each raw byte chunk in order. */
   onData(listener: (chunk: Uint8Array) => void): void;
+  /** Optional separate diagnostics stream; the protocol data stream stays exact. */
+  onStderr?(listener: (chunk: Uint8Array) => void): void;
   /**
    * Registers the one exit listener. The channel calls it one time with the exit.
    * A numeric `exitCode` is a real process exit. `transportClosed` is true when the
@@ -118,9 +122,9 @@ export interface CommandManagedRuntimeRunner {
   /**
    * Optional persistent duplex channel. Present only when the sandbox provider's
    * effective capability grants `duplexCommandStream`. The runner opens one
-   * bidirectional channel to a long-lived command in the sandbox. The SSH runner
-   * and every provider without the capability omit the member, so a caller gates
-   * on its presence in the same style as {@link syncIn}/{@link syncOut}.
+   * bidirectional channel to a long-lived command in the sandbox. Native SSH
+   * owned-foreground mode also exposes it. Generic SSH and providers without
+   * the capability omit it; callers must never silently detach as a fallback.
    *
    * HTTP/2 is the preferred transport. `queue_v1` is the soft-deprecated fallback.
    */

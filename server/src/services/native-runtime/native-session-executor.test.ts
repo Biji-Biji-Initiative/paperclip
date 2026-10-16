@@ -8620,8 +8620,8 @@ describe("runnerd provider runtime wiring", () => {
             username: "runner",
             remoteWorkspacePath: remoteCwd,
             remoteCwd,
-            privateKey: null,
-            knownHosts: null,
+            privateKey: "fixture-dedicated-key-not-used-for-network",
+            knownHosts: "fixture-pinned-host-not-used-for-network",
             strictHostKeyChecking: true,
           },
         },
@@ -11127,8 +11127,8 @@ describe("runnerd provider runtime wiring", () => {
           username: "runner",
           remoteWorkspacePath: remoteCwd,
           remoteCwd,
-          privateKey: null,
-          knownHosts: null,
+          privateKey: "fixture-dedicated-key-not-used-for-network",
+          knownHosts: "fixture-pinned-host-not-used-for-network",
           strictHostKeyChecking: true,
         },
       },
@@ -11481,6 +11481,24 @@ describe("runnerd provider runtime wiring", () => {
     ).toBe(false);
   });
 
+  it("rejects a native SSH backend without its dedicated identity and host pin", async () => {
+    state.createBackend.mockClear();
+    await expect(createRunnerdBackend({
+      db: leaseDb(execution),
+      execution,
+      runnerInstanceId: "runner-missing-ssh-authority",
+      runnerExecutionTarget: {
+        kind: "remote", transport: "ssh", remoteCwd: "/workspace",
+        spec: {
+          host: "runner.internal", port: 22, username: "runner",
+          remoteWorkspacePath: "/workspace", remoteCwd: "/workspace",
+          privateKey: null, knownHosts: null, strictHostKeyChecking: true,
+        },
+      },
+    })).rejects.toThrow("Native SSH requires an explicit target, dedicated key and pinned known-hosts");
+    expect(state.createBackend).not.toHaveBeenCalled();
+  });
+
   it("binds a remote launch to the configured controller-owned runner artifact", async () => {
     const remoteCwd = "/home/daytona/paperclip-workspace";
     const controllerArtifact = "/controller/artifacts/paperclip-runnerd";
@@ -11504,8 +11522,8 @@ describe("runnerd provider runtime wiring", () => {
           username: "runner",
           remoteWorkspacePath: remoteCwd,
           remoteCwd,
-          privateKey: null,
-          knownHosts: null,
+          privateKey: "fixture-dedicated-key-not-used-for-network",
+          knownHosts: "fixture-pinned-host-not-used-for-network",
           strictHostKeyChecking: true,
         },
       },
@@ -11515,7 +11533,10 @@ describe("runnerd provider runtime wiring", () => {
     state.createTransport.mockClear();
     state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
     expect(state.createTransport).toHaveBeenCalledWith(
-      expect.objectContaining({ runnerBinary: controllerArtifact }),
+      expect.objectContaining({
+        runnerBinary: controllerArtifact,
+        runnerProcessLauncher: expect.any(Function),
+      }),
     );
   });
 
@@ -11556,8 +11577,8 @@ describe("runnerd provider runtime wiring", () => {
               username: "runner",
               remoteWorkspacePath: remoteCwd,
               remoteCwd,
-              privateKey: null,
-              knownHosts: null,
+              privateKey: "fixture-dedicated-key-not-used-for-network",
+              knownHosts: "fixture-pinned-host-not-used-for-network",
               strictHostKeyChecking: true,
             },
           },

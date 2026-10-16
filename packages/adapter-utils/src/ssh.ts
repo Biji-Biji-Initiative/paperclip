@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { buildSshArgvCommand } from "./ssh-command.js";
+import { openDedicatedSshDuplex, runDedicatedSshCommand, validateDedicatedSshTarget } from "./ssh-duplex.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -45,6 +47,8 @@ export function createSshCommandManagedRuntimeRunner(input: {
   spec: SshRemoteExecutionSpec;
   defaultCwd?: string | null;
   maxBufferBytes?: number | null;
+  /** Native owned workers opt in; generic host profiles retain their behavior. */
+  executionMode?: "generic" | "owned_foreground";
 }): CommandManagedRuntimeRunner {
   const defaultCwd = input.defaultCwd?.trim() || input.spec.remoteCwd;
   const maxBufferBytes =
@@ -52,24 +56,32 @@ export function createSshCommandManagedRuntimeRunner(input: {
       ? Math.trunc(input.maxBufferBytes)
       : 1024 * 1024;
 
+  if (input.executionMode === "owned_foreground") {
+    validateDedicatedSshTarget(input.spec);
+    return {
+      execute: async (commandInput): Promise<RunProcessResult> => {
+        const result = await runDedicatedSshCommand(input.spec, {
+          ...commandInput,
+          cwd: commandInput.cwd ?? defaultCwd,
+          maxBufferBytes,
+        });
+        if (result.stdout) await commandInput.onLog?.("stdout", result.stdout);
+        if (result.stderr) await commandInput.onLog?.("stderr", result.stderr);
+        return result;
+      },
+      openDuplexChannel: (channelInput) => openDedicatedSshDuplex(input.spec, channelInput),
+    };
+  }
+
   return {
     execute: async (commandInput): Promise<RunProcessResult> => {
       const startedAt = new Date().toISOString();
-      const command = commandInput.command.trim();
-      const args = commandInput.args ?? [];
-      const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
-        .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-      for (const [key] of envEntries) {
-        if (!isValidShellEnvKey(key)) {
-          throw new Error(`Invalid SSH environment variable key: ${key}`);
-        }
-      }
-      const envPrefix = envEntries.length > 0
-        ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
-        : "";
-      const commandScript = [command, ...args].map(shellQuote).join(" ");
-      const remoteCommand = `cd ${shellQuote(cwd)} && exec ${envPrefix}${commandScript}`;
+      const remoteCommand = buildSshArgvCommand({
+        command: commandInput.command,
+        args: commandInput.args,
+        cwd: commandInput.cwd ?? defaultCwd,
+        env: commandInput.env,
+      });
 
       try {
         const result = await runSshCommand(input.spec, remoteCommand, {
