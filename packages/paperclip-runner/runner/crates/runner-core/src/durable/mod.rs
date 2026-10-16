@@ -1,3 +1,4 @@
+mod connect_proxy;
 mod runner;
 mod state;
 mod transport;

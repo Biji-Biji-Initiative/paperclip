@@ -97,6 +97,7 @@ export const FACTORY_LEASE_FIXED_ENV: Readonly<Record<string, string>> = Object.
   TMPDIR: "/tmp", TMP: "/tmp", TEMP: "/tmp",
   HTTP_PROXY: "http://factory-gateway:3128", HTTPS_PROXY: "http://factory-gateway:3128",
   http_proxy: "http://factory-gateway:3128", https_proxy: "http://factory-gateway:3128",
+  PAPERCLIP_RUNNER_CONNECT_PROXY: "http://factory-gateway:3128",
   NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1",
 });
 const homeKeys = new Set(["HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"]);

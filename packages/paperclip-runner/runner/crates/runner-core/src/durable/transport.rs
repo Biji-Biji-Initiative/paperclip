@@ -18,6 +18,7 @@ use tungstenite::protocol::WebSocketConfig;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{accept_hdr_with_config, client_tls_with_config, Connector, Message, WebSocket};
 
+use super::connect_proxy;
 use super::state::{open_private_regular_file, Command, DurableState};
 use super::{
     BootstrapTicket, DurableRunnerConfig, DurableRunnerError, Secret, PROTOCOL,
@@ -49,14 +50,41 @@ pub(crate) struct ResolvedWsTarget {
     authority: String,
     path: String,
     addresses: Vec<SocketAddr>,
+    connect_authority: Option<String>,
 }
 
 impl ResolvedWsTarget {
     pub(crate) fn resolve(input: &str) -> Result<Self, DurableRunnerError> {
-        resolve_ws_target_with(input, |host, port| {
-            (host, port)
-                .to_socket_addrs()
-                .map(|addresses| addresses.collect())
+        let proxy = std::env::var(connect_proxy::ENV)
+            .map(Some)
+            .or_else(|error| match error {
+                std::env::VarError::NotPresent => Ok(None),
+                _ => Err(DurableRunnerError::invalid(
+                    "runner CONNECT proxy is not valid UTF-8",
+                )),
+            })?;
+        if proxy.is_none() {
+            return resolve_ws_target_with(input, |host, port| {
+                (host, port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.collect())
+            });
+        }
+        resolve_ws_target_via_proxy_with(input, proxy.as_deref(), |host, port| {
+            // Resolve once, pin the returned addresses, and bound proxy DNS independently.
+            let host = host.to_owned();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            thread::spawn(move || {
+                let result = (host.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|addresses| addresses.take(33).collect());
+                let _ = sender.send(result);
+            });
+            receiver
+                .recv_timeout(CONNECT_ATTEMPT_TIMEOUT)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "proxy DNS deadline elapsed")
+                })?
         })
     }
 
@@ -145,6 +173,45 @@ fn parse_ws_url(input: &str) -> Result<ParsedWsUrl, DurableRunnerError> {
     })
 }
 
+fn resolve_ws_target_via_proxy_with<F>(
+    input: &str,
+    proxy: Option<&str>,
+    resolver: F,
+) -> Result<ResolvedWsTarget, DurableRunnerError>
+where
+    F: FnOnce(&str, u16) -> io::Result<Vec<SocketAddr>>,
+{
+    let Some(proxy) = proxy else {
+        return resolve_ws_target_with(input, resolver);
+    };
+    let parsed = parse_ws_url(input)?;
+    if !parsed.secure {
+        return Err(DurableRunnerError::invalid(
+            "runner CONNECT proxy requires wss://",
+        ));
+    }
+    let authority = connect_proxy::destination(&parsed.authority, parsed.port)
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+    let (host, port) = connect_proxy::parse_proxy(proxy)
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+    let mut addresses = resolver(&host, port)
+        .map_err(|_| DurableRunnerError::invalid("failed to resolve runner CONNECT proxy"))?;
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.is_empty() || addresses.len() > 32 {
+        return Err(DurableRunnerError::invalid(
+            "runner CONNECT proxy requires 1..32 pinned addresses",
+        ));
+    }
+    Ok(ResolvedWsTarget {
+        secure: true,
+        authority: parsed.authority,
+        path: parsed.path,
+        addresses,
+        connect_authority: Some(authority),
+    })
+}
+
 fn resolve_ws_target_with<F>(
     input: &str,
     resolver: F,
@@ -173,6 +240,7 @@ where
         authority: parsed.authority,
         path: parsed.path,
         addresses,
+        connect_authority: None,
     })
 }
 
@@ -270,14 +338,28 @@ impl RunnerTransportEndpoint {
                         "--ca-bundle-path is accepted only with wss://",
                     ));
                 }
-                let stream = connect_pinned_addresses(&target.addresses, connect_deadline)?;
+                // Proxy TCP, CONNECT, TLS and WebSocket share one connect budget.
+                // Preserve the existing direct-dial budgeting when the opt-in is absent.
+                let dial_deadline = if target.connect_authority.is_some() {
+                    connect_deadline.min(Instant::now() + CONNECT_TOTAL_TIMEOUT)
+                } else {
+                    connect_deadline
+                };
+                let mut stream = connect_pinned_addresses(&target.addresses, dial_deadline)?;
+                if let Some(authority) = &target.connect_authority {
+                    connect_proxy::establish(&mut stream, authority, dial_deadline).map_err(
+                        |error| {
+                            DurableRunnerError::invalid(format!("runner CONNECT failed: {error}"))
+                        },
+                    )?;
+                }
                 let request = target
                     .request_url()
                     .into_client_request()
                     .map_err(|error| {
                         DurableRunnerError::invalid(format!("invalid WebSocket request: {error}"))
                     })?;
-                let deadline = bounded_operation_deadline(connect_deadline, AUTH_TIMEOUT)?;
+                let deadline = bounded_operation_deadline(dial_deadline, AUTH_TIMEOUT)?;
                 let connector = ca_bundle_path.map(custom_tls_connector).transpose()?;
                 ensure_connection_deadline(deadline)?;
                 stream.set_nonblocking(true).map_err(|error| {
@@ -1931,6 +2013,261 @@ mod tests {
             "connectionLeaseId": "lease_1",
             "payload": payload,
         })
+    }
+
+    #[test]
+    fn proxy_resolution_pins_only_proxy_and_preserves_original_tls_authority() {
+        let pinned: SocketAddr = "127.0.0.1:3128".parse().unwrap();
+        let target = resolve_ws_target_via_proxy_with(
+            "wss://factory.mereka.io/api/runner/v1/connect/run-1",
+            Some("http://factory-gateway:3128"),
+            |host, port| {
+                assert_eq!((host, port), ("factory-gateway", 3128));
+                Ok(vec![pinned, pinned])
+            },
+        )
+        .unwrap();
+        assert_eq!(target.addresses, vec![pinned]);
+        assert_eq!(
+            target.connect_authority.as_deref(),
+            Some("factory.mereka.io:443")
+        );
+        assert_eq!(
+            target.request_url(),
+            "wss://factory.mereka.io/api/runner/v1/connect/run-1"
+        );
+        for input in [
+            "ws://127.0.0.1/path",
+            "wss://factory.mereka.io:8443/path",
+            "wss://127.0.0.1/path",
+        ] {
+            assert!(resolve_ws_target_via_proxy_with(
+                input,
+                Some("http://factory-gateway:3128"),
+                |_, _| { panic!("invalid target must fail before any DNS") }
+            )
+            .is_err());
+        }
+        let direct =
+            resolve_ws_target_via_proxy_with("ws://127.0.0.1:1234/path", None, |host, port| {
+                assert_eq!((host, port), ("127.0.0.1", 1234));
+                Ok(vec!["127.0.0.1:1234".parse().unwrap()])
+            })
+            .unwrap();
+        assert!(direct.connect_authority.is_none());
+    }
+
+    /// Uses fresh, synthetic certificates rather than a checked-in private key.
+    /// OpenSSL is required for this Unix transport qualification test.
+    #[cfg(unix)]
+    #[test]
+    fn proxy_transport_certified_wss_preserves_hostname_and_ca_validation() {
+        // Match paperclip-runnerd startup when Cargo unifies multiple TLS backends.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command as ProcessCommand;
+
+        struct FixtureDirectory(PathBuf);
+        impl Drop for FixtureDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = FixtureDirectory(std::env::temp_dir().join(format!(
+            "paperclip-connect-tls-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::create_dir(&directory.0).unwrap();
+        std::fs::set_permissions(&directory.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let openssl = |args: &[&str]| {
+            let output = ProcessCommand::new("openssl")
+                .args(args)
+                .current_dir(&directory.0)
+                .output()
+                .expect("OpenSSL is required for certified CONNECT/WSS transport qualification");
+            assert!(
+                output.status.success(),
+                "synthetic TLS fixture generation failed"
+            );
+        };
+        openssl(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "ca.key",
+            "-out",
+            "ca.pem",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=Paperclip CONNECT Test CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+        ]);
+        openssl(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "leaf.key",
+            "-out",
+            "leaf.csr",
+            "-subj",
+            "/CN=factory.mereka.io",
+        ]);
+        std::fs::write(directory.0.join("leaf.ext"),
+            b"subjectAltName=DNS:factory.mereka.io\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
+        openssl(&[
+            "x509",
+            "-req",
+            "-in",
+            "leaf.csr",
+            "-CA",
+            "ca.pem",
+            "-CAkey",
+            "ca.key",
+            "-CAcreateserial",
+            "-out",
+            "leaf.pem",
+            "-days",
+            "1",
+            "-extfile",
+            "leaf.ext",
+        ]);
+        let ca_path = directory.0.join("ca.pem");
+        std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cert = rustls_pemfile::certs(&mut BufReader::new(
+            std::fs::File::open(directory.0.join("leaf.pem")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(
+            std::fs::File::open(directory.0.join("leaf.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let tls = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert, key)
+                .unwrap(),
+        );
+        for (host, trust_ca, expected_success) in [
+            ("factory.mereka.io", true, true),
+            ("wrong.example", true, false),
+            ("factory.mereka.io", false, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let tls = tls.clone();
+            let expected_authority = format!("{host}:443");
+            let proxy = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 512);
+                }
+                assert_eq!(request, format!("CONNECT {expected_authority} HTTP/1.1\r\nHost: {expected_authority}\r\n\r\n").as_bytes());
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .unwrap();
+                let secure =
+                    rustls::StreamOwned::new(rustls::ServerConnection::new(tls).unwrap(), stream);
+                match accept(secure) {
+                    Ok(mut socket) => {
+                        socket
+                            .send(Message::Text("certified-connect".into()))
+                            .unwrap();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            });
+            let target = resolve_ws_target_via_proxy_with(
+                &format!("wss://{host}/path"),
+                Some("http://proxy:3128"),
+                |_, _| Ok(vec![proxy_address]),
+            )
+            .unwrap();
+            let endpoint = RunnerTransportEndpoint::Dial(target);
+            let result = endpoint.open(
+                4096,
+                trust_ca.then_some(ca_path.as_path()),
+                Instant::now() + Duration::from_secs(5),
+            );
+            if expected_success {
+                let Some(RunnerSocket::Dial(mut socket)) = result.unwrap() else {
+                    panic!("expected dial socket");
+                };
+                assert_eq!(
+                    socket.read().unwrap(),
+                    Message::Text("certified-connect".into())
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "TLS validation unexpectedly accepted {host}"
+                );
+            }
+            assert_eq!(proxy.join().unwrap(), expected_success);
+        }
+    }
+
+    #[test]
+    fn proxy_transport_never_interprets_plaintext_tunnel_as_authenticated_tls() {
+        // Match paperclip-runnerd startup when Cargo unifies multiple TLS backends.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let proxy = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() < 512);
+            }
+            assert_eq!(
+                request,
+                b"CONNECT factory.mereka.io:443 HTTP/1.1\r\nHost: factory.mereka.io:443\r\n\r\n"
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .unwrap();
+            // Wait for the TLS ClientHello, then attempt a plaintext WebSocket response.
+            let mut hello = [0; 5];
+            stream.read_exact(&mut hello).unwrap();
+            assert_eq!(hello[0], 22);
+            let _ = stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\n\r\n");
+        });
+        let target = resolve_ws_target_via_proxy_with(
+            "wss://factory.mereka.io/path",
+            Some("http://proxy:3128"),
+            |_, _| Ok(vec![proxy_address]),
+        )
+        .unwrap();
+        let endpoint = RunnerTransportEndpoint::Dial(target);
+        let result = endpoint.open(4096, None, Instant::now() + Duration::from_secs(3));
+        assert!(result.is_err());
+        proxy.join().unwrap();
     }
 
     #[test]
