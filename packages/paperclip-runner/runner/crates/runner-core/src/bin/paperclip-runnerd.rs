@@ -14,6 +14,12 @@ use paperclip_runner_core::durable::{
 use paperclip_runner_core::local_runner::{run_local_runner, LocalRunnerError, RunnerConfig};
 use paperclip_runner_core::native_provider_backend::NativeProviderCommandExecutor;
 use serde_json::json;
+#[path = "support/claude_external_auth_fd.rs"]
+mod claude_external_auth_fd;
+#[path = "support/external_auth_fd.rs"]
+mod external_auth_fd;
+#[path = "support/factory_child_fd_mapper.rs"]
+mod factory_child_fd_mapper;
 
 const RUNNERD_BUILD_METADATA_SCHEMA: &str = "paperclip-runner/runnerd-build-metadata/v1";
 const RUNNER_DIAGNOSTIC_MAX_BYTES: usize = 64 * 1024;
@@ -127,7 +133,27 @@ fn build_metadata() -> serde_json::Value {
             "minimumVersion": 1,
             "maximumVersion": 2
         },
-        "prpTransportModes": ["dial_ws_loopback", "dial_wss", "listen_ws"]
+        "prpTransportModes": ["dial_ws_loopback", "dial_wss", "listen_ws"],
+        "codexExternalAuth": {
+            "schema": "paperclip.codex-external-auth.v1",
+            "enabled": cfg!(target_os = "linux"),
+            "mode": "nonrefreshing",
+            "secretIngress": "owned_anonymous_pipe",
+            "maxCapabilityBytes": 32768,
+            "maxAdmissionMilliseconds": 300000,
+            "accountDeliveryQualified": false
+        },
+        "claudeExternalAuth": {
+            "schema": "factory.claude-setup-token-reference.v1",
+            "enabled": cfg!(target_os = "linux"),
+            "mode": "cold_nonrefreshing",
+            "secretIngress": "owned_anonymous_pipe",
+            "sidecarMetadataFd": 3,
+            "sidecarAccessFd": 4,
+            "maxCapabilityBytes": 16384,
+            "maxAdmissionMilliseconds": 300000,
+            "accountDeliveryQualified": false
+        }
     })
 }
 
@@ -298,6 +324,17 @@ fn durable_connect_url(args: &[String], run_id: &str) -> Result<String, LocalRun
 }
 
 fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
+    let claude_pipe = claude_external_auth_fd::take_selected()
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    let worker_plan = paperclip_runner_core::claude_external_auth::worker_plan_from_startup_args(
+        args,
+        claude_pipe.is_some(),
+    )
+    .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    // Take exclusive ownership/CLOEXEC before any startup work. The File is
+    // dropped on every parse/configuration failure as well as after consumption.
+    let external_pipe = external_auth_fd::take_selected()
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
     let ticket = capture_bootstrap_ticket()
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?
         .ok_or_else(|| {
@@ -342,12 +379,96 @@ fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
         reconnect_grace: optional_u64(args, "--reconnect-grace-ms")?.map(Duration::from_millis),
         max_runtime: duration("--max-runtime-ms", 0)?,
     };
-    let executor = NativeProviderCommandExecutor::with_runner_config(state_dir, &config);
+    if let Some(pipe) = external_pipe {
+        paperclip_runner_core::codex_external_auth::install_trusted_pipe(
+            pipe,
+            &paperclip_runner_core::codex_external_auth::ExternalAuthRunBinding {
+                run_id: &config.run_id,
+                environment_lease_id: &config.environment_lease_id,
+                normalized_session_id: &config.normalized_session_id,
+                runner_instance_id: &config.runner_instance_id,
+            },
+        )
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    }
+    let executor = if let Some(pipe) = claude_pipe {
+        use paperclip_runner_core::{claude_external_auth as claude, factory_child_fds};
+        let plan = worker_plan.expect("Claude startup required its worker plan");
+        let ingress = claude::ClaudeIngress::from_owned_pipe(
+            pipe,
+            &claude::ActualRun {
+                run_id: &config.run_id,
+                environment_lease_id: &config.environment_lease_id,
+                normalized_session_id: &config.normalized_session_id,
+                runner_instance_id: &config.runner_instance_id,
+                worker_plan_sha256: &plan,
+            },
+        )
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        claude::validate_private_home_and_environment()
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        // Intake has closed its original source. Own empty startup slots before
+        // any transport threads can allocate std's child exec-error channel.
+        let guards = factory_child_fds::FixedSlotGuards::acquire_at_single_threaded_startup()
+            .map_err(|_| {
+                LocalRunnerError::invalid("factory_claude_access_unverified:unsafe_startup_slots")
+            })?;
+        factory_child_fds::install_factory_child_fd_mapper(
+            guards,
+            factory_child_fd_mapper::install_mapper,
+        )
+        .map_err(|_| {
+            LocalRunnerError::invalid("factory_claude_access_unverified:unsafe_startup_slots")
+        })?;
+        NativeProviderCommandExecutor::with_factory_claude(state_dir, &config, ingress, plan)
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?
+    } else {
+        NativeProviderCommandExecutor::with_runner_config(state_dir, &config)
+    };
     run_durable_runner(config, ticket, executor)
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))
 }
 
 fn run(args: &[String]) -> Result<(), LocalRunnerError> {
+    let claude_selected =
+        std::env::var_os(paperclip_runner_core::claude_external_auth::INGRESS_FD_ENV).is_some();
+    paperclip_runner_core::claude_external_auth::validate_mutual_exclusion(
+        std::env::var_os(paperclip_runner_core::codex_external_auth::INGRESS_FD_ENV).is_some(),
+        claude_selected,
+    )
+    .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    if claude_selected
+        && (!args.iter().any(|arg| arg == "--connect-url")
+            || args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--listen-address" | "--listen-port" | "--listen-path"
+                )
+            }))
+    {
+        let _owned = claude_external_auth_fd::take_selected()
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        return Err(LocalRunnerError::invalid(
+            "factory_claude_access_unverified:incompatible_provider",
+        ));
+    }
+    // The protected ingress is supported only by the explicit native outbound
+    // durable mode. Never inherit it into a local fixture or provider listener.
+    if std::env::var_os(paperclip_runner_core::codex_external_auth::INGRESS_FD_ENV).is_some()
+        && (!args.iter().any(|arg| arg == "--connect-url")
+            || args.iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--listen-address" | "--listen-port" | "--listen-path"
+                )
+            }))
+    {
+        let _owned = external_auth_fd::take_selected()
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        return Err(LocalRunnerError::invalid(
+            "codex_external_auth_operator_required:incompatible_provider",
+        ));
+    }
     if args == ["--build-metadata"] {
         println!("{}", build_metadata());
         return Ok(());

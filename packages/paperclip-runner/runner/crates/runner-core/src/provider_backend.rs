@@ -2226,6 +2226,8 @@ impl CodexCommandExecutor {
         if config.provider != "codex" {
             config.include_skill_instructions = None;
         }
+        CodexProvider::validate_external_cold_selection(&config, None)
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         config
             .validate()
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
@@ -4943,6 +4945,7 @@ mod tests {
     fn opencode_result_state() -> CodexProviderState {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
                 provider_version: "1.18.34".to_owned(),
@@ -5305,6 +5308,7 @@ mod tests {
     fn opencode_terminal_fallback_uses_its_actual_provider_identity() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "opencode".to_owned(),
                 driver: "opencode_server".to_owned(),
                 provider_version: "1.18.34".to_owned(),
@@ -5396,6 +5400,7 @@ mod tests {
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "turn_active".to_owned(),
             config: CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5449,6 +5454,7 @@ mod tests {
     fn recovered_active_turn_revokes_prior_completion_authority() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5492,6 +5498,7 @@ mod tests {
     fn emits_a_structured_result_before_the_terminal_event() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5584,6 +5591,7 @@ mod tests {
     fn receipt_limit_diagnostic_is_durable_and_turn_idempotent() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5651,6 +5659,7 @@ mod tests {
     fn settled_receipt_limit_interrupt_cannot_be_marked_accepted() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5701,6 +5710,7 @@ mod tests {
     fn regular_backlog_preserves_receipt_limit_and_terminal_settlement_capacity() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5825,6 +5835,7 @@ mod tests {
 
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5937,6 +5948,7 @@ mod tests {
 
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -5994,6 +6006,7 @@ mod tests {
     fn exact_regular_backlog_capacity_rejects_turn_admission() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -6115,6 +6128,7 @@ mod tests {
 
         let state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -6156,6 +6170,7 @@ mod tests {
     fn durable_provider_turn_ledger_backfills_legacy_completion_authority() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -6194,6 +6209,7 @@ mod tests {
     fn durable_provider_turn_ledger_never_evicts_within_an_epoch() {
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),
@@ -6271,6 +6287,7 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         let mut state = CodexProviderState::new(
             CodexProviderConfig {
+                external_auth: None,
                 provider: "codex".to_owned(),
                 driver: "codex_app_server".to_owned(),
                 provider_version: "test".to_owned(),

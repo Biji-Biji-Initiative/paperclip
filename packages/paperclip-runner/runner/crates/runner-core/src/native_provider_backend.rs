@@ -101,6 +101,9 @@ pub struct NativeProviderCommandExecutor {
     config: DurableRunnerConfig,
     selected: Option<SelectedExecutor>,
     recovery_checked: bool,
+    factory_claude: Option<crate::claude_external_auth::ClaudeIngress>,
+    factory_authority: Option<crate::claude_external_auth::FactoryAuthority>,
+    factory_plan: Option<String>,
 }
 
 impl NativeProviderCommandExecutor {
@@ -110,7 +113,42 @@ impl NativeProviderCommandExecutor {
             config: config.clone(),
             selected: None,
             recovery_checked: false,
+            factory_claude: None,
+            factory_authority: None,
+            factory_plan: None,
         }
+    }
+
+    pub fn with_factory_claude(
+        state_dir: impl Into<PathBuf>,
+        config: &DurableRunnerConfig,
+        ingress: crate::claude_external_auth::ClaudeIngress,
+        plan: String,
+    ) -> Result<Self, DurableRunnerError> {
+        let authority = ingress
+            .authority()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let mut executor = Self::with_runner_config(state_dir, config);
+        executor.factory_claude = Some(ingress);
+        executor.factory_authority = Some(authority);
+        executor.factory_plan = Some(plan);
+        executor.assert_factory_authority()?;
+        Ok(executor)
+    }
+
+    fn assert_factory_authority(&self) -> Result<(), DurableRunnerError> {
+        if let Some(authority) = &self.factory_authority {
+            authority
+                .assert_live(&crate::claude_external_auth::ActualRun {
+                    run_id: &self.config.run_id,
+                    environment_lease_id: &self.config.environment_lease_id,
+                    normalized_session_id: &self.config.normalized_session_id,
+                    runner_instance_id: &self.config.runner_instance_id,
+                    worker_plan_sha256: self.factory_plan.as_deref().unwrap_or(""),
+                })
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        }
+        Ok(())
     }
 
     fn select_recovery(&mut self) -> Result<(), DurableRunnerError> {
@@ -129,6 +167,20 @@ impl NativeProviderCommandExecutor {
         {
             return Err(DurableRunnerError::invalid(
                 "runner state contains conflicting provider authorities",
+            ));
+        }
+        if self.factory_authority.is_some() && (codex || managed || acpx) {
+            self.recovery_checked = false;
+            return Err(DurableRunnerError::invalid(
+                "factory_claude_access_unverified:recovery_not_permitted",
+            ));
+        }
+        if crate::codex_external_auth::selected() && (codex || managed || acpx) {
+            // This ingress is cold/per-turn only. A retained provider state is
+            // not authority to replay or adopt an already admitted execution.
+            self.recovery_checked = false;
+            return Err(DurableRunnerError::invalid(
+                "codex_external_auth_operator_required:recovery_not_permitted",
             ));
         }
         self.selected = if managed {
@@ -150,6 +202,7 @@ impl NativeProviderCommandExecutor {
     }
 
     fn select_from_payload(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
+        self.assert_factory_authority()?;
         let kind = payload
             .pointer("/provider/kind")
             .and_then(Value::as_str)
@@ -158,14 +211,44 @@ impl NativeProviderCommandExecutor {
                     "run.prepare requires a supported provider kind before runner execution",
                 )
             })?;
+        crate::codex_external_auth::assert_selected_run(
+            &crate::codex_external_auth::ExternalAuthRunBinding {
+                run_id: &self.config.run_id,
+                environment_lease_id: &self.config.environment_lease_id,
+                normalized_session_id: &self.config.normalized_session_id,
+                runner_instance_id: &self.config.runner_instance_id,
+            },
+            Some(kind),
+        )
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        if self.factory_authority.is_some()
+            && (kind != "acpx"
+                || payload.pointer("/provider/agent").and_then(Value::as_str) != Some("claude"))
+        {
+            return Err(DurableRunnerError::invalid(
+                "factory_claude_access_unverified:incompatible_provider",
+            ));
+        }
         self.selected = Some(match kind {
             "codex" | "opencode" => SelectedExecutor::LocalFacade(
                 CodexCommandExecutor::with_runner_config(&self.state_dir, &self.config),
             ),
-            "acpx" => SelectedExecutor::Acpx(AcpxCommandExecutor::with_runner_config(
-                &self.state_dir,
-                &self.config,
-            )),
+            "acpx" => SelectedExecutor::Acpx(if let Some(ingress) = self.factory_claude.take() {
+                AcpxCommandExecutor::with_factory_claude(
+                    &self.state_dir,
+                    &self.config,
+                    ingress,
+                    self.factory_plan
+                        .clone()
+                        .expect("Factory ingress has its validated plan"),
+                )?
+            } else if self.factory_authority.is_some() {
+                return Err(DurableRunnerError::invalid(
+                    "factory_claude_access_unverified:source_already_consumed",
+                ));
+            } else {
+                AcpxCommandExecutor::with_runner_config(&self.state_dir, &self.config)
+            }),
             "claude_managed" | "aws_agentcore" => SelectedExecutor::Managed(
                 ManagedProviderCommandExecutor::with_runner_config(&self.state_dir, &self.config),
             ),
@@ -193,6 +276,59 @@ impl CommandExecutor for NativeProviderCommandExecutor {
             .map_or_else(|| Ok(Vec::new()), CommandExecutor::retained_events)
     }
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        // Cleanup/readback remains possible after admission expiry or authority
+        // rotation; another prepare/attach/turn cannot reuse this capability.
+        if !matches!(
+            command.command_type.as_str(),
+            "turn.interrupt"
+                | "run.cancel"
+                | "turn.stop"
+                | "session.snapshot"
+                | "session.close"
+                | "session.destroy"
+                | "runner.suspend"
+                | "runner.shutdown"
+                | "runner.drain"
+        ) {
+            self.assert_factory_authority()?;
+            if self.factory_authority.is_some()
+                && (command.payload.get("paperclipNextAuthority").is_some()
+                    || command
+                        .payload
+                        .pointer("/provider/kind")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind != "acpx")
+                    || command
+                        .payload
+                        .pointer("/provider/agent")
+                        .and_then(Value::as_str)
+                        .is_some_and(|agent| agent != "claude"))
+            {
+                return Err(DurableRunnerError::invalid(
+                    "factory_claude_access_unverified:binding_mismatch",
+                ));
+            }
+        }
+        // Preserve the existing Codex admission boundary independently of the
+        // Claude executor's actual cleanup-only command vocabulary.
+        if !matches!(
+            command.command_type.as_str(),
+            "turn.interrupt" | "session.suspend" | "session.destroy" | "session.snapshot"
+        ) {
+            crate::codex_external_auth::assert_selected_run(
+                &crate::codex_external_auth::ExternalAuthRunBinding {
+                    run_id: &self.config.run_id,
+                    environment_lease_id: &self.config.environment_lease_id,
+                    normalized_session_id: &self.config.normalized_session_id,
+                    runner_instance_id: &self.config.runner_instance_id,
+                },
+                command
+                    .payload
+                    .pointer("/provider/kind")
+                    .and_then(Value::as_str),
+            )
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        }
         self.select_recovery()?;
         if self.selected.is_none()
             && matches!(command.command_type.as_str(), "run.prepare" | "run.attach")
@@ -210,6 +346,7 @@ impl CommandExecutor for NativeProviderCommandExecutor {
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        self.assert_factory_authority()?;
         self.select_recovery()?;
         self.selected
             .as_mut()
@@ -267,5 +404,118 @@ impl CommandExecutor for NativeProviderCommandExecutor {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod factory_cleanup_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn expired_claude_authority_allows_only_owned_cleanup_and_blocks_new_work() {
+        let directory = std::env::temp_dir().join(format!(
+            "factory-expired-cleanup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let config = DurableRunnerConfig {
+            connect_url: "ws://127.0.0.1/runner".into(),
+            ca_bundle_path: None,
+            state_dir: directory.clone(),
+            runner_instance_id: "runner".into(),
+            environment_lease_id: "lease".into(),
+            run_id: "run".into(),
+            normalized_session_id: "session".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            runner_version: "test".into(),
+            runner_digest: "sha256:test".into(),
+            acpx_launch_profile: None,
+            opencode_launch_profile: None,
+            max_outbox_bytes: 1024 * 1024,
+            p0_reserve_bytes: 65536,
+            max_frame_bytes: 1024 * 1024,
+            reconnect_delay: Duration::from_millis(1),
+            reconnect_grace: None,
+            max_runtime: Duration::from_secs(60),
+        };
+        let plan = "a".repeat(64);
+        let actual = crate::claude_external_auth::ActualRun {
+            run_id: &config.run_id,
+            environment_lease_id: &config.environment_lease_id,
+            normalized_session_id: &config.normalized_session_id,
+            runner_instance_id: &config.runner_instance_id,
+            worker_plan_sha256: &plan,
+        };
+        let ingress = crate::claude_external_auth::synthetic_ingress(&actual);
+        let expired = ingress.authority().unwrap().expired_for_test();
+        let mut executor = NativeProviderCommandExecutor::with_factory_claude(
+            &directory,
+            &config,
+            ingress,
+            plan.clone(),
+        )
+        .unwrap();
+        executor.factory_authority = Some(expired);
+        executor.recovery_checked = true;
+        // An already selected, currently owned cold executor needs no launch to
+        // handle shutdown/drain. Expiry cannot prevent that cleanup dispatch.
+        executor.selected = Some(SelectedExecutor::Acpx(
+            AcpxCommandExecutor::with_factory_claude(
+                &directory,
+                &config,
+                crate::claude_external_auth::synthetic_ingress(&actual),
+                plan,
+            )
+            .unwrap(),
+        ));
+        for command_type in ["runner.drain", "runner.shutdown"] {
+            let command = Command {
+                schema: "paperclip.prp.command.v1".into(),
+                command_id: command_type.into(),
+                controller_seq: 1,
+                command_type: command_type.into(),
+                issued_at: "2026-10-16T00:00:00Z".into(),
+                deadline_at: None,
+                precondition: None,
+                payload: serde_json::json!({}),
+            };
+            assert!(executor.execute(&command).is_ok(), "{command_type}");
+        }
+        for command_type in [
+            "run.prepare",
+            "run.attach",
+            "turn.start",
+            "turn.steer",
+            "request.resolve",
+            "semantic_tool.result",
+        ] {
+            let command = Command {
+                schema: "paperclip.prp.command.v1".into(),
+                command_id: command_type.into(),
+                controller_seq: 2,
+                command_type: command_type.into(),
+                issued_at: "2026-10-16T00:00:00Z".into(),
+                deadline_at: None,
+                precondition: None,
+                payload: serde_json::json!({}),
+            };
+            assert!(
+                executor
+                    .execute(&command)
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("factory_claude_access_unverified:expired_capability"),
+                "{command_type}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+        std::fs::remove_dir(directory).unwrap();
     }
 }

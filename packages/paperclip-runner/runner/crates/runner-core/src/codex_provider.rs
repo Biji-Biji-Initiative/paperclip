@@ -23,6 +23,13 @@ use crate::provider_events::normalized_codex_terminal_event_type;
 use crate::qualified_launch::verify_launch_artifact;
 use crate::question_response::validate_question_response;
 
+#[path = "codex_provider_external_auth.rs"]
+mod external_auth_transport;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "codex_external_engine_tests.rs"]
+mod external_engine_tests;
+use crate::codex_external_auth::{ExternalAuthGuard, ExternalAuthReference, HoldReason};
+
 pub const CODEX_APP_SERVER_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const QUALIFIED_OPENCODE_VERSION: &str = "1.18.34";
 const DEFAULT_PROVIDER_TRACE_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -107,6 +114,7 @@ pub(crate) enum ProviderStartupStage {
     Spawn,
     SpawnReceipt,
     Initialize,
+    ExternalAuth,
     ThreadOpen,
     ThreadRead,
     Admission,
@@ -162,6 +170,7 @@ struct ProviderTraceSink {
     max_bytes: usize,
     truncated: bool,
     incomplete_reason: Option<String>,
+    metadata_only: bool,
 }
 
 impl ProviderTraceSink {
@@ -217,6 +226,7 @@ impl ProviderTraceSink {
             max_bytes,
             truncated: false,
             incomplete_reason: None,
+            metadata_only: false,
         }
     }
 
@@ -242,6 +252,13 @@ impl ProviderTraceSink {
     }
 
     fn frame(&mut self, direction: &str, raw: &[u8]) -> Option<u64> {
+        if self.metadata_only {
+            // No per-frame representation, size or digest crosses this mode.
+            // Keep only fixed auth lifecycle records; even a frame flood cannot
+            // turn metadata-only tracing into an unbounded secondary log.
+            self.incomplete_reason = Some("external_auth_metadata_only".to_owned());
+            return None;
+        }
         if self.captured_bytes.saturating_add(raw.len()) > self.max_bytes {
             self.truncated = true;
             return None;
@@ -359,6 +376,9 @@ pub struct CodexProviderConfig {
     // Older sessions retain their standalone task envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_mode: Option<String>,
+    /// A nonsecret authority reference, never credential material or an fd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_auth: Option<ExternalAuthReference>,
 }
 
 /// Explicit per-turn skill selection. The controller resolves assigned skill
@@ -679,6 +699,8 @@ pub struct CodexProvider {
     completion_contract: Option<ProviderCompletionContract>,
     permission_profile: &'static str,
     exit_drain: Option<ProviderExitDrain>,
+    external_auth: Option<ExternalAuthGuard>,
+    external_auth_start_deadline: Option<std::time::Instant>,
 }
 
 struct ProviderExitDrain {
@@ -864,8 +886,16 @@ impl CodexProvider {
         completion_contract: Option<(&str, &[String])>,
         observe: &mut dyn FnMut(ProviderStartupObservation) -> Result<(), LocalRunnerError>,
     ) -> Result<Self, LocalRunnerError> {
+        Self::validate_external_cold_selection(config, resume_thread_id)?;
         config.validate()?;
-        if config.provider == "codex" {
+        let external_auth = crate::codex_external_auth::consume_for_provider(config.external_auth.as_ref())
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        if external_auth.is_some() {
+            crate::codex_external_auth::validate_external_launch(&config.provider, &config.driver, &config.args)
+                .and_then(|_| crate::codex_external_auth::validate_project_auth_absent(Path::new(&config.cwd)))
+                .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        }
+        if config.provider == "codex" && external_auth.is_none() {
             if let Some(home) = std::env::var_os("CODEX_HOME") {
                 crate::codex_startup_trust::trust_startup_root(
                     Path::new(&home),
@@ -914,6 +944,9 @@ impl CodexProvider {
             .collect::<Vec<_>>();
         let runtime_request_scope = new_runtime_request_scope()?;
         let spawn = (|| {
+            if let Some(auth) = external_auth.as_ref() {
+                auth.check_live().map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+            }
             if config.provider == "opencode" {
                 let profile = opencode_launch_profile.ok_or_else(|| {
                     LocalRunnerError::invalid(
@@ -1003,7 +1036,13 @@ impl CodexProvider {
             notification_identity_diagnostics: 0,
             rejected_accepted_turn: None,
             quarantined: false,
-            trace: ProviderTraceSink::from_environment(),
+            trace: ProviderTraceSink::from_environment().map(|mut trace| {
+                trace.metadata_only = external_auth.is_some();
+                if trace.metadata_only {
+                    trace.send_record(json!({"kind":"external_auth_metadata", "event":"raw_capture_disabled", "rawCapture":false}));
+                }
+                trace
+            }),
             last_trace_frame_id: None,
             opencode_launch_profile: opencode_launch_profile.cloned(),
             completion_contract: completion_contract.map(|(revision, criterion_ids)| {
@@ -1014,6 +1053,8 @@ impl CodexProvider {
             }),
             permission_profile,
             exit_drain: None,
+            external_auth,
+            external_auth_start_deadline: None,
         };
         let mut stage = ProviderStartupStage::Initialize;
         let initialized_result = (|| -> Result<(), LocalRunnerError> {
@@ -1032,6 +1073,10 @@ impl CodexProvider {
                 }),
             )?;
             provider.send_frame(&json!({"method": "initialized"}))?;
+            if provider.external_auth.is_some() {
+                stage = ProviderStartupStage::ExternalAuth;
+                provider.initialize_external_auth()?;
+            }
 
             let mut params = json!({
                 "cwd": config.cwd,
@@ -2098,6 +2143,7 @@ impl CodexProvider {
     }
 
     pub fn poll(&mut self) -> Result<Option<CodexProviderEvent>, LocalRunnerError> {
+        self.check_external_auth_live()?;
         if self.process.stdout_failed() {
             return Err(LocalRunnerError::invalid(
                 "Codex stdout closed without a valid reader EOF",
@@ -2176,7 +2222,14 @@ impl CodexProvider {
         let (message, trace_frame_id) = if let Some(buffered) = buffered {
             (buffered.value, buffered.trace_frame_id)
         } else {
-            let Some(line) = self.process.receive_stdout_line(Duration::from_millis(1))? else {
+            // External mode applies the same pre-trace authentication boundary
+            // to asynchronous events as to synchronous JSON-RPC responses.
+            let received = if self.external_auth.is_some() {
+                self.receive_provider_stdout_line(Duration::from_millis(1))?
+            } else {
+                self.process.receive_stdout_line(Duration::from_millis(1))?
+            };
+            let Some(line) = received else {
                 let exit = self.process.try_wait()?;
                 if !self.process.stdout_drained() {
                     return Ok(None);
@@ -2905,6 +2958,10 @@ impl CodexProvider {
     }
 
     fn send_frame(&mut self, value: &Value) -> Result<(), LocalRunnerError> {
+        self.check_external_auth_live()?;
+        if self.external_auth_start_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(self.enter_external_auth_hold(HoldReason::ProviderProtocol));
+        }
         if let Some(trace) = self.trace.as_mut() {
             let raw = serde_json::to_vec(value).unwrap_or_default();
             if let Some(frame_id) = trace.frame("client_to_provider", &raw) {
@@ -2918,7 +2975,18 @@ impl CodexProvider {
                 );
             }
         }
-        self.process.send(value)
+        if let Some(auth) = self.external_auth.as_ref() {
+            let result = self.process.send_bounded_private_json(
+                value, auth.remaining().min(Duration::from_secs(5)),
+                CODEX_APP_SERVER_MAX_FRAME_BYTES,
+            );
+            if result.is_err() {
+                return Err(self.enter_external_auth_hold(HoldReason::ProviderProtocol));
+            }
+            result
+        } else {
+            self.process.send(value)
+        }
     }
 
     fn trace_inbound(&mut self, line: &str) -> Option<u64> {
@@ -2946,9 +3014,22 @@ impl CodexProvider {
         })?;
         self.send_frame(&json!({"id": request_id, "method": method, "params": params}))
             .map_err(ProviderRequestError::Ambiguous)?;
+        self.receive_classified_response(request_id, method)
+    }
+
+    fn receive_classified_response(&mut self, request_id: u64, method: &str) -> Result<Value, ProviderRequestError> {
+        let deadline = self.external_auth_start_deadline.unwrap_or_else(||
+            std::time::Instant::now() + Duration::from_secs(30));
         loop {
+            let timeout = if self.external_auth.is_some() {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(ProviderRequestError::Ambiguous(self.enter_external_auth_hold(HoldReason::ProviderProtocol)));
+                }
+                remaining
+            } else { Duration::from_secs(30) };
             let line = self
-                .receive_provider_stdout_line(Duration::from_secs(30))
+                .receive_provider_stdout_line(timeout)
                 .map_err(ProviderRequestError::Ambiguous)?;
             let Some(line) = line else {
                 let exit = self
@@ -2957,6 +3038,10 @@ impl CodexProvider {
                     .map_err(ProviderRequestError::Ambiguous)?;
                 if exit.is_some() {
                     self.drain_provider_diagnostics(Duration::from_millis(50));
+                }
+                if self.external_auth.is_some() {
+                    return Err(ProviderRequestError::Ambiguous(self.enter_external_auth_hold(
+                        if exit.is_some() { HoldReason::ProviderExited } else { HoldReason::ProviderProtocol })));
                 }
                 let diagnostic_suffix = self.provider_diagnostic_suffix();
                 let message = if let Some(exit) = exit {
@@ -3045,21 +3130,30 @@ impl CodexProvider {
     ) -> Result<Option<String>, LocalRunnerError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            self.check_external_auth_live()?;
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
             }
-            match self.process.recv_timeout(remaining) {
-                Ok(ProcessOutput::Stdout(line)) => return Ok(Some(line)),
+            let receive_wait = if self.external_auth.is_some() { remaining.min(Duration::from_millis(25)) } else { remaining };
+            match self.process.recv_timeout(receive_wait) {
+                Ok(ProcessOutput::Stdout(line)) => {
+                    if let Some(line) = self.external_inbound_before_trace(line)? { return Ok(Some(line)); }
+                },
                 Ok(ProcessOutput::Stderr(line)) => {
-                    self.stderr_tail.push(redact_text(&line));
+                    if self.external_auth.is_none() { self.stderr_tail.push(redact_text(&line)); }
                 }
                 Ok(ProcessOutput::StdoutError(message)) => {
+                    if self.external_auth.is_some() {
+                        return Err(self.enter_external_auth_hold(HoldReason::ProviderProtocol));
+                    }
                     return Err(LocalRunnerError::invalid(message));
                 }
                 Ok(ProcessOutput::StdoutClosed) => return Ok(None),
                 Ok(ProcessOutput::StderrClosed) => {}
-                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.external_auth.is_none() { return Ok(None); }
+                },
                 Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
             }
         }
@@ -3074,7 +3168,7 @@ impl CodexProvider {
             }
             match self.process.recv_timeout(remaining) {
                 Ok(ProcessOutput::Stderr(line)) => {
-                    self.stderr_tail.push(redact_text(&line));
+                    if self.external_auth.is_none() { self.stderr_tail.push(redact_text(&line)); }
                 }
                 Ok(ProcessOutput::StderrClosed)
                 | Err(mpsc::RecvTimeoutError::Timeout)
@@ -4038,6 +4132,7 @@ while IFS= read -r line; do
 done
 "#;
         let config = CodexProviderConfig {
+            external_auth: None,
             provider: "codex".to_owned(),
             driver: "codex_app_server".to_owned(),
             provider_version: "reader-tail-fixture".to_owned(),
@@ -4428,6 +4523,7 @@ done
     #[cfg(unix)]
     fn startup_observer_failure_reaps_the_exact_child_before_any_initialization_rpc() {
         let config = CodexProviderConfig {
+            external_auth: None,
             provider: "codex".to_owned(),
             driver: "codex_app_server".to_owned(),
             provider_version: "fixture".to_owned(),
@@ -4548,6 +4644,7 @@ done
     #[test]
     fn admits_only_exact_local_facade_provider_driver_pairs() {
         let mut config = CodexProviderConfig {
+            external_auth: None,
             provider: "opencode".to_owned(),
             driver: "opencode_server".to_owned(),
             provider_version: QUALIFIED_OPENCODE_VERSION.to_owned(),

@@ -84,9 +84,60 @@ pub struct AcpxSidecarTransport {
     stderr_tail: BoundedLogBuffer,
     stderr_categories: BTreeSet<&'static str>,
     poisoned: bool,
+    factory_deadline: Option<(Instant, u64)>,
 }
 
 impl AcpxSidecarTransport {
+    pub fn start_factory_claude(
+        config: &AcpxSidecarTransportConfig,
+        sources: crate::claude_external_auth::SidecarSources,
+    ) -> Result<Self, LocalRunnerError> {
+        config.validate()?;
+        crate::claude_external_auth::validate_private_home_and_environment()
+            .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        let launch = config.verified_launch.as_ref().ok_or_else(|| {
+            LocalRunnerError::invalid("factory_claude_access_unverified:unverified_bootstrap")
+        })?;
+        let factory_deadline = Some((sources.deadline, sources.binding.deadline_at_ms));
+        let process = SupervisedProcess::spawn_verified_factory_claude(
+            launch,
+            config.shutdown_grace,
+            ACPX_SIDECAR_MAX_FRAME_BYTES,
+            sources,
+            &[
+                "LANGUAGE",
+                "SSL_CERT_FILE",
+                "SSL_CERT_DIR",
+                "NODE_EXTRA_CA_CERTS",
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "NO_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "no_proxy",
+                "all_proxy",
+                "PAPERCLIP_NATIVE_MCP_NAME",
+                "PAPERCLIP_NATIVE_MCP_URL",
+                "PAPERCLIP_NATIVE_MCP_TOKEN",
+                "PAPERCLIP_ACPX_BUILTIN_ROOT",
+                "PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT",
+                "PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST",
+            ],
+        )?;
+        Ok(Self {
+            process,
+            request_timeout: config.request_timeout,
+            next_request_id: 1,
+            last_event_sequence: 0,
+            buffered_events: VecDeque::new(),
+            stderr_tail: BoundedLogBuffer::new(32, 8 * 1024),
+            stderr_categories: BTreeSet::new(),
+            poisoned: false,
+            factory_deadline,
+        })
+    }
+
     pub fn start(config: &AcpxSidecarTransportConfig) -> Result<Self, LocalRunnerError> {
         Self::start_with_environment_keys(config, &[])
     }
@@ -170,6 +221,7 @@ impl AcpxSidecarTransport {
             stderr_tail: BoundedLogBuffer::new(32, 8 * 1024),
             stderr_categories: BTreeSet::new(),
             poisoned: false,
+            factory_deadline: None,
         })
     }
 
@@ -182,6 +234,7 @@ impl AcpxSidecarTransport {
         command: GeneratedAcpxSidecarCommand,
         params: Value,
     ) -> Result<Value, LocalRunnerError> {
+        self.assert_factory_live()?;
         if self.poisoned {
             return Err(LocalRunnerError::invalid(
                 "ACPX sidecar transport is unavailable after a protocol failure",
@@ -202,6 +255,7 @@ impl AcpxSidecarTransport {
         &mut self,
         timeout: Duration,
     ) -> Result<Option<AcpxSidecarEvent>, LocalRunnerError> {
+        self.assert_factory_live()?;
         if self.poisoned {
             return Err(LocalRunnerError::invalid(
                 "ACPX sidecar transport is unavailable after a protocol failure",
@@ -292,13 +346,8 @@ impl AcpxSidecarTransport {
                         ));
                     }
                     let error = response.error.expect("failed response has validated error");
-                    return Ok(CommandOutcome::Rejected(LocalRunnerError::invalid(
-                        format!(
-                            "ACPX sidecar command {} was rejected (retryable={}, classification={})",
-                            command.as_str(),
-                            error.retryable,
-                            response_error_classification(&error),
-                        ),
+                    return Ok(CommandOutcome::Rejected(response_rejection(
+                        command, &error,
                     )));
                 }
             }
@@ -329,14 +378,23 @@ impl AcpxSidecarTransport {
         timeout: Duration,
         stage: &str,
     ) -> Result<Option<String>, LocalRunnerError> {
-        let deadline = Instant::now() + timeout;
+        self.assert_factory_live()?;
+        let deadline = self
+            .factory_deadline
+            .map_or(Instant::now() + timeout, |(deadline, _)| {
+                deadline.min(Instant::now() + timeout)
+            });
         loop {
+            self.assert_factory_live()?;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Ok(None);
             }
             match self.process.recv_timeout(remaining) {
-                Ok(ProcessOutput::Stdout(line)) => return Ok(Some(line)),
+                Ok(ProcessOutput::Stdout(line)) => {
+                    self.assert_factory_live()?;
+                    return Ok(Some(line));
+                }
                 Ok(ProcessOutput::Stderr(line)) => {
                     self.record_stderr(&line);
                 }
@@ -368,6 +426,23 @@ impl AcpxSidecarTransport {
         }
         self.validate_event_sequence(event.sequence)?;
         self.buffered_events.push_back(event);
+        Ok(())
+    }
+
+    fn assert_factory_live(&self) -> Result<(), LocalRunnerError> {
+        if let Some((deadline, until)) = self.factory_deadline {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    LocalRunnerError::invalid("factory_claude_access_unverified:expired_capability")
+                })?
+                .as_millis();
+            if Instant::now() >= deadline || now >= u128::from(until) {
+                return Err(LocalRunnerError::invalid(
+                    "factory_claude_access_unverified:expired_capability",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -680,9 +755,27 @@ fn stderr_diagnostic_categories(value: &str) -> BTreeSet<&'static str> {
     categories
 }
 
+fn response_rejection(
+    command: GeneratedAcpxSidecarCommand,
+    error: &ResponseError,
+) -> LocalRunnerError {
+    if error.code == "FACTORY_CLAUDE_ACCESS_UNVERIFIED" {
+        // The sidecar has retired its one-shot capability. Preserve that hold;
+        // neither an untrusted message nor retryable=true can re-admit it.
+        return LocalRunnerError::invalid("factory_claude_access_unverified:sidecar_rejected");
+    }
+    LocalRunnerError::invalid(format!(
+        "ACPX sidecar command {} was rejected (retryable={}, classification={})",
+        command.as_str(),
+        error.retryable,
+        response_error_classification(error)
+    ))
+}
+
 fn response_error_classification(error: &ResponseError) -> &'static str {
     match error.code.as_str() {
         "ACP_MODEL_UNSUPPORTED" => return "requested_model_unsupported",
+        "FACTORY_CLAUDE_ACCESS_UNVERIFIED" => return "factory_claude_access_unverified",
         "AGENT_STARTUP_FAILED" => return "agent_startup_failed",
         "AGENT_STARTUP_FAILED.UNVERIFIED_MODULE" => return "agent_startup_unverified_module",
         "AGENT_STARTUP_FAILED.MODULE_NOT_FOUND" => return "agent_startup_module_not_found",
@@ -766,6 +859,32 @@ fn response_error_classification(error: &ResponseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn factory_sidecar_hold_is_fixed_nonreflecting_and_cannot_request_retry() {
+        for retryable in [false, true] {
+            let error = ResponseError {
+                code: "FACTORY_CLAUDE_ACCESS_UNVERIFIED".into(),
+                message: "synthetic-private-message-must-not-escape".into(),
+                retryable,
+            };
+            assert_eq!(
+                response_rejection(GeneratedAcpxSidecarCommand::SessionOpen, &error).to_string(),
+                "factory_claude_access_unverified:sidecar_rejected"
+            );
+        }
+        let foreign = ResponseError {
+            code: "FACTORY_CLAUDE_ACCESS_UNVERIFIED_EXTRA".into(),
+            message: "synthetic-private-message-must-not-escape".into(),
+            retryable: true,
+        };
+        assert_eq!(response_error_classification(&foreign), "unclassified");
+        assert!(
+            !response_rejection(GeneratedAcpxSidecarCommand::SessionOpen, &foreign)
+                .to_string()
+                .contains("synthetic-private")
+        );
+    }
 
     #[test]
     fn parse_frame_does_not_echo_untrusted_deserialization_details() {

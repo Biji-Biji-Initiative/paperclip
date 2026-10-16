@@ -226,9 +226,35 @@ impl VerifiedProcessLaunch {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn inherited_command(&self) -> Result<InheritedCommand, LocalRunnerError> {
+        self.inherited_command_mode(false)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn inherited_command_mode(&self, factory: bool) -> Result<InheritedCommand, LocalRunnerError> {
+        #[cfg(not(target_os = "linux"))]
+        if factory {
+            return Err(LocalRunnerError::invalid(
+                "factory_claude_access_unverified:unsupported_platform",
+            ));
+        }
+        let inherit = |artifact: &VerifiedProcessArtifact| {
+            if factory {
+                let fd =
+                    crate::factory_child_fds::duplicate_cloexec_above_fixed_slots(&*artifact.file)
+                        .map_err(|_| {
+                            LocalRunnerError::invalid(
+                                "factory_claude_access_unverified:artifact_descriptor",
+                            )
+                        })?;
+                let path = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
+                Ok((fd, path))
+            } else {
+                inherited_artifact(artifact)
+            }
+        };
         let mut inherited = Vec::with_capacity(self.args.len() + 1);
         #[cfg(target_os = "linux")]
-        let (program_fd, program) = inherited_artifact(&self.program)?;
+        let (program_fd, program) = inherit(&self.program)?;
         #[cfg(target_os = "linux")]
         inherited.push(program_fd);
         #[cfg(target_os = "macos")]
@@ -242,12 +268,12 @@ impl VerifiedProcessLaunch {
             match argument {
                 VerifiedProcessArgument::Literal(value) => args.push(value.clone()),
                 VerifiedProcessArgument::Artifact(artifact) => {
-                    let (fd, path) = inherited_artifact(artifact)?;
+                    let (fd, path) = inherit(artifact)?;
                     inherited.push(fd);
                     args.push(path.to_string_lossy().into_owned());
                 }
                 VerifiedProcessArgument::CommonJsArtifact(artifact) => {
-                    let (fd, path) = inherited_artifact(artifact)?;
+                    let (fd, path) = inherit(artifact)?;
                     inherited.push(fd);
                     args.push("--eval".to_owned());
                     args.push(VERIFIED_COMMONJS_ARTIFACT_LOADER.to_owned());
@@ -256,7 +282,7 @@ impl VerifiedProcessLaunch {
                 VerifiedProcessArgument::ExecutableArtifact(artifact) => {
                     #[cfg(target_os = "linux")]
                     {
-                        let (fd, path) = inherited_artifact(artifact)?;
+                        let (fd, path) = inherit(artifact)?;
                         inherited.push(fd);
                         args.push(path.to_string_lossy().into_owned());
                     }
@@ -749,6 +775,94 @@ impl SupervisedProcess {
         verified_runtime_executable: Option<&Path>,
         cwd: Option<&Path>,
     ) -> Result<Self, LocalRunnerError> {
+        Self::spawn_command_with_factory(
+            program,
+            args,
+            shutdown_grace,
+            max_line_bytes,
+            additional_environment_keys,
+            verified_runtime_executable,
+            cwd,
+            None,
+        )
+    }
+
+    pub fn spawn_verified_factory_claude(
+        launch: &VerifiedProcessLaunch,
+        shutdown_grace: Duration,
+        max_line_bytes: usize,
+        sources: crate::claude_external_auth::SidecarSources,
+        environment_keys: &[&str],
+    ) -> Result<Self, LocalRunnerError> {
+        #[cfg(target_os = "linux")]
+        {
+            sources
+                .check_live()
+                .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+            // The bootstrap flag is appended by this authority-bearing path,
+            // after the complete controller profile has been authenticated.
+            if launch.args.iter().any(|arg| matches!(arg, VerifiedProcessArgument::Literal(value)
+                if value == crate::claude_external_auth::BOOTSTRAP_FLAG || value.starts_with("--factory-claude-access-v1="))) {
+                return Err(LocalRunnerError::invalid("factory_claude_access_unverified:unsafe_configuration"));
+            }
+            let mut inherited = launch.inherited_command_mode(true)?;
+            inherited
+                .args
+                .push(crate::claude_external_auth::BOOTSTRAP_FLAG.to_owned());
+            let deadline = sources.deadline;
+            let until = sources.binding.deadline_at_ms;
+            let layout = crate::factory_child_fds::ChildFdLayout::new(
+                sources.metadata,
+                sources.access,
+                std::mem::take(&mut inherited._inherited),
+            )
+            .map_err(|_| {
+                LocalRunnerError::invalid(
+                    "factory_claude_access_unverified:unsafe_descriptor_layout",
+                )
+            })?;
+            Self::spawn_command_with_factory(
+                &inherited.program,
+                &inherited.args,
+                shutdown_grace,
+                max_line_bytes,
+                environment_keys,
+                launch
+                    .inherit_runtime_executable
+                    .then_some(inherited.program.as_path()),
+                None,
+                Some((layout, deadline, until)),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (
+                launch,
+                shutdown_grace,
+                max_line_bytes,
+                sources,
+                environment_keys,
+            );
+            Err(LocalRunnerError::invalid(
+                "factory_claude_access_unverified:unsupported_platform",
+            ))
+        }
+    }
+
+    fn spawn_command_with_factory(
+        program: &Path,
+        args: &[String],
+        shutdown_grace: Duration,
+        max_line_bytes: usize,
+        additional_environment_keys: &[&str],
+        verified_runtime_executable: Option<&Path>,
+        cwd: Option<&Path>,
+        factory: Option<(
+            crate::factory_child_fds::ChildFdLayout,
+            std::time::Instant,
+            u64,
+        )>,
+    ) -> Result<Self, LocalRunnerError> {
         let mut command = Command::new(program);
         if let Some(cwd) = cwd {
             command.current_dir(cwd);
@@ -790,7 +904,23 @@ impl SupervisedProcess {
         #[cfg(unix)]
         command.process_group(0);
 
-        let mut child = command.spawn().map_err(|error| {
+        let spawned = if let Some((layout, deadline, until)) = factory {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    LocalRunnerError::invalid("factory_claude_access_unverified:expired_capability")
+                })?
+                .as_millis();
+            if std::time::Instant::now() >= deadline || now >= u128::from(until) {
+                return Err(LocalRunnerError::invalid(
+                    "factory_claude_access_unverified:expired_capability",
+                ));
+            }
+            crate::factory_child_fds::spawn_factory_child_once(command, layout)
+        } else {
+            command.spawn()
+        };
+        let mut child = spawned.map_err(|error| {
             LocalRunnerError::invalid(format!(
                 "failed to start supervised process {}: {error}",
                 program.display()
@@ -833,6 +963,71 @@ impl SupervisedProcess {
 
     pub(crate) fn process_group_id(&self) -> u32 {
         self.process_group_id
+    }
+
+    /// Sensitive wire boundary: bounded Linux pipe write, no trace/error payload.
+    /// Never use this to serialize a credential into configuration or a journal.
+    pub(crate) fn send_ephemeral_json<T: Serialize>(
+        &mut self,
+        value: &T,
+        timeout: Duration,
+    ) -> Result<(), LocalRunnerError> {
+        self.send_bounded_private_json(value, timeout, 32 * 1024)
+    }
+
+    /// External-mode ordinary RPCs also have bounded writes, so a provider
+    /// which stops reading cannot prevent lease-expiry/cancellation handling.
+    pub(crate) fn send_bounded_private_json<T: Serialize>(
+        &mut self,
+        value: &T,
+        timeout: Duration,
+        maximum: usize,
+    ) -> Result<(), LocalRunnerError> {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+            let failure = || {
+                LocalRunnerError::invalid("codex_external_auth_operator_required:provider_protocol")
+            };
+            let mut bytes = crate::sensitive_memory::Sensitive::new(
+                serde_json::to_vec(value).map_err(|_| failure())?,
+            );
+            if maximum == 0 || maximum > 4 * 1024 * 1024 || bytes.len() > maximum {
+                return Err(failure());
+            }
+            bytes.push(b'\n');
+            let stdin = self.stdin.as_mut().ok_or_else(failure)?;
+            let flags = fcntl_getfl(&*stdin).map_err(|_| failure())?;
+            fcntl_setfl(&*stdin, flags | OFlags::NONBLOCK).map_err(|_| failure())?;
+            let deadline = std::time::Instant::now() + timeout;
+            let result = (|| {
+                let mut offset = 0;
+                while offset < bytes.len() {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(failure());
+                    }
+                    match stdin.write(&bytes[offset..]) {
+                        Ok(0) => return Err(failure()),
+                        Ok(n) => offset += n,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(2))
+                        }
+                        Err(_) => return Err(failure()),
+                    }
+                }
+                Ok(())
+            })();
+            let restored = fcntl_setfl(&*stdin, flags).map_err(|_| failure());
+            result.and(restored)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (value, timeout, maximum);
+            Err(LocalRunnerError::invalid(
+                "codex_external_auth_operator_required:unsafe_source",
+            ))
+        }
     }
 
     pub fn send<T: Serialize>(&mut self, value: &T) -> Result<(), LocalRunnerError> {

@@ -261,10 +261,44 @@ pub struct AcpxProviderSession {
     working_directory: PathBuf,
     closed: bool,
     transport_terminated: bool,
+    factory_binding: Option<crate::claude_external_auth::FactoryBinding>,
+    factory_deadline: Option<std::time::Instant>,
 }
 
 impl AcpxProviderSession {
     pub fn start(config: &AcpxProviderSessionConfig) -> Result<Self, LocalRunnerError> {
+        Self::start_inner(config, None)
+    }
+
+    pub fn start_factory_claude(
+        config: &AcpxProviderSessionConfig,
+        sources: crate::claude_external_auth::SidecarSources,
+    ) -> Result<Self, LocalRunnerError> {
+        crate::claude_external_auth::validate_provider_selection(
+            &config.agent,
+            if config.permission_mode == AcpxPermissionMode::ApprovePaperclip {
+                "approve-paperclip"
+            } else {
+                "unsupported"
+            },
+            config.transport.verified_launch.is_some(),
+            config.expected_identity.is_none(),
+        )
+        .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+        if sources.binding.run_id != config.run_id
+            || sources.binding.normalized_session_id != config.normalized_session_id
+        {
+            return Err(LocalRunnerError::invalid(
+                "factory_claude_access_unverified:binding_mismatch",
+            ));
+        }
+        Self::start_inner(config, Some(sources))
+    }
+
+    fn start_inner(
+        config: &AcpxProviderSessionConfig,
+        sources: Option<crate::claude_external_auth::SidecarSources>,
+    ) -> Result<Self, LocalRunnerError> {
         config.validate()?;
         let mut tool_bridge = ProviderToolBridge::default();
         tool_bridge
@@ -273,9 +307,14 @@ impl AcpxProviderSession {
                 LocalRunnerError::invalid(format!("ACPX authorized tools are invalid: {error}"))
             })?;
         let reserved_tool_bridge = reserved_terminal_tool_bridge()?;
-        let mut transport =
-            AcpxSidecarTransport::start_for_agent(&config.transport, &config.agent)?;
-        let bootstrap = bootstrap(&mut transport, config);
+        let factory_binding = sources.as_ref().map(|sources| sources.binding.clone());
+        let factory_deadline = sources.as_ref().map(|sources| sources.deadline);
+        let mut transport = if let Some(sources) = sources {
+            AcpxSidecarTransport::start_factory_claude(&config.transport, sources)?
+        } else {
+            AcpxSidecarTransport::start_for_agent(&config.transport, &config.agent)?
+        };
+        let bootstrap = bootstrap(&mut transport, config, factory_binding.as_ref());
         let (identity, state, turn_controls) = match bootstrap {
             Ok(value) => value,
             Err(error) => {
@@ -295,6 +334,8 @@ impl AcpxProviderSession {
             working_directory: config.working_directory.clone(),
             closed: false,
             transport_terminated: false,
+            factory_binding,
+            factory_deadline,
         })
     }
 
@@ -884,7 +925,7 @@ impl AcpxProviderSession {
             GeneratedAcpxSidecarCommand::SessionClose,
             json!({
                 "reason": bounded_reason(reason),
-                "discardPersistentState": false,
+                "discardPersistentState": self.factory_binding.is_some(),
             }),
         );
         let terminate = self.terminate_transport();
@@ -930,6 +971,23 @@ impl AcpxProviderSession {
     }
 
     fn ensure_open(&self) -> Result<(), LocalRunnerError> {
+        if let Some(binding) = &self.factory_binding {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| {
+                    LocalRunnerError::invalid("factory_claude_access_unverified:expired_capability")
+                })?
+                .as_millis();
+            if now >= u128::from(binding.deadline_at_ms)
+                || self
+                    .factory_deadline
+                    .is_none_or(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(LocalRunnerError::invalid(
+                    "factory_claude_access_unverified:expired_capability",
+                ));
+            }
+        }
         if self.closed {
             return Err(LocalRunnerError::invalid("ACPX provider session is closed"));
         }
@@ -937,6 +995,11 @@ impl AcpxProviderSession {
     }
 
     fn restart_idle_provider(&mut self) -> Result<(), LocalRunnerError> {
+        if self.factory_binding.is_some() {
+            return Err(LocalRunnerError::invalid(
+                "factory_claude_access_unverified:recovery_not_permitted",
+            ));
+        }
         let suspended = self.transport.request(
             GeneratedAcpxSidecarCommand::SessionSuspend,
             json!({"reason":"ACPX turn receipt epoch rotation"}),
@@ -952,7 +1015,7 @@ impl AcpxProviderSession {
             &restart_config.agent,
         )?;
         let (replacement_identity, _, turn_controls) =
-            match bootstrap(&mut replacement, &restart_config) {
+            match bootstrap(&mut replacement, &restart_config, None) {
                 Ok(value) => value,
                 Err(error) => {
                     return Err(self.reject_replacement(replacement, error));
@@ -1204,6 +1267,7 @@ impl Drop for AcpxProviderSession {
 fn bootstrap(
     transport: &mut AcpxSidecarTransport,
     config: &AcpxProviderSessionConfig,
+    factory_binding: Option<&crate::claude_external_auth::FactoryBinding>,
 ) -> Result<
     (
         AcpxProviderSessionIdentity,
@@ -1219,23 +1283,8 @@ fn bootstrap(
     )?;
     verify_initialize_response(&initialized, transport.process_id())?;
 
-    let opened = transport.request(
-        GeneratedAcpxSidecarCommand::SessionOpen,
-        json!({
-            "runtimeDirectory": config.runtime_directory,
-            "normalizedSessionId": config.normalized_session_id,
-            "workingDirectory": config.working_directory,
-            "agent": config.agent,
-            "model": config.model,
-            "permissionMode": config.permission_mode,
-            "permissionModePinned": config.permission_mode_pinned,
-            "providerPolicy": config.provider_policy,
-            "systemInstructions": config.system_instructions,
-            "runtimeContext": config.runtime_context,
-            "tools": &sidecar_tools,
-            "expectedIdentity": config.expected_identity,
-        }),
-    )?;
+    let open_params = session_open_params(config, factory_binding)?;
+    let opened = transport.request(GeneratedAcpxSidecarCommand::SessionOpen, open_params)?;
     let identity = verify_open_response(&opened, transport.process_id(), config)?;
     let turn_controls = verified_turn_controls(opened.get("turnControls"), &config.agent)?;
 
@@ -1259,6 +1308,38 @@ fn bootstrap(
         AcpxProviderState::new(&config.run_id)?,
         turn_controls,
     ))
+}
+
+pub(crate) fn session_open_params(
+    config: &AcpxProviderSessionConfig,
+    factory_binding: Option<&crate::claude_external_auth::FactoryBinding>,
+) -> Result<Value, LocalRunnerError> {
+    let mut open_params = json!({
+        "runtimeDirectory": config.runtime_directory,
+        "normalizedSessionId": config.normalized_session_id,
+        "workingDirectory": config.working_directory,
+        "agent": config.agent,
+        "model": config.model,
+        "permissionMode": config.permission_mode,
+        "permissionModePinned": config.permission_mode_pinned,
+        "providerPolicy": config.provider_policy,
+        "systemInstructions": config.system_instructions,
+        "runtimeContext": config.runtime_context,
+        "tools": sidecar_run_tool_operations(&config.tool_set),
+        "expectedIdentity": config.expected_identity,
+    });
+    if let Some(binding) = factory_binding {
+        open_params
+            .as_object_mut()
+            .expect("session.open is an object")
+            .insert(
+                "factoryBinding".to_owned(),
+                serde_json::to_value(binding).map_err(|_| {
+                    LocalRunnerError::invalid("factory_claude_access_unverified:malformed_binding")
+                })?,
+            );
+    }
+    Ok(open_params)
 }
 
 fn verify_initialize_response(value: &Value, process_id: u32) -> Result<(), LocalRunnerError> {

@@ -687,6 +687,12 @@ pub struct AcpxCommandExecutor {
     #[cfg(test)]
     fail_after_state_rename: bool,
     launch_profile: Option<AcpxLaunchProfile>,
+    factory_claude: Option<crate::claude_external_auth::ClaudeIngress>,
+    factory_context: Option<(
+        DurableRunnerConfig,
+        String,
+        crate::claude_external_auth::FactoryAuthority,
+    )>,
 }
 
 impl AcpxCommandExecutor {
@@ -708,7 +714,46 @@ impl AcpxCommandExecutor {
             #[cfg(test)]
             fail_after_state_rename: false,
             launch_profile: config.acpx_launch_profile.clone(),
+            factory_claude: None,
+            factory_context: None,
         }
+    }
+
+    pub fn with_factory_claude(
+        state_dir: impl Into<PathBuf>,
+        config: &DurableRunnerConfig,
+        ingress: crate::claude_external_auth::ClaudeIngress,
+        plan: String,
+    ) -> Result<Self, DurableRunnerError> {
+        let authority = ingress
+            .authority()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        let mut executor = Self::with_runner_config(state_dir, config);
+        executor.factory_context = Some((config.clone(), plan, authority));
+        executor.factory_claude = Some(ingress);
+        Ok(executor)
+    }
+
+    fn assert_factory_live(&self) -> Result<(), DurableRunnerError> {
+        if let Some((config, plan, authority)) = &self.factory_context {
+            if config.run_id != self.context.run_id
+                || config.normalized_session_id != self.context.normalized_session_id
+            {
+                return Err(DurableRunnerError::invalid(
+                    "factory_claude_access_unverified:binding_mismatch",
+                ));
+            }
+            authority
+                .assert_live(&crate::claude_external_auth::ActualRun {
+                    run_id: &config.run_id,
+                    environment_lease_id: &config.environment_lease_id,
+                    normalized_session_id: &config.normalized_session_id,
+                    runner_instance_id: &config.runner_instance_id,
+                    worker_plan_sha256: plan,
+                })
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn state_path(&self) -> PathBuf {
@@ -728,6 +773,11 @@ impl AcpxCommandExecutor {
 
     fn restore(&mut self) -> Result<(), DurableRunnerError> {
         self.ensure_persistence_healthy()?;
+        if self.factory_context.is_some() && !self.restore_checked && self.state_path().exists() {
+            return Err(DurableRunnerError::invalid(
+                "factory_claude_access_unverified:recovery_not_permitted",
+            ));
+        }
         if self.restore_checked {
             return Ok(());
         }
@@ -860,7 +910,11 @@ impl AcpxCommandExecutor {
         self.save_state()
     }
 
-    fn start_session(&self, recovering: bool) -> Result<AcpxProviderSession, DurableRunnerError> {
+    fn start_session(
+        &mut self,
+        recovering: bool,
+    ) -> Result<AcpxProviderSession, DurableRunnerError> {
+        self.assert_factory_live()?;
         let state = self
             .state
             .as_ref()
@@ -871,10 +925,55 @@ impl AcpxCommandExecutor {
             expected,
             self.launch_profile.as_ref(),
         )?;
-        let mut session = AcpxProviderSession::start(&config).map_err(|error| {
+        let command_digest = state.descriptor.command_digest.clone();
+        let started = if let Some((actual, plan, _)) = &self.factory_context {
+            if recovering || self.session.is_some() {
+                return Err(DurableRunnerError::invalid(
+                    "factory_claude_access_unverified:recovery_not_permitted",
+                ));
+            }
+            let mut ingress = self.factory_claude.take().ok_or_else(|| {
+                DurableRunnerError::invalid(
+                    "factory_claude_access_unverified:source_already_consumed",
+                )
+            })?;
+            crate::claude_external_auth::validate_private_home_and_environment()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            crate::claude_external_auth::validate_provider_selection(
+                &config.agent,
+                if config.permission_mode == AcpxPermissionMode::ApprovePaperclip {
+                    "approve-paperclip"
+                } else {
+                    "unsupported"
+                },
+                config.transport.verified_launch.is_some(),
+                config.expected_identity.is_none(),
+            )
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            let frames = ingress
+                .consume_for_sidecar(
+                    &crate::claude_external_auth::ActualRun {
+                        run_id: &actual.run_id,
+                        environment_lease_id: &actual.environment_lease_id,
+                        normalized_session_id: &actual.normalized_session_id,
+                        runner_instance_id: &actual.runner_instance_id,
+                        worker_plan_sha256: plan,
+                    },
+                    &config.runtime_directory,
+                    &config.working_directory,
+                )
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            let sources = frames
+                .into_sources()
+                .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+            AcpxProviderSession::start_factory_claude(&config, sources)
+        } else {
+            AcpxProviderSession::start(&config)
+        };
+        let mut session = started.map_err(|error| {
             DurableRunnerError::invalid(format!("failed to start ACPX provider: {error}"))
         })?;
-        if session.identity().profile_digest != state.descriptor.command_digest {
+        if session.identity().profile_digest != command_digest {
             let _ = session.shutdown("qualified ACPX profile digest mismatch");
             return Err(DurableRunnerError::invalid(
                 "ACPX provider identity did not attest the qualified command digest",
@@ -973,6 +1072,15 @@ impl AcpxCommandExecutor {
             DurableRunnerError::invalid(format!("run.prepare ACPX provider is invalid: {error}"))
         })?;
         descriptor.validate(&self.context)?;
+        if self.factory_context.is_some()
+            && (descriptor.agent != "claude"
+                || descriptor.permission_mode != AcpxPermissionMode::ApprovePaperclip
+                || !descriptor.permission_mode_pinned)
+        {
+            return Err(DurableRunnerError::invalid(
+                "factory_claude_access_unverified:unsafe_configuration",
+            ));
+        }
         let tool_set = authorized_tool_set(payload)?;
         let launch_profile_digest = self.launch_profile_digest()?;
         if let Some(state) = self.state.as_ref() {
@@ -1002,6 +1110,11 @@ impl AcpxCommandExecutor {
     }
 
     fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
+        if self.factory_context.is_some() {
+            return Err(DurableRunnerError::invalid(
+                "factory_claude_access_unverified:recovery_not_permitted",
+            ));
+        }
         let descriptor: AcpxProviderDescriptor = serde_json::from_value(
             payload
                 .get("provider")
@@ -1920,6 +2033,20 @@ fn goal_terminal_disposition<'a>(
 
 impl CommandExecutor for AcpxCommandExecutor {
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
+        if !matches!(
+            command.command_type.as_str(),
+            "turn.interrupt"
+                | "run.cancel"
+                | "turn.stop"
+                | "session.snapshot"
+                | "session.close"
+                | "session.destroy"
+                | "runner.suspend"
+                | "runner.shutdown"
+                | "runner.drain"
+        ) {
+            self.assert_factory_live()?;
+        }
         self.restore()?;
         if command.command_type != "run.attach"
             && self
@@ -1976,6 +2103,11 @@ impl CommandExecutor for AcpxCommandExecutor {
     }
 
     fn rotate_authority(&mut self, config: &DurableRunnerConfig) {
+        if let Some((actual, _, _)) = &mut self.factory_context {
+            // Retain the original public authority; checking the new actual
+            // identity rejects even a lease-only rotation before provider I/O.
+            *actual = config.clone();
+        }
         self.context.run_id = config.run_id.clone();
         self.context.normalized_session_id = config.normalized_session_id.clone();
         self.context.turn_id = config.turn_id.clone();
@@ -1983,6 +2115,7 @@ impl CommandExecutor for AcpxCommandExecutor {
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        self.assert_factory_live()?;
         self.restore()?;
         if self
             .state
@@ -2247,6 +2380,245 @@ mod tests {
             provider_turn_id: None,
             item_id: "item-1".to_owned(),
         }
+    }
+
+    const FACTORY_PLAN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn factory_ingress(config: &DurableRunnerConfig) -> crate::claude_external_auth::ClaudeIngress {
+        crate::claude_external_auth::synthetic_ingress(&crate::claude_external_auth::ActualRun {
+            run_id: &config.run_id,
+            environment_lease_id: &config.environment_lease_id,
+            normalized_session_id: &config.normalized_session_id,
+            runner_instance_id: &config.runner_instance_id,
+            worker_plan_sha256: FACTORY_PLAN,
+        })
+    }
+
+    fn factory_command(provider: Value) -> Command {
+        Command {
+            schema: "paperclip.prp.command.v1".into(),
+            command_id: "command-1".into(),
+            controller_seq: 1,
+            command_type: "run.prepare".into(),
+            issued_at: "2026-10-16T00:00:00Z".into(),
+            deadline_at: None,
+            precondition: None,
+            payload: json!({"provider":provider}),
+        }
+    }
+
+    #[test]
+    fn factory_native_rejects_wrong_provider_before_dispatch_or_state_creation() {
+        for provider in [
+            json!({"kind":"codex"}),
+            json!({"kind":"claude_managed"}),
+            json!({"kind":"acpx","agent":"codex"}),
+        ] {
+            let directory = temporary_directory("factory-wrong-provider");
+            let config = test_config(&directory, None);
+            let mut executor =
+                crate::native_provider_backend::NativeProviderCommandExecutor::with_factory_claude(
+                    &directory,
+                    &config,
+                    factory_ingress(&config),
+                    FACTORY_PLAN.into(),
+                )
+                .unwrap();
+            let error = executor
+                .execute(&factory_command(provider))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains("factory_claude_access_unverified:incompatible_provider"),
+                "{error}"
+            );
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+            fs::remove_dir(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn factory_native_refuses_all_retained_provider_files_before_deserialization() {
+        for file in [
+            ACPX_PROVIDER_STATE_FILE,
+            crate::provider_backend::CODEX_PROVIDER_STATE_FILE,
+            crate::managed_provider_backend::MANAGED_PROVIDER_STATE_FILE,
+        ] {
+            let directory = temporary_directory("factory-retained-provider");
+            fs::write(
+                directory.join(file),
+                "invalid retained state must never be parsed",
+            )
+            .unwrap();
+            let config = test_config(&directory, None);
+            let mut executor =
+                crate::native_provider_backend::NativeProviderCommandExecutor::with_factory_claude(
+                    &directory,
+                    &config,
+                    factory_ingress(&config),
+                    FACTORY_PLAN.into(),
+                )
+                .unwrap();
+            let error = executor.poll_events().err().unwrap().to_string();
+            assert!(
+                error.contains("factory_claude_access_unverified:recovery_not_permitted"),
+                "{error}"
+            );
+            assert_eq!(
+                fs::read_to_string(directory.join(file)).unwrap(),
+                "invalid retained state must never be parsed"
+            );
+            fs::remove_file(directory.join(file)).unwrap();
+            fs::remove_dir(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn factory_native_rejects_plan_or_rotated_authority_without_dispatch() {
+        let directory = temporary_directory("factory-authority");
+        let config = test_config(&directory, None);
+        assert!(
+            crate::native_provider_backend::NativeProviderCommandExecutor::with_factory_claude(
+                &directory,
+                &config,
+                factory_ingress(&config),
+                "b".repeat(64)
+            )
+            .is_err()
+        );
+        for field in ["run", "lease", "session", "runner"] {
+            let mut executor =
+                crate::native_provider_backend::NativeProviderCommandExecutor::with_factory_claude(
+                    &directory,
+                    &config,
+                    factory_ingress(&config),
+                    FACTORY_PLAN.into(),
+                )
+                .unwrap();
+            let mut rotated = config.clone();
+            match field {
+                "run" => rotated.run_id = "foreign".into(),
+                "lease" => rotated.environment_lease_id = "foreign".into(),
+                "session" => rotated.normalized_session_id = "foreign".into(),
+                _ => rotated.runner_instance_id = "foreign".into(),
+            }
+            executor.rotate_authority(&rotated);
+            let error = executor
+                .execute(&factory_command(json!({"kind":"acpx","agent":"claude"})))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains("factory_claude_access_unverified:binding_mismatch"),
+                "{error}"
+            );
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn factory_acpx_rejects_ambient_permission_modes_and_direct_reattachment() {
+        let directory = temporary_directory("factory-permission");
+        let config = test_config(&directory, None);
+        for mode in ["approve-reads", "approve-all", "deny-all"] {
+            let mut executor = AcpxCommandExecutor::with_factory_claude(
+                &directory,
+                &config,
+                factory_ingress(&config),
+                FACTORY_PLAN.into(),
+            )
+            .unwrap();
+            let mut provider = descriptor("claude");
+            provider["permissionMode"] = json!(mode);
+            let error = executor
+                .execute(&factory_command(provider))
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(
+                error.contains("factory_claude_access_unverified:unsafe_configuration"),
+                "{error}"
+            );
+            assert!(executor
+                .attach_run(&json!({}))
+                .unwrap_err()
+                .to_string()
+                .contains("recovery_not_permitted"));
+        }
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 0);
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn factory_session_open_uses_exact_public_projection_and_generic_omits_binding() {
+        let directory = temporary_directory("factory-session-open");
+        let config = test_config(&directory, None);
+        let mut ingress = factory_ingress(&config);
+        let descriptor: AcpxProviderDescriptor =
+            serde_json::from_value(descriptor("claude")).unwrap();
+        let frames = ingress
+            .consume_for_sidecar(
+                &crate::claude_external_auth::ActualRun {
+                    run_id: &config.run_id,
+                    environment_lease_id: &config.environment_lease_id,
+                    normalized_session_id: &config.normalized_session_id,
+                    runner_instance_id: &config.runner_instance_id,
+                    worker_plan_sha256: FACTORY_PLAN,
+                },
+                &descriptor.runtime_directory,
+                Path::new(&descriptor.cwd),
+            )
+            .unwrap();
+        let operations = Vec::new();
+        let session = AcpxProviderSessionConfig {
+            transport: AcpxSidecarTransportConfig {
+                command: "/unused/node".into(),
+                args: Vec::new(),
+                verified_launch: None,
+                request_timeout: Duration::from_secs(1),
+                shutdown_grace: Duration::from_secs(1),
+            },
+            agent: "claude".into(),
+            model: descriptor.model.clone(),
+            run_id: config.run_id.clone(),
+            catalog_revision: 1,
+            runtime_directory: descriptor.runtime_directory.clone(),
+            normalized_session_id: config.normalized_session_id.clone(),
+            working_directory: descriptor.cwd.into(),
+            permission_mode: AcpxPermissionMode::ApprovePaperclip,
+            permission_mode_pinned: true,
+            provider_policy: None,
+            system_instructions: String::new(),
+            runtime_context: Value::Null,
+            tool_set: AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.into(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(&operations).unwrap(),
+                operations,
+            },
+            expected_identity: None,
+        };
+        let public =
+            crate::acpx_provider_session::session_open_params(&session, Some(&frames.binding))
+                .unwrap();
+        assert_eq!(
+            public["factoryBinding"],
+            serde_json::to_value(&frames.binding).unwrap()
+        );
+        assert_eq!(public["factoryBinding"].as_object().unwrap().len(), 8);
+        assert!(!serde_json::to_string(&public)
+            .unwrap()
+            .contains("SYNTHETIC_INFERENCE"));
+        assert_eq!(public["runId"], Value::Null);
+        assert!(
+            crate::acpx_provider_session::session_open_params(&session, None)
+                .unwrap()
+                .get("factoryBinding")
+                .is_none()
+        );
+        fs::remove_dir(directory).unwrap();
     }
 
     fn descriptor(agent: &str) -> Value {
