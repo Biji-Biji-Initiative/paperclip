@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -45,5 +45,78 @@ describe("native SSH deliverable output budget", () => {
     await writeFile(join(root, "response"), Buffer.alloc(4 * Math.ceil(MAX_REMOTE_DELIVERABLE_BYTES / 3) + 1, 65));
     const result = await createRunner().execute({ command: "node", args: ["unused"], timeoutMs: 10_000 });
     expect(result.exitCode).not.toBe(0);
+  });
+});
+
+describe("native SSH command argument semantics", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "paperclip-ssh-argv-"));
+    const executable = join(root, "ssh");
+    // Exercise the constructed remote shell command, replacing only SSH's network.
+    await writeFile(executable, `#!${process.execPath}
+const fs = require('node:fs');
+const { spawnSync } = require('node:child_process');
+fs.writeFileSync(${JSON.stringify(join(root, "invoked"))}, 'yes');
+const result = spawnSync('/bin/sh', ['-c', process.argv.at(-1)], {
+  input: fs.readFileSync(0), encoding: 'utf8',
+  env: { HOME: ${JSON.stringify(root)}, PATH: '/usr/local/bin:/usr/bin:/bin' },
+});
+process.stdout.write(result.stdout || '');
+process.stderr.write(result.stderr || '');
+process.exit(result.status ?? 1);
+`);
+    await chmod(executable, 0o700);
+    vi.stubEnv("PATH", `${root}:${process.env.PATH}`);
+  });
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const createRunner = () => createNativeSshCommandRunner({
+    spec: {
+      host: "fixture.invalid", port: 22, username: "fixture",
+      remoteWorkspacePath: root, remoteCwd: root,
+      privateKey: null, knownHosts: null, strictHostKeyChecking: true,
+    },
+    defaultCwd: root,
+  });
+
+  it.each(["sh", "bash"])("preserves %s shell positional arguments and stdin", async (command) => {
+    const value = "spaces 'quotes'\n$(printf must-stay-literal)";
+    const result = await createRunner().execute({
+      command,
+      args: ["-c", 'set -eu; printf "%s\\n" "$0" "$1" "$2"; cat', "runner entry", value, ""],
+      stdin: "stdin stays separate\n",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(`runner entry\n${value}\n\nstdin stays separate\n`);
+  });
+
+  it("applies environment values to an executable without treating exec as a program", async () => {
+    const value = "a 'quoted' value\n$HOME; printf must-stay-literal";
+    const result = await createRunner().execute({
+      command: "printenv", args: ["FACTORY_TEST_VALUE"],
+      env: { FACTORY_TEST_VALUE: value }, stdin: "",
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe(`${value}\n`);
+  });
+
+  it("preserves shell environment, stderr and nonzero status", async () => {
+    const result = await createRunner().execute({
+      command: "sh", args: ["-c", 'printf "%s" "$FACTORY_TEST_VALUE" >&2; exit 23', "runner"],
+      env: { FACTORY_TEST_VALUE: "specific failure" }, stdin: "",
+    });
+    expect(result.exitCode).toBe(23);
+    expect(result.stderr).toBe("specific failure");
+  });
+
+  it("rejects an invalid environment name before invoking SSH", async () => {
+    await expect(createRunner().execute({
+      command: "true", env: { "INVALID;KEY": "value" }, stdin: "",
+    })).rejects.toThrow("Invalid SSH environment variable key");
+    await expect(readFile(join(root, "invoked"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
