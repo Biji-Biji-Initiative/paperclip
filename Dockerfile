@@ -236,6 +236,7 @@ RUN curl -fsSLo source.tar.gz "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/porta
 FROM base AS production
 ARG USER_UID=1000
 ARG USER_GID=1000
+ARG PAPERCLIP_RUNNER_SUBSCRIPTIONS_ONLY=false
 # Refreshes the tool layer below when it changes (CI stamps an ISO week, so
 # the @latest CLI tools advance weekly). Without it the cached layer would
 # freeze the tools until an unrelated cache bust.
@@ -266,7 +267,16 @@ RUN npm install --global --omit=dev npm@12.2.1 && npm --version
 COPY --from=github-cli /usr/local/bin/gh /usr/local/bin/gh
 COPY --from=openssh-client-build /client-bin/ /usr/local/bin/
 COPY --from=openssh-client-build /client-libexec/ /usr/local/libexec/
-RUN ssh -V && gh --version && ssh -G github.com > /dev/null
+RUN if [ "${PAPERCLIP_RUNNER_SUBSCRIPTIONS_ONLY}" = "true" ]; then \
+      rm -f /usr/local/bin/gh; \
+    fi \
+  && ssh -V \
+  && if [ "${PAPERCLIP_RUNNER_SUBSCRIPTIONS_ONLY}" = "true" ]; then \
+       test ! -e /usr/local/bin/gh; \
+     else \
+       gh --version; \
+     fi \
+  && ssh -G github.com > /dev/null
 
 COPY --from=runner-provider-pack /provider-pack /opt/paperclip-runner/provider-pack
 # Managed deployments can remap node's UID at startup. This immutable pack
