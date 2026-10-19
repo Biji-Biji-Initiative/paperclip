@@ -67,6 +67,7 @@ describe("CompanySettingsNav", () => {
 
   it("maps company settings routes to the expected shared tab value", () => {
     expect(getCompanySettingsTab("/company/settings")).toBe("general");
+    expect(getCompanySettingsTab("/PAP/company/settings/costs")).toBe("costs");
     expect(getCompanySettingsTab("/PAP/company/settings")).toBe("general");
     expect(getCompanySettingsTab("/company/settings/environments")).toBe("instance-environments");
     expect(getCompanySettingsTab("/company/export")).toBe("export");
@@ -121,6 +122,7 @@ describe("CompanySettingsNav", () => {
         value: "members",
         items: [
           { value: "general", label: "General" },
+          { value: "costs", label: "Costs" },
           { value: "export", label: "Export" },
           { value: "import", label: "Import" },
           { value: "members", label: "Members" },
@@ -162,6 +164,7 @@ describe("CompanySettingsNav", () => {
     );
     expect(renderedValues).toEqual([
       "general",
+      "costs",
       "export",
       "import",
       "members",

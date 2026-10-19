@@ -6,6 +6,7 @@ import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, proj
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { subscriptionsOnly } from "./ai-billing-policy.js";
 
 export interface CostDateRange {
   from?: Date;
@@ -140,6 +141,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         unpricedEventCount: Number(unpricedEventCount ?? 0),
         budgetCents: company.budgetMonthlyCents,
         utilizationPercent: Number(utilization.toFixed(2)),
+        aiBillingPolicy: subscriptionsOnly() ? "subscriptions_only" as const : "unrestricted" as const,
       };
     },
 
@@ -353,6 +355,65 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         .where(and(...conditions))
         .groupBy(costEvents.provider, costEvents.biller, costEvents.billingType, costEvents.model)
         .orderBy(desc(sumAsNumber(costEvents.costCents)));
+    },
+
+    byAccount: async (
+      companyId: string,
+      visibleAccounts: ReadonlyArray<{ id: string; grantId: string; provider: string }>,
+      range?: CostDateRange,
+    ) => {
+      const conditions = [eq(costEvents.companyId, companyId)];
+      if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
+      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
+      // The runtime saves this selection after authorizing the account. Never
+      // substitute an agent's mutable current connection, a model or an email.
+      // Visibility comes from the normal AI account metadata service; missing,
+      // deleted or inaccessible accounts retain their usage in the null bucket.
+      const savedConnection = sql<string>`${heartbeatRuns.contextSnapshot} #>> '{aiConnection,connectionId}'`;
+      const savedGrant = sql<string>`${heartbeatRuns.contextSnapshot} #>> '{aiConnection,grantId}'`;
+      const matches = visibleAccounts.map(account => sql<boolean>`(
+        ${savedConnection} = ${account.id} and ${savedGrant} = ${account.grantId}
+        and ${heartbeatRuns.contextSnapshot} #>> '{aiConnection,provider}' = ${account.provider}
+        and ${costEvents.provider} = ${account.provider}
+      )`);
+      const visible = matches.length ? sql<boolean>`(${sql.join(matches, sql` or `)})` : sql<boolean>`false`;
+      const connectionId = sql<string | null>`case when ${visible} then ${savedConnection} else null end`;
+      const grantId = sql<string | null>`case when ${visible} then ${savedGrant} else null end`;
+      const ledger = db.select({
+        connectionId: connectionId.as("account_connection_id"),
+        grantId: grantId.as("account_grant_id"),
+        provider: costEvents.provider,
+        biller: costEvents.biller,
+        billingType: costEvents.billingType,
+        model: costEvents.model,
+        costCents: costEvents.costCents,
+        inputTokens: costEvents.inputTokens,
+        cachedInputTokens: costEvents.cachedInputTokens,
+        outputTokens: costEvents.outputTokens,
+        costStatus: costEvents.costStatus,
+        runId: heartbeatRuns.id,
+      }).from(costEvents).leftJoin(heartbeatRuns, and(
+        eq(heartbeatRuns.id, costEvents.heartbeatRunId),
+        eq(heartbeatRuns.companyId, costEvents.companyId),
+        eq(heartbeatRuns.agentId, costEvents.agentId),
+      )).where(and(...conditions)).as("account_ledger");
+      return db.select({
+        connectionId: ledger.connectionId,
+        grantId: ledger.grantId,
+        provider: ledger.provider,
+        biller: ledger.biller,
+        billingType: ledger.billingType,
+        model: ledger.model,
+        costCents: sql<number>`coalesce(sum(${ledger.costCents}), 0)::double precision`,
+        inputTokens: sql<number>`coalesce(sum(${ledger.inputTokens}), 0)::double precision`,
+        cachedInputTokens: sql<number>`coalesce(sum(${ledger.cachedInputTokens}), 0)::double precision`,
+        outputTokens: sql<number>`coalesce(sum(${ledger.outputTokens}), 0)::double precision`,
+        unpricedEventCount: sql<number>`count(*) filter (where ${ledger.costStatus} = 'unpriced')::double precision`,
+        eventCount: sql<number>`count(*)::double precision`,
+        runCount: sql<number>`count(distinct ${ledger.runId})::double precision`,
+      }).from(ledger)
+        .groupBy(ledger.connectionId, ledger.grantId, ledger.provider, ledger.biller, ledger.billingType, ledger.model)
+        .orderBy(desc(sql`sum(${ledger.costCents})`));
     },
 
     byBiller: async (companyId: string, range?: CostDateRange) => {

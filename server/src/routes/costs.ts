@@ -23,6 +23,7 @@ import {
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
+import { aiConnectionService } from "../services/ai-connections.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 export function parseCostDateRange(query: Record<string, unknown>) {
@@ -214,6 +215,19 @@ export function costRoutes(
     const range = parseCostDateRange(req.query);
     const rows = await costs.byProvider(companyId, range);
     res.json(rows);
+  });
+
+  router.get("/companies/:companyId/costs/by-account", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
+    const range = parseCostDateRange(req.query);
+    // This metadata list enforces the existing human credential audience. It
+    // reads no token and does not probe usage, refresh or contact a provider.
+    const visibleAccounts = req.actor.type === "board"
+      ? await aiConnectionService(db).list(companyId, getActorInfo(req).actorId)
+      : [];
+    res.json(await costs.byAccount(companyId, visibleAccounts, range));
   });
 
   router.get("/companies/:companyId/costs/by-biller", async (req, res) => {

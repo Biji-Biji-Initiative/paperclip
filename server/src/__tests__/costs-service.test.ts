@@ -67,6 +67,7 @@ const mockHeartbeatService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockFetchAllQuotaWindows = vi.hoisted(() => vi.fn());
 const mockCostService = vi.hoisted(() => ({
+  byAccount: vi.fn().mockResolvedValue([]),
   createEvent: vi.fn(),
   summary: vi.fn().mockResolvedValue({ spendCents: 0 }),
   byAgent: vi.fn().mockResolvedValue([]),
@@ -109,8 +110,12 @@ const mockBudgetService = vi.hoisted(() => ({
 const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
+const mockAiList = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 
 function registerModuleMocks() {
+  vi.doMock("../services/ai-connections.js", () => ({
+    aiConnectionService: () => ({ list: mockAiList }),
+  }));
   vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     budgetService: () => mockBudgetService,
@@ -229,6 +234,33 @@ describe("cost routes", () => {
   it("returns 400 for an invalid 'to' date string", async () => {
     const { parseCostDateRange } = loadCostParsers();
     expect(() => parseCostDateRange({ to: "banana" })).toThrow(/invalid 'to' date/i);
+  });
+
+  it("uses only the viewer's visible account metadata and selected cost date range", async () => {
+    const visible = [{ id: "connection-1", grantId: "grant-1", provider: "openai" }];
+    mockAiList.mockResolvedValueOnce(visible);
+    const response = await request(createApp()).get("/api/companies/company-1/costs/by-account")
+      .query({ from: "2026-02-01T00:00:00.000Z" });
+    expect(response.status).toBe(200);
+    expect(mockAiList).toHaveBeenCalledWith("company-1", "board-user");
+    expect(mockCostService.byAccount).toHaveBeenCalledWith("company-1", visible,
+      { from: new Date("2026-02-01T00:00:00.000Z"), to: undefined });
+  });
+
+  it("denies account analytics before looking up account metadata", async () => {
+    mockAccessService.decide.mockResolvedValueOnce({ allowed: false });
+    const response = await request(createApp()).get("/api/companies/company-1/costs/by-account");
+    expect(response.status).toBe(403);
+    expect(mockAiList).not.toHaveBeenCalled();
+    expect(mockCostService.byAccount).not.toHaveBeenCalled();
+  });
+
+  it("does not expose human account identities to agent cost readers", async () => {
+    const response = await request(createAppWithActor({ type: "agent", agentId: "agent-1", companyId: "company-1" }))
+      .get("/api/companies/company-1/costs/by-account");
+    expect(response.status).toBe(200);
+    expect(mockAiList).not.toHaveBeenCalled();
+    expect(mockCostService.byAccount).toHaveBeenCalledWith("company-1", [], undefined);
   });
 
   it("returns finance summary rows for valid requests", async () => {
@@ -431,6 +463,59 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     await tempDb?.cleanup();
   });
 
+  it("projects saved visible account references while retaining unknown, foreign and unpriced usage", async () => {
+    const companyId = randomUUID(), foreignCompany = randomUUID();
+    const agentId = randomUUID(), otherAgent = randomUUID(), foreignAgent = randomUUID();
+    const account = { id: randomUUID(), grantId: randomUUID(), provider: "openai" };
+    await db.insert(companies).values([companyId, foreignCompany].map(id => ({
+      id, name: "Account costs", issuePrefix: `T${id.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    })));
+    await db.insert(agents).values([
+      { id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner" },
+      { id: otherAgent, companyId, name: "Other worker", adapterType: "paperclip_runner" },
+      { id: foreignAgent, companyId: foreignCompany, name: "Foreign worker", adapterType: "paperclip_runner" },
+    ]);
+    const known = randomUUID(), unknown = randomUUID(), foreign = randomUUID(), mismatched = randomUUID();
+    const selection = { aiConnection: { connectionId: account.id, grantId: account.grantId, provider: "openai" } };
+    await db.insert(heartbeatRuns).values([
+      { id: known, companyId, agentId, contextSnapshot: selection },
+      { id: unknown, companyId, agentId, contextSnapshot: {} },
+      { id: foreign, companyId: foreignCompany, agentId: foreignAgent, contextSnapshot: selection },
+      { id: mismatched, companyId, agentId: otherAgent, contextSnapshot: selection },
+    ]);
+    const event = { companyId, agentId, provider: "openai", biller: "chatgpt", model: "fixture-model",
+      billingType: "subscription_included", costStatus: "unpriced", costCents: 0,
+      inputTokens: 10, cachedInputTokens: 3, outputTokens: 2, occurredAt: new Date("2026-02-20T00:00:00Z") };
+    await db.insert(costEvents).values([
+      { ...event, heartbeatRunId: known, costCents: 2_000_000_000, inputTokens: 2_000_000_000, costStatus: "reported" },
+      { ...event, heartbeatRunId: known, costCents: 2_000_000_000, inputTokens: 2_000_000_000 },
+      { ...event, heartbeatRunId: unknown },
+      { ...event, heartbeatRunId: foreign },
+      { ...event, heartbeatRunId: mismatched },
+      { ...event, heartbeatRunId: null },
+      { ...event, heartbeatRunId: known, occurredAt: new Date("2026-01-01T00:00:00Z"), costCents: 99 },
+      { ...event, companyId: foreignCompany, agentId: foreignAgent, heartbeatRunId: foreign, costCents: 777 },
+    ]);
+    // A current agent selection is neither historical attribution nor authority.
+    await db.update(agents).set({ runtimeConfig: { aiConnection: { connectionId: randomUUID(), grantId: randomUUID() } } })
+      .where(eq(agents.id, agentId));
+    const range = { from: new Date("2026-02-01T00:00:00Z"), to: new Date("2026-02-28T23:59:59Z") };
+    const rows = await costs.byAccount(companyId, [account], range);
+    expect(rows).toHaveLength(2);
+    expect(rows.find(row => row.connectionId === account.id)).toMatchObject({
+      grantId: account.grantId, costCents: 4_000_000_000, inputTokens: 4_000_000_000,
+      eventCount: 2, runCount: 1, unpricedEventCount: 1,
+    });
+    expect(rows.find(row => row.connectionId === null)).toMatchObject({
+      grantId: null, costCents: 0, inputTokens: 40, eventCount: 4, runCount: 1, unpricedEventCount: 4,
+    });
+    const hidden = await costs.byAccount(companyId, [], range);
+    expect(hidden).toHaveLength(1);
+    expect(hidden[0]).toMatchObject({ connectionId: null, grantId: null,
+      costCents: 4_000_000_000, eventCount: 6, unpricedEventCount: 5 });
+    expect(await costs.byAccount(companyId, [account], { from: new Date("2027-01-01") })).toEqual([]);
+  });
+
   it("persists unpriced token usage without inflating monthly spend", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -481,6 +566,10 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(await costs.summary(companyId)).toMatchObject({ spendCents: 125, unpricedEventCount: 1 });
     expect(await costs.summary(companyId, { to: new Date("2026-07-12T00:00:00.000Z") }))
       .toMatchObject({ spendCents: 0, unpricedEventCount: 0 });
+    vi.stubEnv("PAPERCLIP_AI_BILLING_POLICY", "subscriptions_only");
+    try {
+      expect(await costs.summary(companyId)).toMatchObject({ aiBillingPolicy: "subscriptions_only", unpricedEventCount: 1 });
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it("aggregates cost event sums above int32 without raising Postgres integer overflow", async () => {

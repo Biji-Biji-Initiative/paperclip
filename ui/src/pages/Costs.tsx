@@ -1,3 +1,4 @@
+import { CostAccounts, CostBillingPolicy } from "@/components/CostAccounts";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { useEffect, useMemo, useRef, useState, type ComponentType } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -35,7 +36,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const NO_COMPANY = "__none__";
-export type CostsMainTab = "overview" | "budgets" | "providers" | "billers" | "finance";
+export type CostsMainTab = "overview" | "budgets" | "providers" | "billers" | "accounts" | "finance";
 
 export interface CostsProps {
   /** Render inside Audit without a second page-level title or breadcrumb. */
@@ -571,6 +572,7 @@ export function Costs({
               <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
                 Inference spend, platform fees, credits, and live quota windows.
               </p>
+              <CostBillingPolicy policy={spendData?.summary.aiBillingPolicy} />
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
@@ -652,6 +654,7 @@ export function Costs({
             {!hideBudgetsTab ? <TabsTrigger value="budgets">Budgets</TabsTrigger> : null}
             <TabsTrigger value="providers">Providers</TabsTrigger>
             <TabsTrigger value="billers">Billers</TabsTrigger>
+            <TabsTrigger value="accounts">Accounts</TabsTrigger>
             <TabsTrigger value="finance">Finance</TabsTrigger>
           </TabsList>
         ) : null}
@@ -1090,6 +1093,12 @@ export function Costs({
               </Tabs>
             </>
           )}
+        </TabsContent>
+
+        <TabsContent value="accounts" className="mt-4 space-y-4">
+          {showCustomPrompt ? <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p>
+            : <CostAccounts companyId={companyId} from={from || undefined} to={to || undefined}
+                enabled={!!selectedCompanyId && customReady && mainTab === "accounts"} />}
         </TabsContent>
 
         <TabsContent value="finance" className="mt-4 space-y-4">

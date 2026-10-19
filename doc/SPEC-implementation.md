@@ -324,6 +324,8 @@ Invariants:
 - `model` text not null
 - `cost_status` text not null default `reported`; `unpriced` when usage exists but no price was reported
 - Company and issue-tree summaries include `unpricedEventCount` under the same company, date-range and issue-visibility filters as their totals. Board cost screens identify recorded charges and show missing-price usage explicitly; dollar totals and recorded-charge budget thresholds do not cap unpriced provider spending.
+- Cost summaries report the operator instance AI billing policy. Older-server absence stays unknown in the UI; subscription-only policy prohibits API fallback and does not make unpriced usage free.
+- Account analytics use the cost event's same-company, same-agent heartbeat run's saved managed-account references. They never infer a historical account from current agent configuration, model or email. The normal AI account metadata audience limits exposed references; missing, deleted, inaccessible or mismatched attribution remains an unknown bucket without dropping its charges/tokens. Protected host subscriptions remain unknown without an authoritative retained account receipt. No credential, usage probe or provider call is needed for this projection.
 - `input_tokens` int not null default 0
 - `output_tokens` int not null default 0
 - `cost_cents` int not null
@@ -1203,6 +1205,7 @@ Allowed states are `joined` and `left`. Endpoints require a concrete board user 
 - `GET /companies/:companyId/costs/summary`
 - `GET /companies/:companyId/costs/by-agent`
 - `GET /companies/:companyId/costs/by-project`
+- `GET /companies/:companyId/costs/by-account` applies company cost-read authorization and date range, returns visible saved connection/grant references grouped with provider/biller/model/billing type, recorded charges, tokens, unpriced events, matched runs and event counts. Agent readers receive no human account identities.
 - `PATCH /companies/:companyId/budgets`
 - `PATCH /agents/:agentId/budgets`
 
@@ -1501,6 +1504,7 @@ V1 UI routes:
 - `/companies/:id/tasks` task list/kanban
 - `/companies/:id/agents/:agentId` agent detail
 - `/companies/:id/costs` cost and budget dashboard
+- `/company/settings/costs` exposes the same company-scoped dashboard under Settings, including its Accounts tab. Account visibility changes do not authorize execution or change the ledger.
 - `/companies/:id/approvals` pending/history approvals
 - `/companies/:id/activity` audit/event stream
 

@@ -29,6 +29,8 @@ export interface CostSummary {
   unpricedEventCount: number;
   budgetCents: number;
   utilizationPercent: number;
+  /** Absent when an older server has not reported the instance policy. */
+  aiBillingPolicy?: "subscriptions_only" | "unrestricted";
 }
 
 export interface IssueCostSummary {
@@ -93,6 +95,23 @@ export interface CostByBiller {
   subscriptionOutputTokens: number;
   providerCount: number;
   modelCount: number;
+}
+
+/** Saved managed-account references, never inferred from current agent settings. */
+export interface CostByAccount {
+  connectionId: string | null;
+  grantId: string | null;
+  provider: string;
+  biller: string;
+  billingType: BillingType;
+  model: string;
+  costCents: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  unpricedEventCount: number;
+  eventCount: number;
+  runCount: number;
 }
 
 /** per-agent breakdown by provider + model, for identifying token-hungry agents */
