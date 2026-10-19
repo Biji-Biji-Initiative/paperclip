@@ -262,7 +262,7 @@ COPY --chown=node:node --from=runtime-app /app /app
 RUN apt-get purge -y gh openssh-client
 # The pinned Node image includes older npm transport/cache dependencies.
 # Update npm itself rather than editing its bundled dependency manifests.
-RUN npm install --global --omit=dev npm@12.2.0 && npm --version
+RUN npm install --global --omit=dev npm@12.2.1 && npm --version
 COPY --from=github-cli /usr/local/bin/gh /usr/local/bin/gh
 COPY --from=openssh-client-build /client-bin/ /usr/local/bin/
 COPY --from=openssh-client-build /client-libexec/ /usr/local/libexec/
