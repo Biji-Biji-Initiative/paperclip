@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { factoryProviderEnrollmentSchema } from "@paperclipai/shared/factory-worker-realm";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -39,9 +40,7 @@ const secretRefSchema = z.object({
 
 const sshEnvironmentConfigBaseSchema = z.object({
   factoryWorkerPolicy: z.literal("factory-worker-scope-v2").optional(),
-  factoryProviderAdmission: z.object({ provider: z.enum(["codex", "claude"]),
-    workerPlanSha256: z.string().regex(/^[a-f0-9]{64}$/),
-  }).strict().optional(),
+  factoryProviderAdmission: factoryProviderEnrollmentSchema.optional(),
   host: z.string({ error: "SSH environments require a host." }).trim().min(1, "SSH environments require a host."),
   port: z.coerce.number().int().min(1).max(65535).default(22),
   username: z.string({ error: "SSH environments require a username." }).trim().min(1, "SSH environments require a username."),

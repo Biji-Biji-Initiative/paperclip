@@ -10,6 +10,7 @@ import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.
 import { randomUUID } from "node:crypto";
 import { validateFactoryOwnRunAuthorization, validateFactoryProviderBinding, type FactoryOwnRunAuthorization, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
 import { factoryExecutionProvider, isFactoryProviderEnrollment } from "./factory-worker-provider-selection.js";
+import { factoryEnrollmentMatchesCompany, sameFactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 
 export interface FactoryWorkerAttempt {
   readonly runId: string;
@@ -100,8 +101,12 @@ export async function authorizeFactoryWorker(input: {
   const selected = target.factoryProviderAdmission;
   if (registered !== undefined || selected !== undefined) {
     if (!isFactoryProviderEnrollment(registered) || !isFactoryProviderEnrollment(selected) ||
-        registered.provider !== selected.provider || selected.provider !== factoryExecutionProvider(input.execution) ||
-        registered.workerPlanSha256 !== selected.workerPlanSha256) fail();
+        !sameFactoryProviderEnrollment(registered, selected) ||
+        !factoryEnrollmentMatchesCompany(registered, binding.companyId) ||
+        selected.provider !== factoryExecutionProvider(input.execution)) fail();
+    // V2 worker/controller/native receivers do not carry an expected realm.
+    // Persisting its public identity must never silently downgrade its authority.
+    if (selected && "realm" in selected) fail();
   }
   return { run, lease, providerMode: selected };
 }

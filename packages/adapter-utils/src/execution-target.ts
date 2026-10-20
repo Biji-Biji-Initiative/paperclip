@@ -5,6 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import type { FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
@@ -138,7 +139,7 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
   /** Copied only from the persisted, validated SSH environment config. */
   readonly factoryWorkerPolicy?: "factory-worker-scope-v2";
-  readonly factoryProviderAdmission?: { readonly provider: "codex" | "claude"; readonly workerPlanSha256: string };
+  readonly factoryProviderAdmission?: FactoryProviderEnrollment;
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;

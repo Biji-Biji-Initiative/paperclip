@@ -21,4 +21,17 @@ describe("explicit Factory provider enrollment", () => {
       expect(() => normalizeEnvironmentConfigForProbe({ driver: "ssh", config })).toThrow();
     }
   });
+  it("preserves explicit tenant identity on persistence, probe and runtime paths", () => {
+    const mode = { schema: "factory.provider-enrollment.v3", provider: "claude", workerPlanSha256: "b".repeat(64),
+      realm: { schema: "factory.worker-realm.v1", companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "factory-botak-g2" } };
+    const config = { ...base, factoryWorkerPolicy: "factory-worker-scope-v2", factoryProviderAdmission: mode };
+    for (const normalize of [normalizeEnvironmentConfig, normalizeEnvironmentConfigForProbe]) {
+      expect(normalize({ driver: "ssh", config })).toMatchObject({ factoryProviderAdmission: mode });
+      for (const realm of [{ ...mode.realm, companyId: "*" }, { ...mode.realm, authorityId: "*" },
+        { schema: mode.realm.schema, companyId: mode.realm.companyId }]) {
+        expect(() => normalize({ driver: "ssh", config: { ...config, factoryProviderAdmission: { ...mode, realm } } })).toThrow();
+      }
+    }
+    expect(parseEnvironmentDriverConfig({ driver: "ssh", config })).toMatchObject({ config: { factoryProviderAdmission: mode } });
+  });
 });

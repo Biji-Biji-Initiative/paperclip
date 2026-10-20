@@ -6,13 +6,14 @@ import type { FactoryAdmissionProvider } from "@paperclipai/adapter-utils/factor
 import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { createAuthorizedFactoryWorkerAdmission, createAuthorizedFactoryWorkerLease } from "./factory-worker-runtime.js";
+import { factoryProviderEnrollmentSchema, type FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 
 // DB-current mutation fixtures. Existing capacity integration suite proves SQL/company predicates.
-function fixture(mode = true, provider: FactoryAdmissionProvider = "codex") {
+function fixture(mode = true, provider: FactoryAdmissionProvider = "codex", enrollment?: FactoryProviderEnrollment) {
   const runId = randomUUID(), leaseId = randomUUID(), environmentId = randomUUID(), workspaceId = randomUUID();
   const runnerInstanceId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = "session-" + randomUUID();
   const cwd = `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`;
-  const admission = { provider, workerPlanSha256: "a".repeat(64) };
+  const admission = enrollment ?? { provider, workerPlanSha256: "a".repeat(64) };
   const config = { factoryWorkerPolicy: FACTORY_WORKER_POLICY, host: "fixture.invalid", port: 2222,
     username: "node", knownHosts: "fixture-pin", strictHostKeyChecking: true, remoteWorkspacePath: cwd,
     ...(mode ? { factoryProviderAdmission: admission } : {}) };
@@ -21,7 +22,7 @@ function fixture(mode = true, provider: FactoryAdmissionProvider = "codex") {
     session: { normalizedSessionId: sessionId, driverKind: provider === "codex" ? "codex_app_server" : "acpx_runtime",
       protocolVersion: 1, lifecyclePolicy: { mode: "per_turn" } } } as NativeExecutionInput;
   const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", environmentId, leaseId,
-    factoryWorkerPolicy: FACTORY_WORKER_POLICY, ...(mode ? { factoryProviderAdmission: { ...admission } } : {}),
+    factoryWorkerPolicy: FACTORY_WORKER_POLICY, ...(mode ? { factoryProviderAdmission: structuredClone(admission) } : {}),
     remoteCwd: cwd, spec: { host: config.host, port: config.port, username: config.username, remoteCwd: cwd, remoteWorkspacePath: cwd,
       knownHosts: config.knownHosts, strictHostKeyChecking: true, privateKey: "synthetic-not-read" } };
   const run = { id: runId, companyId: FACTORY_COMPANY_ID, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
@@ -44,6 +45,18 @@ function fixture(mode = true, provider: FactoryAdmissionProvider = "codex") {
 }
 
 describe("Factory provider DB-current admission", () => {
+  it("keeps versioned realms closed until the signed/native receivers bind their authority", async () => {
+    const mode = { schema: "factory.provider-enrollment.v3", provider: "codex", workerPlanSha256: "a".repeat(64),
+      realm: { schema: "factory.worker-realm.v1", companyId: FACTORY_COMPANY_ID, authorityId: "factory-biji-g2" } };
+    const f = fixture(true, "codex", factoryProviderEnrollmentSchema.parse(mode));
+    await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toThrow("native_execution_ownership_unverified");
+    f.environment.config.factoryProviderAdmission = factoryProviderEnrollmentSchema.parse({ ...mode,
+      realm: { ...mode.realm, authorityId: "another-authority" } });
+    await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toThrow("native_execution_ownership_unverified");
+    const foreign = fixture(true, "codex", factoryProviderEnrollmentSchema.parse({ ...mode,
+      realm: { ...mode.realm, companyId: randomUUID() } }));
+    await expect(createAuthorizedFactoryWorkerAdmission(foreign)).rejects.toThrow("native_execution_ownership_unverified");
+  });
   it("keeps legacy credential-free and prevents old caller downgrade of explicit mode", async () => {
     const f = fixture(false);
     expect(await createAuthorizedFactoryWorkerAdmission(f)).not.toHaveProperty("providerAdmission");

@@ -14,6 +14,14 @@ describe("Factory subscription provider selection", () => {
       expect(isFactoryProviderEnrollment(value)).toBe(false);
     }
   });
+  it("recognizes the versioned realm without admitting absent or wildcard identity", () => {
+    const mode = { schema: "factory.provider-enrollment.v3", provider: "codex", workerPlanSha256: "a".repeat(64),
+      realm: { schema: "factory.worker-realm.v1", companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "factory-botak-g2" } };
+    expect(isFactoryProviderEnrollment(mode)).toBe(true);
+    expect(isFactoryProviderEnrollment({ ...mode, realm: undefined })).toBe(false);
+    expect(isFactoryProviderEnrollment({ ...mode, realm: { ...mode.realm, companyId: "*" } })).toBe(false);
+    expect(isFactoryProviderEnrollment({ ...mode, canonicalProfile: "other-staff" })).toBe(false);
+  });
   it("requires the provider's corresponding native driver", () => {
     const selected = (provider: unknown, driverKind: string) => factoryExecutionProvider({ provider,
       session: { driverKind } } as Pick<NativeExecutionInput, "provider" | "session">);
