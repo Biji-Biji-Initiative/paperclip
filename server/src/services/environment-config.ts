@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { factoryProviderEnrollmentSchema } from "@paperclipai/shared/factory-worker-realm";
+import { factoryProviderEnrollmentSchema, factoryWorkerPolicySchema, factoryEnrollmentMatchesPolicy } from "@paperclipai/shared/factory-worker-realm";
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
 import type {
@@ -39,7 +39,7 @@ const secretRefSchema = z.object({
 }).strict();
 
 const sshEnvironmentConfigBaseSchema = z.object({
-  factoryWorkerPolicy: z.literal("factory-worker-scope-v2").optional(),
+  factoryWorkerPolicy: factoryWorkerPolicySchema.optional(),
   factoryProviderAdmission: factoryProviderEnrollmentSchema.optional(),
   host: z.string({ error: "SSH environments require a host." }).trim().min(1, "SSH environments require a host."),
   port: z.coerce.number().int().min(1).max(65535).default(22),
@@ -60,7 +60,8 @@ const sshEnvironmentConfigBaseSchema = z.object({
   strictHostKeyChecking: z.boolean().optional().default(true),
 }).strict();
 const hasFactoryProviderPolicy = (value: { factoryProviderAdmission?: unknown; factoryWorkerPolicy?: string }) =>
-  !value.factoryProviderAdmission || value.factoryWorkerPolicy === "factory-worker-scope-v2";
+  value.factoryWorkerPolicy === undefined ? value.factoryProviderAdmission === undefined
+    : factoryEnrollmentMatchesPolicy(value.factoryProviderAdmission, value.factoryWorkerPolicy);
 const sshEnvironmentConfigSchema = sshEnvironmentConfigBaseSchema.refine(hasFactoryProviderPolicy,
   "Provider admission requires the Factory worker policy.");
 

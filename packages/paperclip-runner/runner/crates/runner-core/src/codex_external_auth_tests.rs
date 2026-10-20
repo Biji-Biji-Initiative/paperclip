@@ -40,6 +40,31 @@ fn capability_accepts_named_bound_admission() {
     assert_eq!(guard().reference.profile_ref, "fixture@example.invalid");
 }
 #[test]
+fn factory_worker_realm_requires_both_expected_identities_before_provider_selection() {
+    let now = unix_ms().unwrap();
+    let (_, _, bytes) = fixture(now);
+    let company = "a2b00000-0000-4000-8000-000000000001";
+    let realm = FactoryWorkerRealm::new(company, "fixture-botak").unwrap();
+    let mut envelope: Value = serde_json::from_slice(&bytes).unwrap();
+    envelope["reference"]["companyId"] = json!(company);
+    envelope["reference"]["authorityId"] = json!("fixture-botak");
+    let bytes = serde_json::to_vec(&envelope).unwrap();
+    let guard = ExternalAuthGuard::from_bytes_for_realm(&bytes, now, Some(&realm)).unwrap();
+    let binding = ExternalAuthRunBinding { run_id: "fixture-run", environment_lease_id: "fixture-lease",
+        normalized_session_id: "fixture-session", runner_instance_id: "fixture-runner" };
+    guard.reference.assert_run_for_realm(&binding, Some(&realm)).unwrap();
+    assert_eq!(ExternalAuthGuard::from_bytes(&bytes, now).err().unwrap().0, HoldReason::ForeignAuthority);
+    for expected in [
+        FactoryWorkerRealm::new(company, "fixture-mereka").unwrap(),
+        FactoryWorkerRealm::new("a2b00000-0000-4000-8000-000000000002", "fixture-botak").unwrap(),
+    ] {
+        assert_eq!(ExternalAuthGuard::from_bytes_for_realm(&bytes, now, Some(&expected)).err().unwrap().0, HoldReason::ForeignAuthority);
+        assert!(guard.reference.assert_run_for_realm(&binding, Some(&expected)).is_err());
+    }
+    let foreign = ExternalAuthRunBinding { run_id: "foreign-run", ..binding };
+    assert_eq!(guard.reference.assert_run_for_realm(&foreign, Some(&realm)).err().unwrap().0, HoldReason::BindingMismatch);
+}
+#[test]
 fn foreign_company_rejected() {
     assert_eq!(
         reject_mutation(|v| v["reference"]["companyId"] = json!("another-company")).0,

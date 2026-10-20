@@ -5,7 +5,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
-import type { FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
+import { isFactoryWorkerPolicy, type FactoryProviderEnrollment, type FactoryWorkerPolicy } from "@paperclipai/shared/factory-worker-realm";
 import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
@@ -138,7 +138,7 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
   /** Copied only from the persisted, validated SSH environment config. */
-  readonly factoryWorkerPolicy?: "factory-worker-scope-v2";
+  readonly factoryWorkerPolicy?: FactoryWorkerPolicy;
   readonly factoryProviderAdmission?: FactoryProviderEnrollment;
   kind: "remote";
   transport: "ssh";
@@ -1616,7 +1616,7 @@ export async function prepareGitHubExecutionEnvironment(input: {
   networkAccess: boolean;
 }): Promise<Record<string, string>> {
   if (input.target?.kind === "remote" && input.target.transport === "ssh" &&
-      input.target.factoryWorkerPolicy === "factory-worker-scope-v2") {
+      isFactoryWorkerPolicy(input.target.factoryWorkerPolicy)) {
     if (input.hostCredentials) throw new Error("factory_worker_host_github_forbidden");
     // A Factory host only accepts scoped native admission. Its image and
     // private lease home supply the toolchain; do not run an unleased SSH probe

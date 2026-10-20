@@ -27,7 +27,7 @@ import type {
 } from "@paperclipai/shared";
 import { resolveRunnerEnvironmentForRun } from "./runner-environment-lifecycle.js";
 import { parseEnvironmentDriverConfig } from "./environment-config.js";
-import { FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { isFactoryWorkerPolicy } from "@paperclipai/shared/factory-worker-realm";
 import { environmentService } from "./environments.js";
 import {
   environmentRuntimeService,
@@ -161,7 +161,7 @@ function isNativeFactoryEnvironment(environment: Environment, adapterType: strin
     { environmentId: environment.id, driver: environment.driver },
   );
   const parsed = parseEnvironmentDriverConfig(environment);
-  if (parsed.driver !== "ssh" || parsed.config.factoryWorkerPolicy !== FACTORY_WORKER_POLICY) {
+  if (parsed.driver !== "ssh" || !isFactoryWorkerPolicy(parsed.config.factoryWorkerPolicy)) {
     throw new EnvironmentRunError("unsupported_environment", "Factory worker policy is not qualified.",
       { environmentId: environment.id, driver: environment.driver });
   }
@@ -551,7 +551,7 @@ export function environmentRunOrchestrator(
         duplexObservabilityRecorder: input.duplexObservabilityRecorder ?? null,
       });
       if (nativeFactory && (executionTarget?.kind !== "remote" || executionTarget.transport !== "ssh" ||
-          executionTarget.factoryWorkerPolicy !== FACTORY_WORKER_POLICY)) {
+          !isFactoryWorkerPolicy(executionTarget.factoryWorkerPolicy))) {
         throw new Error("factory_worker_native_target_required");
       }
       const realizationMode = workspaceRealization.mode === "in_place" ? "in_place" : "copy";

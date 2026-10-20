@@ -1,10 +1,11 @@
 import { FACTORY_WORKER_BUSY_EXIT, FactoryWorkerBusyError, validateFactoryWorkerLeaseDescriptor,
   type FactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
-import { FACTORY_ADMISSION_SIGNED_SCHEMA, FACTORY_PROVIDER_MARKER, createFactoryControllerAdmission,
+import { factoryAdmissionSignedSchema, factoryProviderMarker, createFactoryControllerAdmission,
   encodeFactoryControllerAdmission, validateFactoryPreparedReceipt, validateFactoryProviderBinding,
   type FactoryControllerAdmission, type FactoryProviderBinding, type FactoryPreparedReceipt,
   type FactorySignedAdmission } from "./factory-provider-admission.js";
 import { SshTransportUnverifiedError, type SshChannelExit, type SshProcessChannel } from "./ssh-process-channel.js";
+import { factoryWorkerRealmSchema } from "@paperclipai/shared/factory-worker-realm";
 
 type SignAdmission = (record: FactoryControllerAdmission, signal: AbortSignal) => Promise<FactorySignedAdmission>;
 
@@ -26,6 +27,7 @@ export async function admitFactoryProviderLease(raw: SshProcessChannel, descript
   let dataListener: ((value: Uint8Array) => void) | undefined;
   let exitListener: ((value: SshChannelExit) => void) | undefined;
   const signing = new AbortController();
+  const marker = factoryProviderMarker(provider), realmFields = "realm" in provider ? 1 : 0;
   let resolvePrepared!: (value: FactoryPreparedReceipt | null) => void;
   let rejectPrepared!: (error: Error) => void;
   let resolveAccepted!: () => void, rejectAccepted!: (error: Error) => void;
@@ -49,8 +51,12 @@ export async function admitFactoryProviderLease(raw: SshProcessChannel, descript
   const deliverExit = () => {
     if (exit && exitListener && !exitDelivered) { exitDelivered = true; exitListener(exit); }
   };
-  const identity = (value: Record<string, unknown>) => ["companyId", "runId", "leaseId", "sessionId"]
-    .every(key => value[key] === lease[key as keyof FactoryWorkerLeaseDescriptor]);
+  const identity = (value: Record<string, unknown>) => {
+    if (!["companyId", "runId", "leaseId", "sessionId"].every(key => value[key] === lease[key as keyof FactoryWorkerLeaseDescriptor])) return false;
+    if (!("realm" in provider)) return !Object.hasOwn(value, "realm");
+    const realm = factoryWorkerRealmSchema.safeParse(value.realm);
+    return realm.success && realm.data.companyId === provider.realm.companyId && realm.data.authorityId === provider.realm.authorityId;
+  };
   raw.onData(chunk => {
     if (stage === "accepted") { deliverData(Buffer.from(chunk)); return; }
     if (stage !== "prepare" && stage !== "admit") { fail(); return; }
@@ -68,7 +74,7 @@ export async function admitFactoryProviderLease(raw: SshProcessChannel, descript
     const value = parsed as Record<string, unknown>;
     frame = Buffer.alloc(0);
     if (stage === "prepare") {
-      if (Object.keys(value).length === 9 && value.protocol === FACTORY_PROVIDER_MARKER && value.type === "admission" && value.status === "busy" &&
+      if (Object.keys(value).length === 9 + realmFields && value.protocol === marker && value.type === "admission" && value.status === "busy" &&
           value.code === "busy" && value.dispatchAttempted === false && identity(value)) {
         stage = "busy"; resolvePrepared(null);
       } else {
@@ -79,7 +85,7 @@ export async function admitFactoryProviderLease(raw: SshProcessChannel, descript
       if (combined.length > newline + 1) fail();
       return;
     }
-    if (Object.keys(value).length !== 8 || value.protocol !== FACTORY_PROVIDER_MARKER || value.type !== "admission" ||
+    if (Object.keys(value).length !== 8 + realmFields || value.protocol !== marker || value.type !== "admission" ||
         value.status !== "accepted" || value.dispatchAttempted !== true || !identity(value)) { fail(); return; }
     stage = "accepted"; resolveAccepted(); deliverData(combined.subarray(newline + 1));
   });
@@ -106,7 +112,7 @@ export async function admitFactoryProviderLease(raw: SshProcessChannel, descript
     if ((stage as string) !== "signing" || exit || signing.signal.aborted) throw new SshTransportUnverifiedError();
     const signature = await Promise.race([sign(record, signing.signal), accepted.then(() => { throw new SshTransportUnverifiedError(); })]);
     if ((stage as string) !== "signing" || exit || signing.signal.aborted ||
-        Object.keys(signature).length !== 3 || signature.schema !== FACTORY_ADMISSION_SIGNED_SCHEMA ||
+        Object.keys(signature).length !== 3 || signature.schema !== factoryAdmissionSignedSchema(record) ||
         signature.payload !== encodeFactoryControllerAdmission(record).toString("base64") ||
         typeof signature.signature !== "string" || signature.signature.length > 4096) throw new SshTransportUnverifiedError();
     signedFrame = Buffer.from(JSON.stringify(signature) + "\n");

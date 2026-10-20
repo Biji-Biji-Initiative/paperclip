@@ -13,6 +13,7 @@ pub mod aws_agentcore_provider;
 pub mod claude_managed_provider;
 pub mod claude_external_auth;
 pub mod factory_child_fds;
+pub mod factory_worker_realm;
 pub mod codex_provider;
 pub mod codex_external_auth;
 mod sensitive_memory;

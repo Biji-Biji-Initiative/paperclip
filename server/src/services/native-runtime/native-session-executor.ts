@@ -7394,7 +7394,7 @@ export async function executePaperclipNativeSession(input: {
 }): Promise<AdapterExecutionResult> {
   if (isFactoryWorkerTarget(input.runnerExecutionTarget)) {
     assertFactoryWorkerCurrentDurableAuthority(input);
-    assertFactoryWorkerColdExecution(input.execution, input.restartRecovery);
+    assertFactoryWorkerColdExecution(input.execution, input.restartRecovery, input.runnerExecutionTarget);
     assertFactoryWorkerCredentialBoundary(input.runnerEnvironment, input.managedAiCredentialHome);
     if (!input.useRunnerd || input.backend) throw new Error("factory_worker_native_backend_required");
     await authorizeFactoryWorker({ db: input.db, execution: input.execution,
@@ -10873,7 +10873,7 @@ export async function createRunnerdBackend(input: {
 }): Promise<NativeSessionBackend & { bindManagedSession(session: NativeSession): NativeSession }> {
   if (isFactoryWorkerTarget(input.runnerExecutionTarget)) {
     assertFactoryWorkerCurrentDurableAuthority(input);
-    assertFactoryWorkerColdExecution(input.execution, input.restartRecovery);
+    assertFactoryWorkerColdExecution(input.execution, input.restartRecovery, input.runnerExecutionTarget);
     assertFactoryWorkerCredentialBoundary(input.runnerEnvironment, input.managedAiCredentialHome);
     await authorizeFactoryWorker({ db: input.db, execution: input.execution, target: input.runnerExecutionTarget });
     await assertFactoryWorkspaceStagingOwned({ db: input.db, companyId: input.execution.binding.companyId,

@@ -24,7 +24,7 @@ describe("explicit Factory provider enrollment", () => {
   it("preserves explicit tenant identity on persistence, probe and runtime paths", () => {
     const mode = { schema: "factory.provider-enrollment.v3", provider: "claude", workerPlanSha256: "b".repeat(64),
       realm: { schema: "factory.worker-realm.v1", companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "factory-botak-g2" } };
-    const config = { ...base, factoryWorkerPolicy: "factory-worker-scope-v2", factoryProviderAdmission: mode };
+    const config = { ...base, factoryWorkerPolicy: "factory-worker-scope-v3", factoryProviderAdmission: mode };
     for (const normalize of [normalizeEnvironmentConfig, normalizeEnvironmentConfigForProbe]) {
       expect(normalize({ driver: "ssh", config })).toMatchObject({ factoryProviderAdmission: mode });
       for (const realm of [{ ...mode.realm, companyId: "*" }, { ...mode.realm, authorityId: "*" },
@@ -33,5 +33,10 @@ describe("explicit Factory provider enrollment", () => {
       }
     }
     expect(parseEnvironmentDriverConfig({ driver: "ssh", config })).toMatchObject({ config: { factoryProviderAdmission: mode } });
+    for (const invalid of [
+      { ...config, factoryWorkerPolicy: "factory-worker-scope-v2" },
+      { ...config, factoryProviderAdmission: { provider: "claude", workerPlanSha256: mode.workerPlanSha256 } },
+      { ...base, factoryWorkerPolicy: "factory-worker-scope-v3" },
+    ]) expect(() => normalizeEnvironmentConfig({ driver: "ssh", config: invalid })).toThrow();
   });
 });

@@ -7,6 +7,11 @@ const companyIdSchema = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 const authorityIdSchema = z.string().regex(/^[A-Za-z0-9_.:@+-]{1,128}$/);
 const provider = z.enum(["codex", "claude"]);
 const workerPlanSha256 = z.string().regex(/^[a-f0-9]{64}$/);
+export const factoryWorkerPolicySchema = z.enum(["factory-worker-scope-v2", "factory-worker-scope-v3"]);
+export type FactoryWorkerPolicy = z.infer<typeof factoryWorkerPolicySchema>;
+export function isFactoryWorkerPolicy(value: unknown): value is FactoryWorkerPolicy {
+  return factoryWorkerPolicySchema.safeParse(value).success;
+}
 
 /** Public identity only. Registration never supplies credentials or grants execution. */
 export const factoryWorkerRealmSchema = z.object({
@@ -27,6 +32,21 @@ export const factoryProviderEnrollmentSchema = z.union([
 
 export type FactoryWorkerRealm = z.infer<typeof factoryWorkerRealmSchema>;
 export type FactoryProviderEnrollment = z.infer<typeof factoryProviderEnrollmentSchema>;
+
+export function factoryEnrollmentMatchesPolicy(enrollment: unknown, policy: unknown): boolean {
+  if (enrollment === undefined) return policy === "factory-worker-scope-v2";
+  const parsed = factoryProviderEnrollmentSchema.safeParse(enrollment);
+  return parsed.success && ("realm" in parsed.data
+    ? policy === "factory-worker-scope-v3" : policy === "factory-worker-scope-v2");
+}
+
+/** Legacy absence is BIJ-only; every versioned scope requires explicit enrollment. */
+export function factoryWorkerScopeMatchesCompany(policy: unknown, enrollment: unknown, companyId: string): boolean {
+  if (!factoryEnrollmentMatchesPolicy(enrollment, policy)) return false;
+  if (enrollment === undefined) return companyId === LEGACY_FACTORY_COMPANY_ID;
+  const parsed = factoryProviderEnrollmentSchema.safeParse(enrollment);
+  return parsed.success && factoryEnrollmentMatchesCompany(parsed.data, companyId);
+}
 
 /** Environments are instance-wide; their selected realm must match the DB company. */
 export function factoryEnrollmentMatchesCompany(enrollment: FactoryProviderEnrollment, companyId: string): boolean {

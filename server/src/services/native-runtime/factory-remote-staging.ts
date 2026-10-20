@@ -2,7 +2,6 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { posix } from "node:path";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { FACTORY_COMPANY_ID } from "@paperclipai/adapter-utils/factory-worker-lease";
 
 const MAX_PAYLOAD = 64 * 1024 * 1024;
 const FAILURE = "factory_remote_staging_unverified";
@@ -222,8 +221,8 @@ except BaseException:
 `;
 
 function relativeTarget(workspaceRoot: string, targetPath: string) {
-  const prefix = `/workspace/${FACTORY_COMPANY_ID}/`;
-  if (!workspaceRoot.startsWith(prefix) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(workspaceRoot.slice(prefix.length)) ||
+  const uuid = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+  if (!new RegExp(`^/workspace/${uuid}/${uuid}$`).test(workspaceRoot) ||
       posix.normalize(workspaceRoot) !== workspaceRoot || /[\u0000-\u001f\u007f\\]/.test(workspaceRoot + targetPath)) throw new Error(FAILURE);
   const relative = posix.relative(workspaceRoot, targetPath);
   if (!posix.isAbsolute(targetPath) || posix.normalize(targetPath) !== targetPath ||

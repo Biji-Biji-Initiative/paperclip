@@ -317,7 +317,7 @@ import {
 } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { FactoryWorkerCapacityDeferredError } from "./native-runtime/factory-worker-capacity.js";
-import { FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { isFactoryWorkerPolicy } from "@paperclipai/shared/factory-worker-realm";
 import {
   authorizeChatConversationForBoundRun,
   isExternalChatWaitAuthorizationContention,
@@ -21567,7 +21567,7 @@ export function heartbeatService(
             : null;
       const protectedWorkerSelected =
         selectedEnvironmentForConfig?.driver === "ssh" &&
-        selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY;
+        isFactoryWorkerPolicy(selectedEnvironmentForConfig.config?.factoryWorkerPolicy);
       const protectedSubscription = agent.adapterType === "paperclip_runner" && protectedWorkerSelected &&
         isFactoryProviderEnrollment(selectedEnvironmentForConfig?.config?.factoryProviderAdmission);
       assertAiBillingRuntime({ managedConnectionSelected: Boolean(aiBinding), protectedSubscription, protectedWorkerSelected });
@@ -21760,7 +21760,7 @@ export function heartbeatService(
       const useHostGitHub =
         !githubSelection.configured &&
         !(selectedEnvironmentForConfig?.driver === "ssh" &&
-          selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY) &&
+          isFactoryWorkerPolicy(selectedEnvironmentForConfig.config?.factoryWorkerPolicy)) &&
         trustPreset.kind === "standard" &&
         ["local", "ssh"].includes(
           selectedEnvironmentForConfig?.driver ?? "local",
@@ -21992,7 +21992,7 @@ export function heartbeatService(
       // provider checkpoint. A persisted same-run admission (including a
       // verified capacity refusal) must keep its original identity.
       if (selectedEnvironmentForConfig?.driver === "ssh" &&
-          selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY &&
+          isFactoryWorkerPolicy(selectedEnvironmentForConfig.config?.factoryWorkerPolicy) &&
           !persistedNativeExecutionInput && !run.nativeSessionId && !run.runtimeModeResolvedAt) {
         context.forceFreshSession = true;
       }
@@ -22715,7 +22715,7 @@ export function heartbeatService(
       }
       const environmentAcquireStartedAtMs = Date.now();
       const factoryWorkspacePreparation = selectedEnvironmentForConfig?.driver === "ssh" &&
-        selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY;
+        isFactoryWorkerPolicy(selectedEnvironmentForConfig.config?.factoryWorkerPolicy);
       if (factoryWorkspacePreparation && run.runtimeModeResolvedAt && run.runtimeMode === "native" &&
           !persistedNativeExecutionInput) {
         throw new NativeRunnerOwnershipUnverifiedError("factory_workspace_staging_unverified");

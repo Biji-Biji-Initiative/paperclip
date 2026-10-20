@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issues, projects } from "@paperclipai/db";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, FACTORY_REALM_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { factoryProviderEnrollmentSchema, type FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 import { FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE, NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE,
   isNativeRunnerOwnershipHeld, nativeRunnerOwnershipNotHeldCondition } from "./native-runtime/native-runner-ownership.js";
 import { legacyControllerBootId } from "./legacy-controller-lease.js";
@@ -22,12 +23,15 @@ describe("Factory durable ownership before workspace preparation", () => {
   }, 120_000);
   afterAll(async () => { await temporary?.cleanup(); });
 
-  async function fixture(db = first, workspaceId = randomUUID(), alias = false) {
+  async function fixture(db = first, workspaceId = randomUUID(), alias = false,
+    scope: { companyId: string; agentId: string; projectId: string } = { companyId, agentId, projectId }, enrollment?: FactoryProviderEnrollment) {
+    const { companyId, agentId, projectId } = scope;
     const environmentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
     const cwd = `/workspace/${companyId}/${workspaceId}`;
     await db.insert(issues).values({ id: issueId, companyId, title: "No provider call", status: "in_progress", assigneeAgentId: agentId });
     await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, projectId, mode: "shared", strategyType: "shared", name: "Fixture", cwd }).onConflictDoNothing();
-    const config: FactoryWorkspaceStagingConfig = { factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+    const config: FactoryWorkspaceStagingConfig = { factoryWorkerPolicy: enrollment && "realm" in enrollment ? FACTORY_REALM_WORKER_POLICY : FACTORY_WORKER_POLICY,
+      ...(enrollment ? { factoryProviderAdmission: structuredClone(enrollment) } : {}),
       host: alias ? "alias.invalid" : "fixture.invalid", port: alias ? 2223 : 2222, username: "node",
       remoteWorkspacePath: cwd, knownHosts: `${alias ? "alias.invalid" : "fixture.invalid"} ssh-ed25519 ${Buffer.alloc(32, 7).toString("base64")}`,
       strictHostKeyChecking: true };
@@ -37,6 +41,30 @@ describe("Factory durable ownership before workspace preparation", () => {
     return { db, companyId, agentId, environmentId, executionWorkspaceId: workspaceId, runId, issueId,
       executionWorkspaceMode: "shared", config, prepareWorkspace: async () => ({ remoteCwd: cwd }) };
   }
+
+  it("stages one explicit tenant and refuses retargeting or enrollment changes around its held workspace", async () => {
+    const scope = { companyId: randomUUID(), agentId: randomUUID(), projectId: randomUUID() };
+    await first.insert(companies).values({ id: scope.companyId, name: "Isolated tenant staging", issuePrefix: "TNT" });
+    await first.insert(agents).values({ id: scope.agentId, companyId: scope.companyId, name: "Paused tenant", adapterType: "paperclip_runner", status: "paused" });
+    await first.insert(projects).values({ id: scope.projectId, companyId: scope.companyId, name: "No provider" });
+    const enrollment = factoryProviderEnrollmentSchema.parse({ schema: "factory.provider-enrollment.v3", provider: "claude", workerPlanSha256: "a".repeat(64),
+      realm: { schema: "factory.worker-realm.v1", companyId: scope.companyId, authorityId: "fixture-tenant" } });
+    const a = await fixture(first, randomUUID(), false, scope, enrollment);
+    let preparations = 0;
+    const prepareWorkspace = async () => { preparations++; return { remoteCwd: a.config.remoteWorkspacePath }; };
+    await expect(acquireFactoryWorkspaceStagingLease({ ...a, companyId: FACTORY_COMPANY_ID, prepareWorkspace })).rejects.toThrow(FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE);
+    await expect(acquireFactoryWorkspaceStagingLease({ ...a, config: { ...a.config, factoryWorkerPolicy: FACTORY_WORKER_POLICY }, prepareWorkspace })).rejects.toThrow(FACTORY_WORKSPACE_STAGING_UNVERIFIED_ERROR_CODE);
+    expect(preparations).toBe(0);
+    const lease = await acquireFactoryWorkspaceStagingLease({ ...a, prepareWorkspace });
+    expect(lease.companyId).toBe(scope.companyId); expect(preparations).toBe(1);
+    const changed = factoryProviderEnrollmentSchema.parse({ ...enrollment,
+      realm: { schema: "factory.worker-realm.v1", companyId: scope.companyId, authorityId: "fixture-new-authority" }, workerPlanSha256: "b".repeat(64) });
+    const alias = await fixture(second, a.executionWorkspaceId, true, scope, changed);
+    await expect(acquireFactoryWorkspaceStagingLease({ ...alias, prepareWorkspace })).rejects.toThrow("factory_workspace_staging_busy");
+    expect(preparations).toBe(1);
+    await expect(assertFactoryWorkspaceStagingOwned({ db: first, companyId: scope.companyId, runId: a.runId, leaseId: lease.id })).resolves.toBeUndefined();
+    await expect(assertFactoryWorkspaceStagingOwned({ db: first, companyId: FACTORY_COMPANY_ID, runId: a.runId, leaseId: lease.id })).rejects.toThrow();
+  });
 
   it("fresh unresolved Paperclip intent stages before native admission without rewriting runtime mode", async () => {
     const a = await fixture();

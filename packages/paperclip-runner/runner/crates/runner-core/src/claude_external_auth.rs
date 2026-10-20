@@ -1,6 +1,7 @@
 //! Cold Factory Claude capability intake; no credentials are obtained here.
 //! Input is an exclusively owned anonymous pipe delivered by the trusted parent.
 use crate::sensitive_memory::Sensitive;
+use crate::factory_worker_realm::FactoryWorkerRealm;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs::File;
@@ -15,7 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const INGRESS_FD_ENV: &str = "PAPERCLIP_CLAUDE_EXTERNAL_AUTH_FD";
 pub const MAX_BYTES: usize = 16 * 1024;
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
-const COMPANY: &str = "740ad7ee-0c28-4e07-b9d1-ca7b35da820d";
+#[cfg(test)]
+const COMPANY: &str = crate::factory_worker_realm::LEGACY_COMPANY_ID;
 const READ_DEADLINE: Duration = Duration::from_secs(2);
 pub const BOOTSTRAP_FLAG: &str = "--factory-claude-access-v1";
 
@@ -117,10 +119,10 @@ pub struct ActualRun<'a> {
     pub worker_plan_sha256: &'a str,
 }
 impl ClaudeReference {
-    fn validate(&self, actual: &ActualRun<'_>, now: u64) -> Result<()> {
+    fn validate_for_realm(&self, actual: &ActualRun<'_>, now: u64, expected: Option<&FactoryWorkerRealm>) -> Result<()> {
         if self.schema != "factory.claude-setup-token-reference.v1"
             || self.provider != "claude"
-            || self.company_id != COMPANY
+            || !FactoryWorkerRealm::matches_expected(expected, &self.company_id, &self.authority_id)
             || !identifier(&self.authority_id, 128)
             || !identifier(&self.profile_ref, 254)
             || ![
@@ -170,6 +172,8 @@ struct Envelope {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FactoryBinding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<FactoryWorkerRealm>,
     pub admission_id: String,
     pub capability_id: String,
     pub worker_plan_sha256: String,
@@ -182,6 +186,7 @@ pub struct FactoryBinding {
 impl From<&ClaudeReference> for FactoryBinding {
     fn from(r: &ClaudeReference) -> Self {
         Self {
+            realm: None,
             admission_id: r.admission_id.clone(),
             capability_id: r.capability_id.clone(),
             worker_plan_sha256: r.worker_plan_sha256.clone(),
@@ -197,6 +202,7 @@ struct Capability {
     reference: ClaudeReference,
     access: Access,
     deadline: Instant,
+    expected_realm: Option<FactoryWorkerRealm>,
 }
 pub struct ClaudeIngress {
     capability: Option<Capability>,
@@ -206,6 +212,7 @@ pub struct ClaudeIngress {
 pub struct FactoryAuthority {
     reference: ClaudeReference,
     deadline: Instant,
+    expected_realm: Option<FactoryWorkerRealm>,
 }
 impl FactoryAuthority {
     #[cfg(test)]
@@ -214,7 +221,7 @@ impl FactoryAuthority {
         self
     }
     pub fn assert_live(&self, actual: &ActualRun<'_>) -> Result<()> {
-        self.reference.validate(actual, now_ms()?)?;
+        self.reference.validate_for_realm(actual, now_ms()?, self.expected_realm.as_ref())?;
         if Instant::now() >= self.deadline {
             return fail(Reason::Expired);
         }
@@ -304,6 +311,7 @@ impl ClaudeIngress {
         Ok(FactoryAuthority {
             reference: cap.reference.clone(),
             deadline: cap.deadline,
+            expected_realm: cap.expected_realm.clone(),
         })
     }
     pub fn reference(&self) -> Result<&ClaudeReference> {
@@ -312,7 +320,10 @@ impl ClaudeIngress {
             .map(|cap| &cap.reference)
             .ok_or(ClaudeHold(Reason::Consumed))
     }
-    pub fn from_owned_pipe(mut pipe: File, actual: &ActualRun<'_>) -> Result<Self> {
+    pub fn from_owned_pipe(pipe: File, actual: &ActualRun<'_>) -> Result<Self> {
+        Self::from_owned_pipe_for_realm(pipe, actual, None)
+    }
+    pub fn from_owned_pipe_for_realm(mut pipe: File, actual: &ActualRun<'_>, expected_realm: Option<FactoryWorkerRealm>) -> Result<Self> {
         use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
         use rustix::io::{fcntl_setfd, FdFlags};
         fcntl_setfd(&pipe, FdFlags::CLOEXEC).map_err(|_| ClaudeHold(Reason::Source))?;
@@ -362,9 +373,13 @@ impl ClaudeIngress {
             }
         }
         drop(pipe);
-        Self::from_bytes(&bytes, actual)
+        Self::from_bytes_for_realm(&bytes, actual, expected_realm)
     }
+    #[cfg(test)]
     fn from_bytes(bytes: &[u8], actual: &ActualRun<'_>) -> Result<Self> {
+        Self::from_bytes_for_realm(bytes, actual, None)
+    }
+    fn from_bytes_for_realm(bytes: &[u8], actual: &ActualRun<'_>, expected_realm: Option<FactoryWorkerRealm>) -> Result<Self> {
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
             return fail(Reason::Malformed);
         }
@@ -372,7 +387,7 @@ impl ClaudeIngress {
         let now = now_ms()?;
         let envelope: Envelope =
             serde_json::from_slice(bytes).map_err(|_| ClaudeHold(Reason::Malformed))?;
-        envelope.reference.validate(actual, now)?;
+        envelope.reference.validate_for_realm(actual, now, expected_realm.as_ref())?;
         let until = envelope.reference.admitted_until_unix_ms;
         if envelope.access_token_expires_at_unix_ms > MAX_SAFE_INTEGER
             || envelope.access_token_expires_at_unix_ms < until + 5_000
@@ -395,6 +410,7 @@ impl ClaudeIngress {
                 reference: envelope.reference,
                 access: envelope.access_token,
                 deadline: started + Duration::from_millis(until - now),
+                expected_realm,
             }),
         })
     }
@@ -406,14 +422,15 @@ impl ClaudeIngress {
     ) -> Result<SidecarFrames> {
         // Failed projection consumes this handoff too; no config repair/replay.
         let cap = self.capability.take().ok_or(ClaudeHold(Reason::Consumed))?;
-        cap.reference.validate(actual, now_ms()?)?;
+        cap.reference.validate_for_realm(actual, now_ms()?, cap.expected_realm.as_ref())?;
         if Instant::now() >= cap.deadline {
             return fail(Reason::Expired);
         }
         if !canonical(runtime) || !canonical(workspace) {
             return fail(Reason::Configuration);
         }
-        let binding = FactoryBinding::from(&cap.reference);
+        let mut binding = FactoryBinding::from(&cap.reference);
+        binding.realm = cap.expected_realm;
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Metadata<'a> {
@@ -429,6 +446,8 @@ impl ClaudeIngress {
         struct Private<'a> {
             schema: &'static str,
             provider: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            realm: Option<&'a FactoryWorkerRealm>,
             admission_id: &'a str,
             capability_id: &'a str,
             worker_plan_sha256: &'a str,
@@ -440,7 +459,7 @@ impl ClaudeIngress {
             access_token: &'a str,
         }
         let metadata = serde_json::to_vec(&Metadata {
-            schema: "paperclip.factory-claude-sidecar.v1",
+            schema: if binding.realm.is_some() { "paperclip.factory-claude-sidecar.v3" } else { "paperclip.factory-claude-sidecar.v1" },
             provider: "claude",
             binding: &binding,
             runtime_directory: runtime,
@@ -449,8 +468,9 @@ impl ClaudeIngress {
         .map_err(|_| ClaudeHold(Reason::Malformed))?;
         let private = Sensitive::new(
             serde_json::to_vec(&Private {
-                schema: "paperclip.factory-claude-access.v1",
+                schema: if binding.realm.is_some() { "paperclip.factory-claude-access.v3" } else { "paperclip.factory-claude-access.v1" },
                 provider: "claude",
+                realm: binding.realm.as_ref(),
                 admission_id: &binding.admission_id,
                 capability_id: &binding.capability_id,
                 worker_plan_sha256: &binding.worker_plan_sha256,

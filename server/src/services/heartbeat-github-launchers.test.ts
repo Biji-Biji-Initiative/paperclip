@@ -11,9 +11,9 @@ import { prepareHeartbeatGitHubLaunchers } from "./heartbeat-github-launchers.js
 const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "daytona", remoteCwd: "/workspace" };
 
 describe("heartbeat GitHub launcher lifetime", () => {
-  it("keeps unconfigured Factory preparation free of raw staging and broker capabilities", async () => {
+  it.each(["factory-worker-scope-v2", "factory-worker-scope-v3"] as const)("keeps %s preparation free of raw staging and broker capabilities", async policy => {
     const factory = { kind: "remote" as const, transport: "ssh" as const,
-      factoryWorkerPolicy: "factory-worker-scope-v2" as const, remoteCwd: "/workspace/factory",
+      factoryWorkerPolicy: policy, remoteCwd: "/workspace/factory",
       spec: { host: "fixture.invalid", port: 22, username: "node", remoteCwd: "/workspace/factory",
         remoteWorkspacePath: "/workspace/factory", privateKey: null, knownHosts: null, strictHostKeyChecking: true } };
     const prepare = vi.fn();

@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, authUsers, environmentLeases, environments, executionWorkspaces, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget, AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, FACTORY_LEASE_FIXED_ENV, createFactoryWorkerLeaseDescriptor,
+import { FACTORY_COMPANY_ID, FACTORY_LEASE_FIXED_ENV, createFactoryWorkerLeaseDescriptor,
   type FactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { hasFactoryBusyReceipt } from "./factory-worker-capacity.js";
@@ -10,19 +10,22 @@ import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.
 import { randomUUID } from "node:crypto";
 import { validateFactoryOwnRunAuthorization, validateFactoryProviderBinding, type FactoryOwnRunAuthorization, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
 import { factoryExecutionProvider, isFactoryProviderEnrollment } from "./factory-worker-provider-selection.js";
-import { factoryEnrollmentMatchesCompany, sameFactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
+import { factoryEnrollmentMatchesCompany, factoryWorkerScopeMatchesCompany, isFactoryWorkerPolicy, sameFactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 
 export interface FactoryWorkerAttempt {
   readonly runId: string;
   busy?: FactoryWorkerBusyError;
 }
 export function isFactoryWorkerTarget(target: AdapterExecutionTarget | null | undefined): target is AdapterSshExecutionTarget {
-  return target?.kind === "remote" && target.transport === "ssh" && target.factoryWorkerPolicy === FACTORY_WORKER_POLICY;
+  return target?.kind === "remote" && target.transport === "ssh" && isFactoryWorkerPolicy(target.factoryWorkerPolicy);
 }
-export function assertFactoryWorkerColdExecution(execution: NativeExecutionInput, recovery: unknown): void {
+export function assertFactoryWorkerColdExecution(execution: NativeExecutionInput, recovery: unknown, target?: AdapterSshExecutionTarget): void {
   const providerAllowed = execution.provider.kind === "codex" ||
     (execution.provider.kind === "acpx" && execution.provider.agent === "claude");
-  if (!providerAllowed || execution.binding.companyId !== FACTORY_COMPANY_ID || execution.session.lifecyclePolicy.mode !== "per_turn" || recovery) {
+  const scoped = target
+    ? factoryWorkerScopeMatchesCompany(target.factoryWorkerPolicy, target.factoryProviderAdmission, execution.binding.companyId)
+    : execution.binding.companyId === FACTORY_COMPANY_ID;
+  if (!providerAllowed || !scoped || execution.session.lifecyclePolicy.mode !== "per_turn" || recovery) {
     throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
   }
 }
@@ -62,7 +65,9 @@ export async function authorizeFactoryWorker(input: {
   const { binding } = input.execution;
   const target = input.target;
   const fail = (): never => { throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified"); };
-  if (!isFactoryWorkerTarget(target) || binding.companyId !== FACTORY_COMPANY_ID || !target.environmentId || !target.leaseId) fail();
+  if (!isFactoryWorkerTarget(target) ||
+      !factoryWorkerScopeMatchesCompany(target.factoryWorkerPolicy, target.factoryProviderAdmission, binding.companyId) ||
+      !target.environmentId || !target.leaseId) fail();
   validateDedicatedSshTarget({ ...target.spec, remoteCwd: target.remoteCwd });
   const [lease] = await input.db.select().from(environmentLeases).where(and(
     eq(environmentLeases.id, target.leaseId!), eq(environmentLeases.companyId, binding.companyId),
@@ -82,7 +87,8 @@ export async function authorizeFactoryWorker(input: {
       lease.status !== "active" || lease.provider !== "ssh" || lease.releasedAt !== null ||
       (lease.expiresAt !== null && lease.expiresAt.getTime() <= Date.now()) ||
       lease.metadata?.remoteCwd !== expectedCwd || !environment || environment.driver !== "ssh" || environment.status !== "active" ||
-      environment.config?.factoryWorkerPolicy !== FACTORY_WORKER_POLICY ||
+      environment.config?.factoryWorkerPolicy !== target.factoryWorkerPolicy ||
+      !factoryWorkerScopeMatchesCompany(environment.config?.factoryWorkerPolicy, environment.config?.factoryProviderAdmission, binding.companyId) ||
       environment.config?.remoteWorkspacePath !== expectedCwd || target.remoteCwd !== expectedCwd ||
       environment.config?.host !== target.spec.host || (environment.config?.port ?? 22) !== target.spec.port ||
       environment.config?.username !== target.spec.username || environment.config?.knownHosts !== target.spec.knownHosts ||
@@ -104,9 +110,6 @@ export async function authorizeFactoryWorker(input: {
         !sameFactoryProviderEnrollment(registered, selected) ||
         !factoryEnrollmentMatchesCompany(registered, binding.companyId) ||
         selected.provider !== factoryExecutionProvider(input.execution)) fail();
-    // V2 worker/controller/native receivers do not carry an expected realm.
-    // Persisting its public identity must never silently downgrade its authority.
-    if (selected && "realm" in selected) fail();
   }
   return { run, lease, providerMode: selected };
 }
@@ -130,6 +133,8 @@ function descriptor(input: {
   const deadlineUnixMs = Math.min(now + Math.floor(duration), run.executionControlDeadlineAt?.getTime() ?? Infinity,
     lease.expiresAt?.getTime() ?? Infinity);
   return createFactoryWorkerLeaseDescriptor({ companyId: input.execution.binding.companyId,
+    ...(input.target.factoryProviderAdmission && "realm" in input.target.factoryProviderAdmission
+      ? { realm: input.target.factoryProviderAdmission.realm } : {}),
     runId: input.execution.binding.runId, leaseId: lease.id,
     workspaceId: input.execution.binding.executionWorkspaceId, sessionId: input.sessionId,
     workspaceRoot: input.target.remoteCwd, deadlineUnixMs });
@@ -187,7 +192,8 @@ export async function createAuthorizedFactoryWorkerAdmission(input: {
       (run.runnerProfileJson?.durableEnvironmentLeaseId !== undefined && run.runnerProfileJson.durableEnvironmentLeaseId !== lease.id) ||
       (stored.session?.normalizedSessionId ?? `session-${run.id}`) !== nativeSession) fail();
   const providerAdmission: FactoryProviderBinding = {
-    schema: "factory.provider-worker-binding.v2", provider: providerMode.provider,
+    ...("realm" in providerMode ? { schema: "factory.provider-worker-binding.v3", realm: structuredClone(providerMode.realm) }
+      : { schema: "factory.provider-worker-binding.v2" }), provider: providerMode.provider,
     admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: nativeSession,
     runnerInstanceId: attempt.runnerInstanceId, workerPlanSha256: providerMode.workerPlanSha256,
     authorization: await readFactoryOwnRunAuthorization(input.db, attempt.execution.binding),

@@ -1,17 +1,18 @@
 import { createHash } from "node:crypto";
+import { factoryWorkerRealmSchema, type FactoryWorkerRealm } from "@paperclipai/shared/factory-worker-realm";
 
 export const FACTORY_WORKER_MARKER = "factory-worker-lease-v1" as const;
 export const FACTORY_WORKER_POLICY = "factory-worker-scope-v2" as const;
+export const FACTORY_REALM_WORKER_MARKER = "factory-worker-lease-v3" as const;
+export const FACTORY_REALM_WORKER_POLICY = "factory-worker-scope-v3" as const;
 export const FACTORY_COMPANY_ID = "740ad7ee-0c28-4e07-b9d1-ca7b35da820d" as const;
 export const FACTORY_LEASE_MAX_HEADER_BYTES = 64 * 1024;
 export const FACTORY_WORKER_BUSY_EXIT = 75;
 export const FACTORY_WORKER_HELD_EXIT = 76;
 
 /** Explicit enrollment seam. None of these fields come from a model or prompt. */
-export interface FactoryWorkerLeaseDescriptor {
-  protocol: typeof FACTORY_WORKER_MARKER;
-  policy: typeof FACTORY_WORKER_POLICY;
-  companyId: typeof FACTORY_COMPANY_ID;
+interface FactoryWorkerLeaseFields {
+  companyId: string;
   runId: string;
   leaseId: string;
   workspaceId: string;
@@ -23,7 +24,11 @@ export interface FactoryWorkerLeaseDescriptor {
   diagnosticsDirectory: string;
   deadlineUnixMs: number;
 }
-export interface FactoryWorkerLaunchHeader extends FactoryWorkerLeaseDescriptor {
+export type FactoryWorkerLeaseDescriptor = FactoryWorkerLeaseFields & (
+  { protocol: typeof FACTORY_WORKER_MARKER; policy: typeof FACTORY_WORKER_POLICY; companyId: typeof FACTORY_COMPANY_ID }
+  | { protocol: typeof FACTORY_REALM_WORKER_MARKER; policy: typeof FACTORY_REALM_WORKER_POLICY; realm: FactoryWorkerRealm }
+);
+export type FactoryWorkerLaunchHeader = FactoryWorkerLeaseDescriptor & {
   command: readonly string[];
   environment: Readonly<Record<string, string>>;
 }
@@ -54,15 +59,20 @@ function path(value: unknown): value is string {
 export function validateFactoryWorkerLeaseDescriptor(
   value: unknown, now = Date.now(),
 ): asserts value is FactoryWorkerLeaseDescriptor {
-  if (!record(value) || Object.keys(value).length !== descriptorKeys.length ||
-      descriptorKeys.some(key => !Object.hasOwn(value, key)) ||
-      value.protocol !== FACTORY_WORKER_MARKER || value.policy !== FACTORY_WORKER_POLICY ||
+  if (!record(value)) invalid();
+  const realmMode = value.protocol === FACTORY_REALM_WORKER_MARKER;
+  const keys = realmMode ? [...descriptorKeys, "realm"] : descriptorKeys;
+  if (Object.keys(value).length !== keys.length || keys.some(key => !Object.hasOwn(value, key))) invalid();
+  if (realmMode) {
+    const realm = factoryWorkerRealmSchema.safeParse(value.realm);
+    if (!realm.success || value.policy !== FACTORY_REALM_WORKER_POLICY || value.companyId !== realm.data.companyId) invalid();
+  } else if (value.protocol !== FACTORY_WORKER_MARKER || value.policy !== FACTORY_WORKER_POLICY ||
       value.companyId !== FACTORY_COMPANY_ID) invalid();
   for (const key of ["runId", "leaseId", "workspaceId"]) {
     if (typeof value[key] !== "string" || value[key].length !== 36 || !UUID.test(value[key])) invalid();
   }
   if (typeof value.sessionId !== "string" || !SESSION.test(value.sessionId)) invalid();
-  const workspace = `/workspace/${FACTORY_COMPANY_ID}/${value.workspaceId}`;
+  const workspace = `/workspace/${value.companyId}/${value.workspaceId}`;
   const session = `${workspace}/.paperclip-runtime/paperclip-runner/sessions/` +
     createHash("sha256").update(value.sessionId).digest("hex");
   for (const [key, expected] of Object.entries({workspaceRoot: workspace, sessionRoot: session,
@@ -78,11 +88,15 @@ export function validateFactoryWorkerLeaseDescriptor(
 export function createFactoryWorkerLeaseDescriptor(input: {
   companyId: string; runId: string; leaseId: string; workspaceId: string;
   sessionId: string; workspaceRoot: string; deadlineUnixMs: number;
+  realm?: FactoryWorkerRealm;
 }): FactoryWorkerLeaseDescriptor {
   const sessionRoot = input.workspaceRoot + "/.paperclip-runtime/paperclip-runner/sessions/" +
     createHash("sha256").update(input.sessionId).digest("hex");
+  const { realm, ...fields } = input;
   const descriptor = {
-    protocol: FACTORY_WORKER_MARKER, policy: FACTORY_WORKER_POLICY, ...input,
+    ...(realm ? { protocol: FACTORY_REALM_WORKER_MARKER, policy: FACTORY_REALM_WORKER_POLICY, realm: structuredClone(realm) }
+      : { protocol: FACTORY_WORKER_MARKER, policy: FACTORY_WORKER_POLICY }),
+    ...fields,
     sessionRoot, stateDirectory: sessionRoot + "/runner",
     filesystemDirectory: sessionRoot + "/filesystem", diagnosticsDirectory: sessionRoot + "/diagnostics",
   };

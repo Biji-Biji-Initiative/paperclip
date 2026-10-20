@@ -7,7 +7,7 @@ import { buildSshArgvCommand, quoteSshArgument } from "./ssh-command.js";
 import { createSshProcessChannel, type SshProcessChannel } from "./ssh-process-channel.js";
 import { FACTORY_WORKER_MARKER, encodeFactoryWorkerLaunch, isFactoryWorkerBusyError, type FactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
 import { admitFactoryWorkerLease } from "./factory-worker-lease-channel.js";
-import { FACTORY_PROVIDER_MARKER, encodeFactoryProviderLaunch, signFactoryControllerAdmission,
+import { factoryProviderMarker, encodeFactoryProviderLaunch, signFactoryControllerAdmission,
   type FactoryProviderBinding } from "./factory-provider-admission.js";
 import { admitFactoryProviderLease } from "./factory-provider-lease-channel.js";
 
@@ -87,6 +87,7 @@ export async function openDedicatedSshDuplex(
   const providerAdmission = input.providerAdmission ? structuredClone(input.providerAdmission) : undefined;
   const revalidateProviderAdmission = input.revalidateProviderAdmission;
   if (providerAdmission && !workerLease) throw new Error("factory_provider_requires_worker_lease");
+  if (workerLease && "realm" in workerLease && !providerAdmission) throw new Error("factory_realm_requires_provider_admission");
   if (workerLease && config.remoteCwd !== workerLease.workspaceRoot) {
     throw new Error("factory_worker_lease_cwd_mismatch");
   }
@@ -96,7 +97,7 @@ export async function openDedicatedSshDuplex(
   const header = workerLease ? (providerAdmission
     ? encodeFactoryProviderLaunch(workerLease, providerAdmission, input.command, input.environment)
     : encodeFactoryWorkerLaunch(workerLease, input.command, input.environment)) : undefined;
-  const command = providerAdmission ? FACTORY_PROVIDER_MARKER : workerLease ? FACTORY_WORKER_MARKER : `/bin/sh -c ${quoteSshArgument(buildSshArgvCommand({
+  const command = providerAdmission ? factoryProviderMarker(providerAdmission) : workerLease ? FACTORY_WORKER_MARKER : `/bin/sh -c ${quoteSshArgument(buildSshArgvCommand({
     command: input.command[0]!, args: input.command.slice(1), cwd: config.remoteCwd,
   }))}`;
   if (input.signal?.aborted) throw new Error("native_ssh_open_cancelled_before_dispatch");

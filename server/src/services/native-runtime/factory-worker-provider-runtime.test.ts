@@ -3,35 +3,36 @@ import { describe, expect, it } from "vitest";
 import { agentWakeupRequests, authUsers, environmentLeases, environments, executionWorkspaces, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { FactoryAdmissionProvider } from "@paperclipai/adapter-utils/factory-provider-admission";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, FACTORY_REALM_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { createAuthorizedFactoryWorkerAdmission, createAuthorizedFactoryWorkerLease } from "./factory-worker-runtime.js";
 import { factoryProviderEnrollmentSchema, type FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 
 // DB-current mutation fixtures. Existing capacity integration suite proves SQL/company predicates.
-function fixture(mode = true, provider: FactoryAdmissionProvider = "codex", enrollment?: FactoryProviderEnrollment) {
+function fixture(mode = true, provider: FactoryAdmissionProvider = "codex", enrollment?: FactoryProviderEnrollment, companyId: string = FACTORY_COMPANY_ID) {
   const runId = randomUUID(), leaseId = randomUUID(), environmentId = randomUUID(), workspaceId = randomUUID();
   const runnerInstanceId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = "session-" + randomUUID();
-  const cwd = `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`;
+  const cwd = `/workspace/${companyId}/${workspaceId}`;
   const admission = enrollment ?? { provider, workerPlanSha256: "a".repeat(64) };
-  const config = { factoryWorkerPolicy: FACTORY_WORKER_POLICY, host: "fixture.invalid", port: 2222,
+  const policy = "realm" in admission ? FACTORY_REALM_WORKER_POLICY : FACTORY_WORKER_POLICY;
+  const config = { factoryWorkerPolicy: policy, host: "fixture.invalid", port: 2222,
     username: "node", knownHosts: "fixture-pin", strictHostKeyChecking: true, remoteWorkspacePath: cwd,
     ...(mode ? { factoryProviderAdmission: admission } : {}) };
-  const execution = { binding: { companyId: FACTORY_COMPANY_ID, runId, agentId, issueId, executionWorkspaceId: workspaceId },
+  const execution = { binding: { companyId, runId, agentId, issueId, executionWorkspaceId: workspaceId },
     provider: provider === "codex" ? { kind: "codex" } : { kind: "acpx", agent: "claude" },
     session: { normalizedSessionId: sessionId, driverKind: provider === "codex" ? "codex_app_server" : "acpx_runtime",
       protocolVersion: 1, lifecyclePolicy: { mode: "per_turn" } } } as NativeExecutionInput;
   const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", environmentId, leaseId,
-    factoryWorkerPolicy: FACTORY_WORKER_POLICY, ...(mode ? { factoryProviderAdmission: structuredClone(admission) } : {}),
+    factoryWorkerPolicy: policy, ...(mode ? { factoryProviderAdmission: structuredClone(admission) } : {}),
     remoteCwd: cwd, spec: { host: config.host, port: config.port, username: config.username, remoteCwd: cwd, remoteWorkspacePath: cwd,
       knownHosts: config.knownHosts, strictHostKeyChecking: true, privateKey: "synthetic-not-read" } };
-  const run = { id: runId, companyId: FACTORY_COMPANY_ID, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
+  const run = { id: runId, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "running",
     wakeupRequestId: randomUUID(), invocationSource: "on_demand", triggerDetail: "manual", retryOfRunId: null,
     runnerInstanceId, runnerProfileJson: { nativeExecutionInput: structuredClone(execution) }, executionControlDeadlineAt: new Date(Date.now() + 60_000) };
   const lease = { id: leaseId, environmentId, heartbeatRunId: runId, executionWorkspaceId: workspaceId, issueId,
     status: "active", provider: "ssh", releasedAt: null, expiresAt: null, metadata: { remoteCwd: cwd } };
   const environment = { driver: "ssh", status: "active", config };
-  const wake = { id: run.wakeupRequestId, companyId: FACTORY_COMPANY_ID, agentId, runId, status: "claimed", finishedAt: null,
+  const wake = { id: run.wakeupRequestId, companyId, agentId, runId, status: "claimed", finishedAt: null,
     coalescedCount: 0, source: "on_demand", triggerDetail: "manual", payload: { manualUserWake: true },
     requestedByActorType: "user", requestedByActorId: "synthetic-user", requestedAt: new Date(Date.now() - 1000) };
   const user = { id: "synthetic-user", email: "synthetic@example.invalid" };
@@ -45,17 +46,24 @@ function fixture(mode = true, provider: FactoryAdmissionProvider = "codex", enro
 }
 
 describe("Factory provider DB-current admission", () => {
-  it("keeps versioned realms closed until the signed/native receivers bind their authority", async () => {
-    const mode = { schema: "factory.provider-enrollment.v3", provider: "codex", workerPlanSha256: "a".repeat(64),
-      realm: { schema: "factory.worker-realm.v1", companyId: FACTORY_COMPANY_ID, authorityId: "factory-biji-g2" } };
-    const f = fixture(true, "codex", factoryProviderEnrollmentSchema.parse(mode));
-    await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toThrow("native_execution_ownership_unverified");
+  it.each(["codex", "claude"] as const)("binds the exact explicit %s realm and refuses authority, policy and company substitution", async provider => {
+    const companyId = randomUUID();
+    const mode = { schema: "factory.provider-enrollment.v3", provider, workerPlanSha256: "a".repeat(64),
+      realm: { schema: "factory.worker-realm.v1", companyId, authorityId: "fixture-tenant-authority" } };
+    const f = fixture(true, provider, factoryProviderEnrollmentSchema.parse(mode), companyId);
+    const admitted = await createAuthorizedFactoryWorkerAdmission(f);
+    expect(admitted.providerAdmission).toMatchObject({ schema: "factory.provider-worker-binding.v3", realm: mode.realm });
+    expect(admitted.workerLease).toMatchObject({ protocol: "factory-worker-lease-v3", policy: FACTORY_REALM_WORKER_POLICY, realm: mode.realm, companyId });
+    await expect(admitted.revalidateProviderAdmission!()).resolves.toBeUndefined();
     f.environment.config.factoryProviderAdmission = factoryProviderEnrollmentSchema.parse({ ...mode,
       realm: { ...mode.realm, authorityId: "another-authority" } });
-    await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toThrow("native_execution_ownership_unverified");
+    await expect(admitted.revalidateProviderAdmission!()).rejects.toThrow("native_execution_ownership_unverified");
     const foreign = fixture(true, "codex", factoryProviderEnrollmentSchema.parse({ ...mode,
       realm: { ...mode.realm, companyId: randomUUID() } }));
     await expect(createAuthorizedFactoryWorkerAdmission(foreign)).rejects.toThrow("native_execution_ownership_unverified");
+    const downgraded = fixture(true, provider, factoryProviderEnrollmentSchema.parse(mode), companyId);
+    await expect(createAuthorizedFactoryWorkerAdmission({ ...downgraded, target: { ...downgraded.target, factoryWorkerPolicy: FACTORY_WORKER_POLICY } }))
+      .rejects.toThrow("native_execution_ownership_unverified");
   });
   it("keeps legacy credential-free and prevents old caller downgrade of explicit mode", async () => {
     const f = fixture(false);

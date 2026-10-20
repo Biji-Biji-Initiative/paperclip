@@ -2,7 +2,26 @@ import { closeSync, fstatSync } from "node:fs";
 import { isAbsolute, normalize } from "node:path";
 import type { Writable } from "node:stream";
 
+export interface FactoryClaudeRealm {
+  schema: "factory.worker-realm.v1";
+  companyId: string;
+  authorityId: string;
+}
+/** Builtin-only boundary, also used before loading the provider runtime. */
+export function parseFactoryClaudeRealm(input: unknown): FactoryClaudeRealm {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("factory_claude_access_unverified");
+  const fields = Object.getOwnPropertyDescriptors(input);
+  const keys = ["schema", "companyId", "authorityId"];
+  if (Reflect.ownKeys(input).length !== keys.length || keys.some(key => !fields[key] || !("value" in fields[key]))) throw new Error("factory_claude_access_unverified");
+  const schema: unknown = fields.schema!.value, companyId: unknown = fields.companyId!.value, authorityId: unknown = fields.authorityId!.value;
+  if (schema !== "factory.worker-realm.v1" || typeof companyId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(companyId) ||
+    typeof authorityId !== "string" || !/^[A-Za-z0-9_.:@+-]{1,128}$/.test(authorityId)) throw new Error("factory_claude_access_unverified");
+  return { schema, companyId, authorityId };
+}
+
 export interface FactoryClaudeAccessPolicy {
+  realm?: FactoryClaudeRealm;
   provider: "claude";
   admissionId: string;
   capabilityId: string;
@@ -29,6 +48,8 @@ function projectFactoryClaudeAccessPolicy(input: FactoryClaudeAccessPolicy): Fac
   const names = ["provider", "admissionId", "capabilityId", "workerPlanSha256", "runId", "normalizedSessionId", "environmentLeaseId", "runnerInstanceId", "deadlineAtMs", "runtimeRoot", "workspaceRoot", "bridgeUrl", "allowedMcpTools"];
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(FAILURE);
   const descriptors = Object.getOwnPropertyDescriptors(input);
+  const realmMode = Object.hasOwn(descriptors, "realm");
+  if (realmMode) names.push("realm");
   if (Reflect.ownKeys(input).length !== names.length || names.some(name => !descriptors[name] || !("value" in descriptors[name]))) throw new Error(FAILURE);
   const value = (name: string): unknown => descriptors[name]!.value;
   const identifiers = ["admissionId", "capabilityId", "runId", "normalizedSessionId", "environmentLeaseId", "runnerInstanceId"];
@@ -54,6 +75,7 @@ function projectFactoryClaudeAccessPolicy(input: FactoryClaudeAccessPolicy): Fac
   }
   if (new Set(allowedMcpTools).size !== allowedMcpTools.length) throw new Error(FAILURE);
   return {
+    ...(realmMode ? { realm: parseFactoryClaudeRealm(value("realm")) } : {}),
     provider: "claude", admissionId: value("admissionId") as string, capabilityId: value("capabilityId") as string,
     workerPlanSha256: value("workerPlanSha256") as string, runId: value("runId") as string,
     normalizedSessionId: value("normalizedSessionId") as string, environmentLeaseId: value("environmentLeaseId") as string,
@@ -126,6 +148,15 @@ export async function installFactoryClaudeAccess(input: { fd: number; policy: Fa
   const { Socket } = require("node:net") as typeof import("node:net");
   const failure = () => new Error("factory_claude_access_unverified");
   const policy = input.policy;
+  const realm = (value: unknown): FactoryClaudeRealm => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw failure();
+    const fields = Object.getOwnPropertyDescriptors(value);
+    if (Reflect.ownKeys(value).length !== 3 || ["schema", "companyId", "authorityId"].some(key => !fields[key] || !("value" in fields[key]))) throw failure();
+    const schema: unknown = fields.schema!.value, companyId: unknown = fields.companyId!.value, authorityId: unknown = fields.authorityId!.value;
+    if (schema !== "factory.worker-realm.v1" || typeof companyId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(companyId) ||
+      typeof authorityId !== "string" || !/^[A-Za-z0-9_.:@+-]{1,128}$/.test(authorityId)) throw failure();
+    return { schema, companyId, authorityId };
+  };
   const stable = (value: unknown): value is string => typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
   const canonical = (value: unknown): value is string => typeof value === "string" && path.isAbsolute(value) && path.resolve(value) === value && value !== "/" && !/[\x00-\x1f\x7f]/.test(value);
   const inside = (root: string, candidate: string) => candidate.startsWith(root + "/");
@@ -140,6 +171,7 @@ export async function installFactoryClaudeAccess(input: { fd: number; policy: Fa
       new Set(policy.allowedMcpTools).size !== policy.allowedMcpTools.length ||
       typeof policy.bridgeUrl !== "string" || !/^http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/[^\s?#]*$/.test(policy.bridgeUrl) ||
       Object.hasOwn(globalThis, hook)) throw failure();
+  const expectedRealm = Object.hasOwn(policy, "realm") ? realm(policy.realm) : undefined;
   const metadata = fs.fstatSync(input.fd);
   if (!metadata.isFIFO() && !metadata.isSocket()) throw failure();
   const bytes = await new Promise<Buffer>((resolve, reject) => {
@@ -166,11 +198,16 @@ export async function installFactoryClaudeAccess(input: { fd: number; policy: Fa
   let expiresAtMs: number;
   try {
     const frame = JSON.parse(bytes.toString("utf8"));
-    if (Object.keys(frame).sort().join(",") !== "accessToken,admissionId,capabilityId,environmentLeaseId,expiresAtMs,normalizedSessionId,provider,runId,runnerInstanceId,schema,workerPlanSha256" ||
-        frame.schema !== "paperclip.factory-claude-access.v1" || frame.provider !== "claude" ||
+    const frameKeys = ["accessToken", "admissionId", "capabilityId", "environmentLeaseId", "expiresAtMs", "normalizedSessionId", "provider", "runId", "runnerInstanceId", "schema", "workerPlanSha256", ...(expectedRealm ? ["realm"] : [])];
+    if (Object.keys(frame).sort().join(",") !== frameKeys.sort().join(",") ||
+        frame.schema !== (expectedRealm ? "paperclip.factory-claude-access.v3" : "paperclip.factory-claude-access.v1") || frame.provider !== "claude" ||
         ["admissionId", "capabilityId", "workerPlanSha256", "runId", "normalizedSessionId", "environmentLeaseId", "runnerInstanceId"].some(key => frame[key] !== policy[key as keyof FactoryClaudeAccessPolicy]) ||
         !Number.isSafeInteger(frame.expiresAtMs) || frame.expiresAtMs <= Date.now() || frame.expiresAtMs > policy.deadlineAtMs ||
         typeof frame.accessToken !== "string" || !/^[A-Za-z0-9._-]{32,4096}$/.test(frame.accessToken)) throw failure();
+    if (expectedRealm) {
+      const actualRealm = realm(frame.realm);
+      if (actualRealm.companyId !== expectedRealm.companyId || actualRealm.authorityId !== expectedRealm.authorityId) throw failure();
+    }
     token = Buffer.from(frame.accessToken); expiresAtMs = frame.expiresAtMs;
     frame.accessToken = "";
   } catch { throw failure(); } finally { bytes.fill(0); }

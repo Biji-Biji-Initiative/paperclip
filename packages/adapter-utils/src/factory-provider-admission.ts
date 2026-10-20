@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { isAbsolute } from "node:path";
+import { factoryWorkerRealmSchema, type FactoryWorkerRealm } from "@paperclipai/shared/factory-worker-realm";
 import { FACTORY_COMPANY_ID, encodeFactoryWorkerLaunch, validateFactoryWorkerLeaseDescriptor,
   type FactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
 
@@ -7,6 +8,10 @@ export const FACTORY_PROVIDER_MARKER = "factory-worker-provider-lease-v2" as con
 export const FACTORY_PROVIDER_POLICY = "factory-worker-provider-scope-v2" as const;
 export const FACTORY_ADMISSION_NAMESPACE = "factory-provider-admission-v2@mereka.io" as const;
 export const FACTORY_ADMISSION_SIGNED_SCHEMA = "factory.provider-controller-signed.v2" as const;
+export const FACTORY_REALM_PROVIDER_MARKER = "factory-worker-provider-lease-v3" as const;
+export const FACTORY_REALM_PROVIDER_POLICY = "factory-worker-provider-scope-v3" as const;
+export const FACTORY_REALM_ADMISSION_NAMESPACE = "factory-provider-admission-v3@mereka.io" as const;
+export const FACTORY_REALM_ADMISSION_SIGNED_SCHEMA = "factory.provider-controller-signed.v3" as const;
 export type FactoryAdmissionProvider = "codex" | "claude";
 /** Public controller assertion, derived only from the exact authenticated DB wake. */
 export interface FactoryOwnRunAuthorization {
@@ -18,8 +23,7 @@ export interface FactoryOwnRunAuthorization {
   agentId: string;
   requestedAtUnixMs: number;
 }
-export interface FactoryProviderBinding {
-  schema: "factory.provider-worker-binding.v2";
+interface FactoryProviderBindingFields {
   provider: FactoryAdmissionProvider;
   admissionId: string;
   capabilityId: string;
@@ -28,8 +32,11 @@ export interface FactoryProviderBinding {
   workerPlanSha256: string;
   authorization: FactoryOwnRunAuthorization;
 }
-export interface FactoryPreparedReceipt {
-  protocol: typeof FACTORY_PROVIDER_MARKER;
+export type FactoryProviderBinding = FactoryProviderBindingFields & (
+  { schema: "factory.provider-worker-binding.v2" }
+  | { schema: "factory.provider-worker-binding.v3"; realm: FactoryWorkerRealm }
+);
+interface FactoryPreparedFields {
   provider: FactoryAdmissionProvider;
   type: "preparation";
   status: "prepared";
@@ -44,11 +51,14 @@ export interface FactoryPreparedReceipt {
   workerPlanSha256: string;
   dispatchAttempted: false;
 }
-export interface FactoryControllerAdmission {
-  schema: "factory.provider-controller-admission.v2";
+export type FactoryPreparedReceipt = FactoryPreparedFields & (
+  { protocol: typeof FACTORY_PROVIDER_MARKER }
+  | { protocol: typeof FACTORY_REALM_PROVIDER_MARKER; realm: FactoryWorkerRealm }
+);
+interface FactoryControllerAdmissionFields {
   provider: FactoryAdmissionProvider;
   admissionId: string;
-  companyId: typeof FACTORY_COMPANY_ID;
+  companyId: string;
   capabilityId: string;
   runId: string;
   environmentLeaseId: string;
@@ -62,8 +72,12 @@ export interface FactoryControllerAdmission {
   admittedUntilUnixMs: number;
   authorization: FactoryOwnRunAuthorization;
 }
+export type FactoryControllerAdmission = FactoryControllerAdmissionFields & (
+  { schema: "factory.provider-controller-admission.v2"; companyId: typeof FACTORY_COMPANY_ID }
+  | { schema: "factory.provider-controller-admission.v3"; realm: FactoryWorkerRealm }
+);
 export interface FactorySignedAdmission {
-  schema: typeof FACTORY_ADMISSION_SIGNED_SCHEMA;
+  schema: typeof FACTORY_ADMISSION_SIGNED_SCHEMA | typeof FACTORY_REALM_ADMISSION_SIGNED_SCHEMA;
   payload: string;
   signature: string;
 }
@@ -85,6 +99,21 @@ function exact(value: unknown, keys: readonly string[]): value is Record<string,
 function provider(value: unknown): value is FactoryAdmissionProvider { return value === "codex" || value === "claude"; }
 function id(value: unknown): value is string { return typeof value === "string" && ID.test(value); }
 function integer(value: unknown): value is number { return typeof value === "number" && Number.isSafeInteger(value); }
+function sameRealm(left: FactoryWorkerRealm, right: FactoryWorkerRealm): boolean {
+  return left.companyId === right.companyId && left.authorityId === right.authorityId;
+}
+export function factoryProviderMarker(binding: FactoryProviderBinding) {
+  return binding.schema === "factory.provider-worker-binding.v3" ? FACTORY_REALM_PROVIDER_MARKER : FACTORY_PROVIDER_MARKER;
+}
+export function factoryAdmissionSignedSchema(value: FactoryControllerAdmission) {
+  return value.schema === "factory.provider-controller-admission.v3" ? FACTORY_REALM_ADMISSION_SIGNED_SCHEMA : FACTORY_ADMISSION_SIGNED_SCHEMA;
+}
+function matchingLeaseRealm(descriptor: FactoryWorkerLeaseDescriptor, binding: FactoryProviderBinding): void {
+  validateFactoryWorkerLeaseDescriptor(descriptor);
+  if ("realm" in binding) {
+    if (!("realm" in descriptor) || !sameRealm(descriptor.realm, binding.realm)) invalid();
+  } else if ("realm" in descriptor) invalid();
+}
 
 export function validateFactoryOwnRunAuthorization(value: unknown): asserts value is FactoryOwnRunAuthorization {
   if (!exact(value, authorizationKeys) || value.schema !== "factory.direct-board-wakeup.v1" || value.actorType !== "user" ||
@@ -96,15 +125,21 @@ export function validateFactoryOwnRunAuthorization(value: unknown): asserts valu
 }
 
 export function validateFactoryProviderBinding(value: unknown): asserts value is FactoryProviderBinding {
-  if (!exact(value, bindingKeys) || value.schema !== "factory.provider-worker-binding.v2" || !provider(value.provider) ||
+  if (!object(value)) invalid();
+  const realmMode = value.schema === "factory.provider-worker-binding.v3";
+  if (!exact(value, realmMode ? [...bindingKeys, "realm"] : bindingKeys) ||
+      (!realmMode && value.schema !== "factory.provider-worker-binding.v2") || !provider(value.provider) ||
       ["admissionId", "capabilityId", "normalizedSessionId", "runnerInstanceId"].some(key => !id(value[key])) ||
       typeof value.workerPlanSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.workerPlanSha256)) invalid();
   validateFactoryOwnRunAuthorization(value.authorization);
+  if (realmMode && !factoryWorkerRealmSchema.safeParse(value.realm).success) invalid();
 }
 
 export function encodeFactoryProviderLaunch(descriptor: FactoryWorkerLeaseDescriptor, binding: FactoryProviderBinding,
   command: readonly string[], environment?: Readonly<Record<string, string>>): Buffer {
   validateFactoryProviderBinding(binding);
+  matchingLeaseRealm(descriptor, binding);
+  if (command.some(value => ["--factory-company-id", "--factory-authority-id"].some(flag => value === flag || value.startsWith(flag + "=")))) invalid();
   const flags: Record<string, string> = { "--run-id": descriptor.runId, "--environment-lease-id": descriptor.leaseId,
     "--session-id": binding.normalizedSessionId, "--runner-id": binding.runnerInstanceId };
   for (const [flag, expected] of Object.entries(flags)) {
@@ -114,8 +149,8 @@ export function encodeFactoryProviderLaunch(descriptor: FactoryWorkerLeaseDescri
   const base = encodeFactoryWorkerLaunch(descriptor, command, environment);
   try {
     const value = JSON.parse(base.toString("utf8")) as Record<string, unknown>;
-    const body = Buffer.from(JSON.stringify({ ...value, protocol: FACTORY_PROVIDER_MARKER,
-      policy: FACTORY_PROVIDER_POLICY, providerAdmission: binding }) + "\n");
+    const body = Buffer.from(JSON.stringify({ ...value, protocol: factoryProviderMarker(binding),
+      policy: "realm" in binding ? FACTORY_REALM_PROVIDER_POLICY : FACTORY_PROVIDER_POLICY, providerAdmission: binding }) + "\n");
     if (body.length > 65536) invalid();
     return body;
   } finally { base.fill(0); }
@@ -125,29 +160,41 @@ export function validateFactoryPreparedReceipt(value: unknown, descriptor: Facto
   binding: FactoryProviderBinding): asserts value is FactoryPreparedReceipt {
   validateFactoryWorkerLeaseDescriptor(descriptor);
   validateFactoryProviderBinding(binding);
-  if (!exact(value, preparedKeys) || value.protocol !== FACTORY_PROVIDER_MARKER || value.type !== "preparation" ||
+  matchingLeaseRealm(descriptor, binding);
+  const realmMode = "realm" in binding;
+  if (!exact(value, realmMode ? [...preparedKeys, "realm"] : preparedKeys) || value.protocol !== factoryProviderMarker(binding) || value.type !== "preparation" ||
       value.status !== "prepared" || value.provider !== binding.provider || value.dispatchAttempted !== false ||
       ["companyId", "runId", "leaseId", "sessionId"].some(key => value[key] !== descriptor[key as keyof FactoryWorkerLeaseDescriptor]) ||
       value.workerPlanSha256 !== binding.workerPlanSha256 || value.deadlineUnixMs !== descriptor.deadlineUnixMs ||
       typeof value.ownerNonce !== "string" || !/^[a-f0-9]{32}$/.test(value.ownerNonce) ||
       typeof value.bootId !== "string" || !UUID.test(value.bootId) || !integer(value.createdUnixMs) ||
       value.createdUnixMs <= 0 || value.createdUnixMs > Date.now() + 5000) invalid();
+  if (realmMode) {
+    const realm = factoryWorkerRealmSchema.safeParse(value.realm);
+    if (!realm.success || !sameRealm(realm.data, binding.realm)) invalid();
+  }
 }
 
 export function createFactoryControllerAdmission(descriptor: FactoryWorkerLeaseDescriptor, binding: FactoryProviderBinding,
   prepared: unknown): FactoryControllerAdmission {
   validateFactoryPreparedReceipt(prepared, descriptor, binding);
-  return { schema: "factory.provider-controller-admission.v2", provider: binding.provider, admissionId: binding.admissionId,
-    companyId: FACTORY_COMPANY_ID, capabilityId: binding.capabilityId, runId: descriptor.runId,
+  const fields = { provider: binding.provider, admissionId: binding.admissionId,
+    capabilityId: binding.capabilityId, runId: descriptor.runId,
     environmentLeaseId: descriptor.leaseId, workerSessionId: descriptor.sessionId,
     normalizedSessionId: binding.normalizedSessionId, runnerInstanceId: binding.runnerInstanceId,
     workerOwnerNonce: prepared.ownerNonce, workerPlanSha256: binding.workerPlanSha256,
     bootId: prepared.bootId, createdUnixMs: prepared.createdUnixMs, admittedUntilUnixMs: descriptor.deadlineUnixMs,
     authorization: structuredClone(binding.authorization) };
+  return "realm" in binding
+    ? { ...fields, schema: "factory.provider-controller-admission.v3", companyId: binding.realm.companyId, realm: structuredClone(binding.realm) }
+    : { ...fields, schema: "factory.provider-controller-admission.v2", companyId: FACTORY_COMPANY_ID };
 }
 
 export function encodeFactoryControllerAdmission(value: FactoryControllerAdmission): Buffer {
-  if (!exact(value, admissionKeys) || value.schema !== "factory.provider-controller-admission.v2" || !provider(value.provider) || value.companyId !== FACTORY_COMPANY_ID ||
+  const realmMode = value.schema === "factory.provider-controller-admission.v3";
+  const keys = realmMode ? [...admissionKeys, "realm"] : admissionKeys;
+  if (!exact(value, keys) || (!realmMode && value.schema !== "factory.provider-controller-admission.v2") || !provider(value.provider) ||
+      (!realmMode && value.companyId !== FACTORY_COMPANY_ID) ||
       ["admissionId", "capabilityId", "runId", "environmentLeaseId", "normalizedSessionId", "runnerInstanceId"].some(key => !id(value[key])) ||
       typeof value.workerSessionId !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(value.workerSessionId) ||
       typeof value.workerOwnerNonce !== "string" || !/^[a-f0-9]{32}$/.test(value.workerOwnerNonce) ||
@@ -156,9 +203,15 @@ export function encodeFactoryControllerAdmission(value: FactoryControllerAdmissi
       value.createdUnixMs > Date.now() + 5000 || !integer(value.admittedUntilUnixMs) ||
       value.admittedUntilUnixMs <= Date.now() || value.admittedUntilUnixMs > Date.now() + 300000) invalid();
   validateFactoryOwnRunAuthorization(value.authorization);
+  let realm: Record<string, string> | undefined;
+  if (realmMode) {
+    const parsed = factoryWorkerRealmSchema.safeParse(value.realm);
+    if (!parsed.success || parsed.data.companyId !== value.companyId) invalid();
+    realm = { authorityId: parsed.data.authorityId, companyId: parsed.data.companyId, schema: parsed.data.schema };
+  }
   const authorization = Object.fromEntries([...authorizationKeys].sort().map(key => [key, value.authorization[key as keyof FactoryOwnRunAuthorization]]));
-  return Buffer.from(JSON.stringify(Object.fromEntries([...admissionKeys].sort().map(key =>
-    [key, key === "authorization" ? authorization : value[key as keyof FactoryControllerAdmission]]))) + "\n");
+  return Buffer.from(JSON.stringify(Object.fromEntries([...keys].sort().map(key =>
+    [key, key === "authorization" ? authorization : key === "realm" ? realm : value[key as keyof FactoryControllerAdmission]]))) + "\n");
 }
 
 type StartSigner = (args: readonly string[], environment: NodeJS.ProcessEnv) => ChildProcessWithoutNullStreams;
@@ -171,7 +224,8 @@ export async function signFactoryControllerAdmission(value: FactoryControllerAdm
   if (!isAbsolute(keyPath) || keyPath.includes("\0") || signal?.aborted) throw new Error("factory_provider_signing_held");
   return await new Promise<FactorySignedAdmission>((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
-    try { child = start(["-Y", "sign", "-f", keyPath, "-n", FACTORY_ADMISSION_NAMESPACE],
+    const namespace = value.schema === "factory.provider-controller-admission.v3" ? FACTORY_REALM_ADMISSION_NAMESPACE : FACTORY_ADMISSION_NAMESPACE;
+    try { child = start(["-Y", "sign", "-f", keyPath, "-n", namespace],
       { PATH: "/usr/bin:/bin:/usr/local/bin", LANG: "C", LC_ALL: "C" }); }
     catch { body.fill(0); reject(new Error("factory_provider_signing_held")); return; }
     const chunks: Buffer[] = [];
@@ -198,7 +252,7 @@ export async function signFactoryControllerAdmission(value: FactoryControllerAdm
       const signature = Buffer.concat(chunks).toString("ascii");
       if (code !== 0 || exitSignal !== null || !signature.startsWith("-----BEGIN SSH SIGNATURE-----\n") ||
           !signature.endsWith("-----END SSH SIGNATURE-----\n") || Date.now() >= value.admittedUntilUnixMs) { fail(); return; }
-      const result: FactorySignedAdmission = { schema: FACTORY_ADMISSION_SIGNED_SCHEMA, payload: body.toString("base64"), signature };
+      const result: FactorySignedAdmission = { schema: factoryAdmissionSignedSchema(value), payload: body.toString("base64"), signature };
       settled = true; cleanup(); resolve(result);
     });
     child.stdin.end(body);

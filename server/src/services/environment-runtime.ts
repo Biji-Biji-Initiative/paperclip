@@ -32,7 +32,7 @@ import type {
   PluginSyncOperation,
 } from "@paperclipai/plugin-sdk";
 import { ensureSshWorkspaceReady } from "@paperclipai/adapter-utils/ssh";
-import { FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { isFactoryWorkerPolicy } from "@paperclipai/shared/factory-worker-realm";
 import { acquireFactoryWorkspaceStagingLease } from "./factory-workspace-staging.js";
 import {
   getActiveStepContext,
@@ -1194,7 +1194,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         throw new Error(`Expected SSH environment config for driver "${input.environment.driver}".`);
       }
 
-      if (parsed.config.factoryWorkerPolicy === FACTORY_WORKER_POLICY) {
+      if (isFactoryWorkerPolicy(parsed.config.factoryWorkerPolicy)) {
         if (!input.heartbeatRunId || !input.executionWorkspaceId || !input.agentId) {
           throw new Error("factory_workspace_staging_ownership_unverified");
         }

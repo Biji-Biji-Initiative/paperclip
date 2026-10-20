@@ -6,7 +6,7 @@ import type {
   EnvironmentStatus,
 } from "../constants.js";
 import type { AgentEnvConfig, EnvSecretRefBinding } from "./secrets.js";
-import type { FactoryProviderEnrollment } from "../factory-worker-realm.js";
+import type { FactoryProviderEnrollment, FactoryWorkerPolicy } from "../factory-worker-realm.js";
 
 export interface LocalEnvironmentConfig {
   [key: string]: unknown;
@@ -14,7 +14,7 @@ export interface LocalEnvironmentConfig {
 
 export interface SshEnvironmentConfig {
   /** Explicit, versioned enrollment in the isolated Factory worker protocol. */
-  factoryWorkerPolicy?: "factory-worker-scope-v2";
+  factoryWorkerPolicy?: FactoryWorkerPolicy;
   /** Operator enrollment only; absent preserves credential-free execution. */
   factoryProviderAdmission?: FactoryProviderEnrollment;
   host: string;

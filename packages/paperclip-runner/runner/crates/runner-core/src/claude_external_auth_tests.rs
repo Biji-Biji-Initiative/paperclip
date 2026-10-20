@@ -35,6 +35,36 @@ fn pipe_file() -> (File, std::io::PipeWriter) {
     (File::from(owned), write)
 }
 #[test]
+fn factory_worker_realm_survives_real_pipe_intake_and_both_sidecar_frames() {
+    let company = "a2b00000-0000-4000-8000-000000000001";
+    let realm = FactoryWorkerRealm::new(company, "fixture-botak").unwrap();
+    let mut source = envelope();
+    source["reference"]["companyId"] = json!(company);
+    source["reference"]["authorityId"] = json!("fixture-botak");
+    assert_reason(ingress(&source), Reason::Foreign);
+    for expected in [
+        FactoryWorkerRealm::new(company, "fixture-mereka").unwrap(),
+        FactoryWorkerRealm::new("a2b00000-0000-4000-8000-000000000002", "fixture-botak").unwrap(),
+    ] {
+        assert_reason(ClaudeIngress::from_bytes_for_realm(&serde_json::to_vec(&source).unwrap(), &actual(), Some(expected)), Reason::Foreign);
+    }
+    let (read, mut write) = pipe_file();
+    let bytes = serde_json::to_vec(&source).unwrap();
+    let writer = std::thread::spawn(move || write.write_all(&bytes).unwrap());
+    let mut ingress = ClaudeIngress::from_owned_pipe_for_realm(read, &actual(), Some(realm.clone())).unwrap();
+    writer.join().unwrap();
+    ingress.authority().unwrap().assert_live(&actual()).unwrap();
+    let frames = ingress.consume_for_sidecar(&actual(), Path::new("/runtime/native"), Path::new("/workspace/proposal")).unwrap();
+    let metadata: Value = serde_json::from_slice(&frames.metadata).unwrap();
+    let grant: Value = serde_json::from_slice(&frames.private).unwrap();
+    assert_eq!(metadata["schema"], "paperclip.factory-claude-sidecar.v3");
+    assert_eq!(grant["schema"], "paperclip.factory-claude-access.v3");
+    assert_eq!(metadata["realm"], serde_json::to_value(&realm).unwrap());
+    assert_eq!(grant["realm"], metadata["realm"]);
+    assert_eq!(serde_json::to_value(&frames.binding).unwrap()["realm"], metadata["realm"]);
+    assert!(metadata.get("accessToken").is_none());
+}
+#[test]
 fn projects_distinct_closed_frames_and_caps_source_expiry() {
     let source = envelope();
     let mut owner = ingress(&source).unwrap();

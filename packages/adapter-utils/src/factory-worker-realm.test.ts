@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   LEGACY_FACTORY_COMPANY_ID, factoryEnrollmentMatchesCompany, factoryProviderEnrollmentSchema,
   sameFactoryProviderEnrollment,
+  factoryEnrollmentMatchesPolicy, factoryWorkerScopeMatchesCompany,
 } from "@paperclipai/shared/factory-worker-realm";
 
 const botak = "a2b00000-0000-4000-8000-000000000001";
@@ -11,6 +12,16 @@ const tenant = { ...legacy, schema: "factory.provider-enrollment.v3",
   realm: { schema: "factory.worker-realm.v1", companyId: botak, authorityId: "factory-botak-g2" } };
 
 describe("explicit Factory worker realms", () => {
+  it("never downgrades a realm to legacy policy or admits an unenrolled v3 scope", () => {
+    expect(factoryEnrollmentMatchesPolicy(tenant, "factory-worker-scope-v3")).toBe(true);
+    expect(factoryEnrollmentMatchesPolicy(tenant, "factory-worker-scope-v2")).toBe(false);
+    expect(factoryEnrollmentMatchesPolicy(legacy, "factory-worker-scope-v3")).toBe(false);
+    expect(factoryEnrollmentMatchesPolicy(undefined, "factory-worker-scope-v3")).toBe(false);
+    expect(factoryWorkerScopeMatchesCompany("factory-worker-scope-v3", tenant, botak)).toBe(true);
+    expect(factoryWorkerScopeMatchesCompany("factory-worker-scope-v3", tenant, mereka)).toBe(false);
+    expect(factoryWorkerScopeMatchesCompany("factory-worker-scope-v2", undefined, botak)).toBe(false);
+    expect(factoryWorkerScopeMatchesCompany("factory-worker-scope-v2", undefined, LEGACY_FACTORY_COMPANY_ID)).toBe(true);
+  });
   it("retains the legacy shape only for its original company", () => {
     const parsed = factoryProviderEnrollmentSchema.parse(legacy);
     expect(parsed).toEqual(legacy);

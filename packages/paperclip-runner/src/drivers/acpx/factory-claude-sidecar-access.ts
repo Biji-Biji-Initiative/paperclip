@@ -1,12 +1,13 @@
 import { closeSync, fstatSync } from "node:fs";
 import { Socket } from "node:net";
 import { isAbsolute, join, normalize } from "node:path";
-import type { FactoryClaudeAccessHandoff } from "./factory-claude-access.js";
+import { parseFactoryClaudeRealm, type FactoryClaudeAccessHandoff, type FactoryClaudeRealm } from "./factory-claude-access.js";
 
 export const FACTORY_CLAUDE_SIDECAR_FLAG = "--factory-claude-access-v1";
 const FAILURE = "factory_claude_access_unverified";
 const bindingKeys = ["admissionId", "capabilityId", "workerPlanSha256", "runId", "normalizedSessionId", "environmentLeaseId", "runnerInstanceId", "deadlineAtMs"] as const;
 export interface FactoryClaudeSidecarBinding {
+  realm?: FactoryClaudeRealm;
   admissionId: string;
   capabilityId: string;
   workerPlanSha256: string;
@@ -41,16 +42,19 @@ function canonical(input: unknown): input is string {
   return typeof input === "string" && input.length <= 4096 && isAbsolute(input) && input !== "/" && normalize(input) === input && !/[\x00-\x1f\x7f]/.test(input);
 }
 export function parseFactoryClaudeSidecarBinding(input: unknown): FactoryClaudeSidecarBinding {
-  const value = closedRecord(input, bindingKeys);
+  const realmMode = typeof input === "object" && input !== null && Object.hasOwn(input, "realm");
+  const value = closedRecord(input, realmMode ? [...bindingKeys, "realm"] : bindingKeys);
   for (const key of bindingKeys.filter(key => key !== "deadlineAtMs" && key !== "workerPlanSha256")) {
     if (typeof value[key] !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(value[key] as string)) return fail();
   }
   if (typeof value.workerPlanSha256 !== "string" || !/^[a-f0-9]{64}$/.test(value.workerPlanSha256) ||
     typeof value.deadlineAtMs !== "number" || !Number.isSafeInteger(value.deadlineAtMs) || value.deadlineAtMs <= Date.now() || value.deadlineAtMs > Date.now() + 300_000) return fail();
-  return value as unknown as FactoryClaudeSidecarBinding;
+  const parsed = value as unknown as FactoryClaudeSidecarBinding;
+  return { ...parsed, ...(realmMode ? { realm: parseFactoryClaudeRealm(value.realm) } : {}) };
 }
 function sameBinding(actual: FactoryClaudeSidecarBinding, expected: FactoryClaudeSidecarBinding): boolean {
-  return bindingKeys.every(key => actual[key] === expected[key]);
+  return bindingKeys.every(key => actual[key] === expected[key]) &&
+    (expected.realm ? actual.realm?.companyId === expected.realm.companyId && actual.realm.authorityId === expected.realm.authorityId : !actual.realm);
 }
 async function readPipe(fd: number, signal: AbortSignal): Promise<Buffer> {
   const stat = fstatSync(fd);
@@ -95,14 +99,21 @@ export async function initializeFactoryClaudeSidecarAccess(): Promise<void> {
     if (reads[0].status === "fulfilled") metadata = reads[0].value;
     if (reads[1].status === "fulfilled") access = reads[1].value;
     if (!metadata || !access) return fail();
-    const raw = closedRecord(JSON.parse(metadata.toString("utf8")), ["schema", "provider", ...bindingKeys, "runtimeDirectory", "workingDirectory"]);
-    if (raw.schema !== "paperclip.factory-claude-sidecar.v1" || raw.provider !== "claude" || !canonical(raw.runtimeDirectory) || !canonical(raw.workingDirectory)) return fail();
-    const binding = parseFactoryClaudeSidecarBinding(Object.fromEntries(bindingKeys.map(key => [key, raw[key]])));
-    const grant = closedRecord(JSON.parse(access.toString("utf8")), ["schema", "provider", ...bindingKeys.filter(key => key !== "deadlineAtMs"), "expiresAtMs", "accessToken"]);
-    if (grant.schema !== "paperclip.factory-claude-access.v1" || grant.provider !== "claude" ||
+    const decoded: unknown = JSON.parse(metadata.toString("utf8"));
+    const realmMode = typeof decoded === "object" && decoded !== null && Object.hasOwn(decoded, "realm");
+    const fields = realmMode ? [...bindingKeys, "realm"] : [...bindingKeys];
+    const raw = closedRecord(decoded, ["schema", "provider", ...fields, "runtimeDirectory", "workingDirectory"]);
+    if (raw.schema !== (realmMode ? "paperclip.factory-claude-sidecar.v3" : "paperclip.factory-claude-sidecar.v1") || raw.provider !== "claude" || !canonical(raw.runtimeDirectory) || !canonical(raw.workingDirectory)) return fail();
+    const binding = parseFactoryClaudeSidecarBinding(Object.fromEntries(fields.map(key => [key, raw[key]])));
+    const grant = closedRecord(JSON.parse(access.toString("utf8")), ["schema", "provider", ...fields.filter(key => key !== "deadlineAtMs"), "expiresAtMs", "accessToken"]);
+    if (grant.schema !== (realmMode ? "paperclip.factory-claude-access.v3" : "paperclip.factory-claude-access.v1") || grant.provider !== "claude" ||
       !bindingKeys.filter(key => key !== "deadlineAtMs").every(key => grant[key] === binding[key]) ||
       typeof grant.expiresAtMs !== "number" || !Number.isSafeInteger(grant.expiresAtMs) || grant.expiresAtMs <= Date.now() || grant.expiresAtMs > binding.deadlineAtMs ||
       typeof grant.accessToken !== "string" || !/^[A-Za-z0-9._-]{32,4096}$/.test(grant.accessToken)) return fail();
+    if (binding.realm) {
+      const realm = parseFactoryClaudeRealm(grant.realm);
+      if (realm.companyId !== binding.realm.companyId || realm.authorityId !== binding.realm.authorityId) return fail();
+    }
     // The worker's closed SSH environment excludes controller-local package
     // paths. Its authenticated workspace fixes the read-only staged pack; the
     // descriptor-loaded sidecar cannot derive it from /proc/self/fd/__filename.

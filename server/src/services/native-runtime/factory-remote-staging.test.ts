@@ -3,6 +3,7 @@ import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, rea
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FACTORY_COMPANY_ID } from "@paperclipai/adapter-utils/factory-worker-lease";
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { FACTORY_STAGE_PROGRAM, stageFactoryRemoteRunnerFile } from "./factory-remote-staging.js";
 
 type Entry = { name: string; kind?: string; target?: string; content?: string; mode?: number };
@@ -141,5 +142,22 @@ describe("Factory remote staging with actual local filesystem operations", () =>
     await expect(stageFactoryRemoteRunnerFile({ runner: { execute } as never, workspaceRoot: root,
       targetPath: `${root}/../other/config`, sourcePath: join(scratch, "missing"), mode: 0o600 })).rejects.toThrow("factory_remote_staging_unverified");
     expect(execute).not.toHaveBeenCalled();
+  });
+  it("projects only a canonical selected company workspace into the trusted staging command", async () => {
+    const sourcePath = join(scratch, "public-input"); writeFileSync(sourcePath, "synthetic-public-runtime");
+    const requests: unknown[] = [];
+    const runner: CommandManagedRuntimeRunner = { async execute(input) {
+      requests.push(JSON.parse(input.args?.at(-1) ?? "null"));
+      expect(input.command).toBe("/usr/bin/python3"); expect(input.stdin).toBe(Buffer.from("synthetic-public-runtime").toString("base64"));
+      return { stdout: "", stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString() };
+    } };
+    for (const company of [FACTORY_COMPANY_ID, "a2b00000-0000-4000-8000-000000000001", "a2b00000-0000-4000-8000-000000000002"]) {
+      const root = `/workspace/${company}/11111111-1111-1111-1111-111111111111`;
+      await stageFactoryRemoteRunnerFile({ runner, workspaceRoot: root, targetPath: `${root}/.paperclip-runtime/bin/runner`, sourcePath, mode: 0o555 });
+      expect(requests.at(-1)).toEqual({ kind: "file", workspaceRoot: root, relativePath: ".paperclip-runtime/bin/runner", mode: 0o555 });
+      await expect(stageFactoryRemoteRunnerFile({ runner, workspaceRoot: root,
+        targetPath: `/workspace/${company}/22222222-2222-2222-2222-222222222222/.paperclip-runtime/bin/runner`, sourcePath, mode: 0o555 })).rejects.toThrow("factory_remote_staging_unverified");
+    }
+    expect(requests).toHaveLength(3);
   });
 });

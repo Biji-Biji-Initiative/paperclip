@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { and, eq, gt, or, sql } from "drizzle-orm";
 import { agents, issues, environmentLeases, environments, executionWorkspaces, heartbeatRuns, type Db } from "@paperclipai/db";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { factoryWorkerScopeMatchesCompany, type FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 
 import { NativeRunnerOwnershipUnverifiedError, isNativeRunnerOwnershipHeld } from "./native-runtime/native-runner-ownership.js";
 
@@ -29,6 +29,7 @@ function denied(): never { throw new NativeRunnerOwnershipUnverifiedError("facto
 
 export type FactoryWorkspaceStagingConfig = {
   factoryWorkerPolicy?: string;
+  factoryProviderAdmission?: FactoryProviderEnrollment;
   remoteWorkspacePath: string;
   host: string; port: number; username: string;
   knownHosts: string | null; strictHostKeyChecking: boolean;
@@ -36,7 +37,7 @@ export type FactoryWorkspaceStagingConfig = {
 
 function scopeFor(companyId: string, workspaceId: string, config: FactoryWorkspaceStagingConfig) {
   const expected = `/workspace/${companyId}/${workspaceId}`;
-  if (!config || companyId !== FACTORY_COMPANY_ID || config.factoryWorkerPolicy !== FACTORY_WORKER_POLICY ||
+  if (!config || !factoryWorkerScopeMatchesCompany(config.factoryWorkerPolicy, config.factoryProviderAdmission, companyId) ||
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(workspaceId) ||
       config.remoteWorkspacePath !== expected || !config.strictHostKeyChecking || !config.knownHosts) denied();
   const pins = config.knownHosts.trim().split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith("#"));
@@ -48,11 +49,17 @@ function scopeFor(companyId: string, workspaceId: string, config: FactoryWorkspa
   if (!hostPattern || /[@*?!]/.test(hostPattern) || !algorithm || !/^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa)$/.test(algorithm) ||
       !key || !/^[A-Za-z0-9+/]+={0,2}$/.test(key) || Buffer.from(key, "base64").length < 16 ||
       Buffer.from(key, "base64").toString("base64") !== key) denied();
+  // Workspace exclusion survives plan/authority changes. A new enrollment
+  // cannot bypass a held owner of the same host-key/company/workspace.
   return createHash("sha256").update(JSON.stringify([SCHEMA, companyId, algorithm, key, expected])).digest("hex");
 }
 function connectionFor(config: FactoryWorkspaceStagingConfig) {
-  return createHash("sha256").update(JSON.stringify([config.host, config.port, config.username,
-    config.remoteWorkspacePath, config.knownHosts?.trim(), config.strictHostKeyChecking])).digest("hex");
+  const identity = [config.host, config.port, config.username,
+    config.remoteWorkspacePath, config.knownHosts?.trim(), config.strictHostKeyChecking];
+  const enrollment = config.factoryProviderAdmission;
+  if (enrollment && "realm" in enrollment) identity.push(enrollment.realm.companyId, enrollment.realm.authorityId,
+    enrollment.workerPlanSha256, enrollment.provider);
+  return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 function advisoryKey(scope: string) { return BigInt.asIntN(64, BigInt(`0x${scope.slice(0, 16)}`)).toString(); }
 

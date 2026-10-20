@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
 import { cleanupGitHubOperationLaunchers, prepareGitHubOperationLaunchers } from "@paperclipai/adapter-utils/execution-target";
+import { isFactoryWorkerPolicy } from "@paperclipai/shared/factory-worker-realm";
 
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 
@@ -16,7 +17,7 @@ export async function prepareHeartbeatGitHubLaunchers(
   cleanupLaunchers = cleanupGitHubOperationLaunchers,
 ) {
   if (input.target?.kind === "remote" && input.target.transport === "ssh" &&
-      input.target.factoryWorkerPolicy === "factory-worker-scope-v2") {
+      isFactoryWorkerPolicy(input.target.factoryWorkerPolicy)) {
     if (!input.native || input.githubConfigured) {
       throw new Error("factory_worker_github_not_qualified");
     }

@@ -1,0 +1,98 @@
+{
+  "nowUnixMs": 1792454400000,
+  "descriptor": {
+    "protocol": "factory-worker-lease-v3",
+    "policy": "factory-worker-scope-v3",
+    "companyId": "a2b00000-0000-4000-8000-000000000001",
+    "realm": {
+      "schema": "factory.worker-realm.v1",
+      "companyId": "a2b00000-0000-4000-8000-000000000001",
+      "authorityId": "fixture-botak"
+    },
+    "runId": "10000000-0000-4000-8000-000000000001",
+    "leaseId": "10000000-0000-4000-8000-000000000002",
+    "workspaceId": "10000000-0000-4000-8000-000000000003",
+    "sessionId": "fixture-session",
+    "workspaceRoot": "/workspace/a2b00000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000003",
+    "sessionRoot": "/workspace/a2b00000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000003/.paperclip-runtime/paperclip-runner/sessions/d6440983c454c2e5999fdb66bbe9cf5f89a8f5847d6c9578ef14afd26eee122c",
+    "stateDirectory": "/workspace/a2b00000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000003/.paperclip-runtime/paperclip-runner/sessions/d6440983c454c2e5999fdb66bbe9cf5f89a8f5847d6c9578ef14afd26eee122c/runner",
+    "filesystemDirectory": "/workspace/a2b00000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000003/.paperclip-runtime/paperclip-runner/sessions/d6440983c454c2e5999fdb66bbe9cf5f89a8f5847d6c9578ef14afd26eee122c/filesystem",
+    "diagnosticsDirectory": "/workspace/a2b00000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000003/.paperclip-runtime/paperclip-runner/sessions/d6440983c454c2e5999fdb66bbe9cf5f89a8f5847d6c9578ef14afd26eee122c/diagnostics",
+    "deadlineUnixMs": 1792454460000
+  },
+  "binding": {
+    "schema": "factory.provider-worker-binding.v3",
+    "provider": "codex",
+    "realm": {
+      "schema": "factory.worker-realm.v1",
+      "companyId": "a2b00000-0000-4000-8000-000000000001",
+      "authorityId": "fixture-botak"
+    },
+    "admissionId": "fixture-admission",
+    "capabilityId": "fixture-capability",
+    "normalizedSessionId": "fixture-session",
+    "runnerInstanceId": "fixture-runner",
+    "workerPlanSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "authorization": {
+      "schema": "factory.direct-board-wakeup.v1",
+      "actorType": "user",
+      "actorId": "synthetic-owner",
+      "actorEmail": "synthetic@example.invalid",
+      "wakeupRequestId": "10000000-0000-4000-8000-000000000004",
+      "agentId": "10000000-0000-4000-8000-000000000005",
+      "requestedAtUnixMs": 1792454399000
+    }
+  },
+  "prepared": {
+    "protocol": "factory-worker-provider-lease-v3",
+    "provider": "codex",
+    "realm": {
+      "schema": "factory.worker-realm.v1",
+      "companyId": "a2b00000-0000-4000-8000-000000000001",
+      "authorityId": "fixture-botak"
+    },
+    "type": "preparation",
+    "status": "prepared",
+    "companyId": "a2b00000-0000-4000-8000-000000000001",
+    "runId": "10000000-0000-4000-8000-000000000001",
+    "leaseId": "10000000-0000-4000-8000-000000000002",
+    "sessionId": "fixture-session",
+    "ownerNonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "bootId": "10000000-0000-4000-8000-000000000006",
+    "createdUnixMs": 1792454400000,
+    "deadlineUnixMs": 1792454460000,
+    "workerPlanSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "dispatchAttempted": false
+  },
+  "controller": {
+    "schema": "factory.provider-controller-admission.v3",
+    "provider": "codex",
+    "realm": {
+      "schema": "factory.worker-realm.v1",
+      "companyId": "a2b00000-0000-4000-8000-000000000001",
+      "authorityId": "fixture-botak"
+    },
+    "admissionId": "fixture-admission",
+    "companyId": "a2b00000-0000-4000-8000-000000000001",
+    "capabilityId": "fixture-capability",
+    "runId": "10000000-0000-4000-8000-000000000001",
+    "environmentLeaseId": "10000000-0000-4000-8000-000000000002",
+    "workerSessionId": "fixture-session",
+    "normalizedSessionId": "fixture-session",
+    "runnerInstanceId": "fixture-runner",
+    "workerOwnerNonce": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "workerPlanSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "bootId": "10000000-0000-4000-8000-000000000006",
+    "createdUnixMs": 1792454400000,
+    "admittedUntilUnixMs": 1792454460000,
+    "authorization": {
+      "schema": "factory.direct-board-wakeup.v1",
+      "actorType": "user",
+      "actorId": "synthetic-owner",
+      "actorEmail": "synthetic@example.invalid",
+      "wakeupRequestId": "10000000-0000-4000-8000-000000000004",
+      "agentId": "10000000-0000-4000-8000-000000000005",
+      "requestedAtUnixMs": 1792454399000
+    }
+  }
+}

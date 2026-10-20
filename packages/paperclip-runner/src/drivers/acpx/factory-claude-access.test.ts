@@ -28,7 +28,7 @@ describe("Factory Claude access pipe and native SDK spawn boundary", () => {
       bridgeUrl: "http://127.0.0.1:41234/mcp", allowedMcpTools: ["mcp__paperclip__report_progress"] };
   });
   function frame(overrides: Record<string, unknown> = {}) {
-    return { schema: "paperclip.factory-claude-access.v1", provider: "claude", admissionId: policy.admissionId, capabilityId: policy.capabilityId, workerPlanSha256: policy.workerPlanSha256, runId: policy.runId, normalizedSessionId: policy.normalizedSessionId,
+    return { schema: policy.realm ? "paperclip.factory-claude-access.v3" : "paperclip.factory-claude-access.v1", ...(policy.realm ? { realm: policy.realm } : {}), provider: "claude", admissionId: policy.admissionId, capabilityId: policy.capabilityId, workerPlanSha256: policy.workerPlanSha256, runId: policy.runId, normalizedSessionId: policy.normalizedSessionId,
       environmentLeaseId: policy.environmentLeaseId, runnerInstanceId: policy.runnerInstanceId, expiresAtMs: policy.deadlineAtMs, accessToken: TOKEN, ...overrides };
   }
   async function run(body: string, value = frame(), env = environment, holdInput = false) {
@@ -44,6 +44,21 @@ describe("Factory Claude access pipe and native SDK spawn boundary", () => {
     return { code, signal, stdout, stderr };
   }
   const configure = `const configure=globalThis[Symbol.for("paperclip.factoryClaudeAccess.v1")];const options=configure({paperclip:{type:"http",url:${JSON.stringify("http://127.0.0.1:41234/mcp")}}});`;
+
+  it("checks v3 company and authority in the actual serialized inherited-pipe bootstrap", async () => {
+    policy.realm = { schema: "factory.worker-realm.v1", companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "factory-botak" };
+    const accepted = await run('process.stdout.write("realm-verified");');
+    expect(accepted).toEqual({ code: 0, signal: null, stdout: "realm-verified", stderr: "" });
+    for (const changes of [
+      { realm: { ...policy.realm, authorityId: "factory-mereka" } },
+      { realm: { ...policy.realm, companyId: "a2b00000-0000-4000-8000-000000000002" } },
+      { realm: { ...policy.realm, authorityId: "*" } },
+      { schema: "paperclip.factory-claude-access.v1" },
+    ]) {
+      const rejected = await run('process.stdout.write("must-not-initialize");', frame(changes));
+      expect(rejected).toEqual({ code: 1, signal: null, stdout: "", stderr: "factory_claude_access_unverified" });
+    }
+  });
 
   it("retires a held-open capability pipe at the two second deadline", async () => {
     const result = await run('process.stdout.write("unexpected-provider-import");', frame(), environment, true);

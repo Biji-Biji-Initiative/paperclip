@@ -335,6 +335,9 @@ fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
     // dropped on every parse/configuration failure as well as after consumption.
     let external_pipe = external_auth_fd::take_selected()
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
+    let expected_realm = paperclip_runner_core::factory_worker_realm::FactoryWorkerRealm::from_startup_args(
+        args, external_pipe.is_some() || claude_pipe.is_some(),
+    ).map_err(LocalRunnerError::invalid)?;
     let ticket = capture_bootstrap_ticket()
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?
         .ok_or_else(|| {
@@ -380,7 +383,7 @@ fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
         max_runtime: duration("--max-runtime-ms", 0)?,
     };
     if let Some(pipe) = external_pipe {
-        paperclip_runner_core::codex_external_auth::install_trusted_pipe(
+        paperclip_runner_core::codex_external_auth::install_trusted_pipe_for_realm(
             pipe,
             &paperclip_runner_core::codex_external_auth::ExternalAuthRunBinding {
                 run_id: &config.run_id,
@@ -388,13 +391,14 @@ fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
                 normalized_session_id: &config.normalized_session_id,
                 runner_instance_id: &config.runner_instance_id,
             },
+            expected_realm.clone(),
         )
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
     }
     let executor = if let Some(pipe) = claude_pipe {
         use paperclip_runner_core::{claude_external_auth as claude, factory_child_fds};
         let plan = worker_plan.expect("Claude startup required its worker plan");
-        let ingress = claude::ClaudeIngress::from_owned_pipe(
+        let ingress = claude::ClaudeIngress::from_owned_pipe_for_realm(
             pipe,
             &claude::ActualRun {
                 run_id: &config.run_id,
@@ -403,6 +407,7 @@ fn run_durable(args: &[String]) -> Result<(), LocalRunnerError> {
                 runner_instance_id: &config.runner_instance_id,
                 worker_plan_sha256: &plan,
             },
+            expected_realm,
         )
         .map_err(|error| LocalRunnerError::invalid(error.to_string()))?;
         claude::validate_private_home_and_environment()

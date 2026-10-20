@@ -748,19 +748,21 @@ describe("environmentRunOrchestrator — realizeForRun", () => {
 
 
 describe("native runner lifecycle changes before lease acquisition", () => {
-  const factoryEnvironment = () => ({ ...makeEnvironment("ssh"), config: {
+  const factoryEnvironment = (policy: "factory-worker-scope-v2" | "factory-worker-scope-v3" = "factory-worker-scope-v2") => ({ ...makeEnvironment("ssh"), config: {
     host: "fixture.invalid", port: 2222, username: "node", remoteWorkspacePath: "/workspace/fixture",
     privateKey: null, privateKeySecretRef: null, knownHosts: "fixture-public-pin", strictHostKeyChecking: true,
-    factoryWorkerPolicy: "factory-worker-scope-v2",
+    factoryWorkerPolicy: policy,
+    ...(policy === "factory-worker-scope-v3" ? { factoryProviderAdmission: { schema: "factory.provider-enrollment.v3", provider: "codex", workerPlanSha256: "a".repeat(64),
+      realm: { schema: "factory.worker-realm.v1", companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "fixture-tenant" } } } : {}),
   } });
-  it("acquires and realizes an enrolled native Factory target without serializing any raw SSH spec", async () => {
+  it.each(["factory-worker-scope-v2", "factory-worker-scope-v3"] as const)("acquires and realizes %s without serializing any raw SSH spec", async policy => {
     vi.clearAllMocks();
-    const environment = factoryEnvironment(), lease = makeLease({ provider: "ssh", metadata: { remoteCwd: "/workspace/fixture" } });
+    const environment = factoryEnvironment(policy), lease = makeLease({ provider: "ssh", metadata: { remoteCwd: "/workspace/fixture" } });
     mockGetEnvironment.mockResolvedValue(environment);
     const acquireRunLease = vi.fn().mockResolvedValue({ environment, lease, leaseContext: {} });
     mockResolveEnvironmentExecutionTransport.mockRejectedValueOnce(new Error("raw transport must not be requested"));
     mockAdapterExecutionTargetToRemoteSpec.mockImplementationOnce(() => { throw new Error("raw converter must not be requested"); });
-    const target = { kind: "remote", transport: "ssh", factoryWorkerPolicy: "factory-worker-scope-v2",
+    const target = { kind: "remote", transport: "ssh", factoryWorkerPolicy: policy,
       environmentId: environment.id, leaseId: lease.id, remoteCwd: "/workspace/fixture", spec: {} };
     mockResolveEnvironmentExecutionTarget.mockResolvedValue(target);
     mockBuildWorkspaceRealizationRequest.mockReturnValue({ runtimeOverlay: { provisionCommand: null } });

@@ -30,6 +30,16 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("Factory worker bootstrap environment", () => {
+  it.each(["factory-worker-scope-v2", "factory-worker-scope-v3"] as const)("keeps %s outside host GitHub credentials and generic SSH preparation", async factoryWorkerPolicy => {
+    const { lease } = fixture();
+    const target = { kind: "remote" as const, transport: "ssh" as const, factoryWorkerPolicy, remoteCwd: lease.workspaceRoot,
+      spec: { host: "unused.invalid", port: 2222, username: "node", remoteCwd: lease.workspaceRoot,
+        remoteWorkspacePath: lease.workspaceRoot, privateKey: null, knownHosts: null, strictHostKeyChecking: true } };
+    const input = { target, cwd: lease.workspaceRoot, env: { GH_TOKEN: "synthetic-denied", GITHUB_TOKEN: "synthetic-denied" }, hostCredentials: false, networkAccess: true };
+    const environment = await prepareGitHubExecutionEnvironment(input);
+    expect(environment).toMatchObject({ GH_TOKEN: "", GITHUB_TOKEN: "", PAPERCLIP_GITHUB_BROKER_TOKEN: "", PAPERCLIP_GITHUB_HOST_HOME: "", PAPERCLIP_GIT_METADATA_ROOTS: "[]" });
+    await expect(prepareGitHubExecutionEnvironment({ ...input, hostCredentials: true })).rejects.toThrow("factory_worker_host_github_forbidden");
+  });
   it("encodes a real controller bootstrap using the fixed worker paths and proxy", () => {
     const { lease, command } = fixture();
     const bootstrap = { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",

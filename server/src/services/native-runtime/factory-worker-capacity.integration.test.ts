@@ -3,7 +3,8 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces,
   heartbeatRuns, issues, nativeRunFinalizations, projects } from "@paperclipai/db";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, FactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, FACTORY_REALM_WORKER_POLICY, FactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { factoryProviderEnrollmentSchema, type FactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
 import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -27,14 +28,17 @@ describe("Factory authoritative runtime and nondispatched capacity", () => {
   }, 120_000);
   afterAll(async () => { await temporary?.cleanup(); });
 
-  async function fixture() {
+  async function fixture(scope: { companyId: string; agentId: string; projectId: string } = { companyId, agentId, projectId }, enrollment?: FactoryProviderEnrollment) {
+    const { companyId, agentId, projectId } = scope;
     const runId = randomUUID(), issueId = randomUUID(), workspaceId = randomUUID(), environmentId = randomUUID(), leaseId = randomUUID();
     const cwd = `/workspace/${companyId}/${workspaceId}`;
     await db.insert(issues).values({ id: issueId, companyId, title: "Fixture", status: "in_progress", assigneeAgentId: agentId });
     await db.insert(executionWorkspaces).values({ id: workspaceId, companyId, projectId,
       mode: "shared", strategyType: "shared", name: "Fixture", cwd });
+    const policy = enrollment && "realm" in enrollment ? FACTORY_REALM_WORKER_POLICY : FACTORY_WORKER_POLICY;
     const config = { host: "fixture.invalid", port: 2222, username: "node", remoteWorkspacePath: cwd,
-      knownHosts: "fixture-key-pin", strictHostKeyChecking: true, factoryWorkerPolicy: FACTORY_WORKER_POLICY };
+      knownHosts: "fixture-key-pin", strictHostKeyChecking: true, factoryWorkerPolicy: policy,
+      ...(enrollment ? { factoryProviderAdmission: enrollment } : {}) };
     await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "ssh", config });
     const execution: NativeExecutionInputV1 = {
       schema: "paperclip.native-execution-input.v1",
@@ -55,10 +59,38 @@ describe("Factory authoritative runtime and nondispatched capacity", () => {
     await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, executionWorkspaceId: workspaceId,
       heartbeatRunId: runId, issueId, status: "active", provider: "ssh", metadata: { remoteCwd: cwd } });
     const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", environmentId, leaseId,
-      factoryWorkerPolicy: FACTORY_WORKER_POLICY, remoteCwd: cwd,
+      factoryWorkerPolicy: policy, ...(enrollment ? { factoryProviderAdmission: structuredClone(enrollment) } : {}), remoteCwd: cwd,
       spec: { ...config, remoteCwd: cwd, privateKey: "fixture-not-a-key" } };
     return { execution, target, runId, issueId, environmentId, leaseId };
   }
+
+  it("enforces distinct tenant enrollment and real database company predicates before any provider", async () => {
+    const attempts = [];
+    for (const name of ["Botak", "Mereka"]) {
+      const scope = { companyId: randomUUID(), agentId: randomUUID(), projectId: randomUUID() };
+      await db.insert(companies).values({ id: scope.companyId, name: `${name} isolated realm fixture`, issuePrefix: name === "Botak" ? "BOT" : "MER" });
+      await db.insert(agents).values({ id: scope.agentId, companyId: scope.companyId, name: "Paused fixture", adapterType: "paperclip_runner", status: "paused" });
+      await db.insert(projects).values({ id: scope.projectId, companyId: scope.companyId, name: "No provider calls" });
+      const enrollment = factoryProviderEnrollmentSchema.parse({ schema: "factory.provider-enrollment.v3", provider: "codex", workerPlanSha256: "a".repeat(64),
+        realm: { schema: "factory.worker-realm.v1", companyId: scope.companyId, authorityId: `fixture-${name}` } });
+      const f = await fixture(scope, enrollment);
+      expect((await authorizeFactoryWorker({ db, ...f, beforeClaim: true })).providerMode).toEqual(enrollment);
+      expect(() => assertFactoryWorkerColdExecution(f.execution, undefined, f.target)).not.toThrow();
+      expect(() => assertFactoryWorkerColdExecution(f.execution, undefined)).toThrow();
+      await expect(createAuthorizedFactoryWorkerLease({ db, ...f, sessionId: f.execution.session.normalizedSessionId! })).rejects.toThrow();
+      attempts.push(f);
+    }
+    const [botak, mereka] = attempts;
+    if (!botak || !mereka) throw new Error("two actual tenant fixtures required");
+    await expect(authorizeFactoryWorker({ db, ...botak, target: { ...botak.target, leaseId: mereka.leaseId } })).rejects.toThrow();
+    await expect(authorizeFactoryWorker({ db, ...botak, target: mereka.target })).rejects.toThrow();
+    const [environment] = await db.select().from(environments).where(eq(environments.id, botak.environmentId));
+    const mode = botak.target.factoryProviderAdmission;
+    if (!mode || !("realm" in mode) || !environment) throw new Error("explicit realm required");
+    await db.update(environments).set({ config: { ...environment.config, factoryProviderAdmission: { ...mode,
+      realm: { ...mode.realm, authorityId: "foreign-authority" } } } }).where(eq(environments.id, botak.environmentId));
+    await expect(authorizeFactoryWorker({ db, ...botak })).rejects.toThrow();
+  });
 
   it("binds actual run/workspace/acquired lease, revalidates enrollment and uses the earlier deadline", async () => {
     const f = await fixture();

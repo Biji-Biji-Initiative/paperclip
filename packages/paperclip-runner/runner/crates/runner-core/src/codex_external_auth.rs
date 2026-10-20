@@ -10,6 +10,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::sensitive_memory::Sensitive;
+use crate::factory_worker_realm::FactoryWorkerRealm;
 use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
     Engine,
@@ -128,8 +129,11 @@ pub fn unix_ms() -> Result<u64> {
 }
 impl ExternalAuthReference {
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_realm(None)
+    }
+    fn validate_for_realm(&self, expected: Option<&FactoryWorkerRealm>) -> Result<()> {
         if self.schema != "paperclip.codex-external-auth.v1"
-            || self.company_id != FACTORY_COMPANY_ID
+            || !FactoryWorkerRealm::matches_expected(expected, &self.company_id, &self.authority_id)
             || !identifier(&self.authority_id, 128)
             || !identifier(&self.capability_id, 128)
             || !identifier(&self.profile_ref, 254)
@@ -145,7 +149,10 @@ impl ExternalAuthReference {
         Ok(())
     }
     pub fn assert_run(&self, expected: &ExternalAuthRunBinding<'_>) -> Result<()> {
-        self.validate()?;
+        self.assert_run_for_realm(expected, None)
+    }
+    fn assert_run_for_realm(&self, expected: &ExternalAuthRunBinding<'_>, realm: Option<&FactoryWorkerRealm>) -> Result<()> {
+        self.validate_for_realm(realm)?;
         if self.run_id != expected.run_id
             || self.environment_lease_id != expected.environment_lease_id
             || self.normalized_session_id != expected.normalized_session_id
@@ -183,13 +190,17 @@ pub struct ExternalAuthGuard {
     hold: Option<HoldReason>,
 }
 impl ExternalAuthGuard {
+    #[cfg(test)]
     fn from_bytes(bytes: &[u8], now: u64) -> Result<Self> {
+        Self::from_bytes_for_realm(bytes, now, None)
+    }
+    fn from_bytes_for_realm(bytes: &[u8], now: u64, expected: Option<&FactoryWorkerRealm>) -> Result<Self> {
         if bytes.len() > MAX_CAPABILITY_BYTES {
             return Err(hold(HoldReason::OversizeCapability));
         }
         let envelope: CapabilityEnvelope =
             serde_json::from_slice(bytes).map_err(|_| hold(HoldReason::MalformedCapability))?;
-        envelope.reference.validate()?;
+        envelope.reference.validate_for_realm(expected)?;
         let until = envelope.reference.admitted_until_unix_ms;
         if until <= now
             || until.saturating_sub(now) > MAX_ADMISSION_MS
@@ -451,6 +462,7 @@ struct ExternalLoginParams<'a> {
 struct InstalledIngress {
     reference: ExternalAuthReference,
     guard: Option<ExternalAuthGuard>,
+    expected_realm: Option<FactoryWorkerRealm>,
 }
 static INGRESS: OnceLock<Mutex<InstalledIngress>> = OnceLock::new();
 
@@ -459,8 +471,14 @@ static INGRESS: OnceLock<Mutex<InstalledIngress>> = OnceLock::new();
 /// is CLOEXEC/nonblocking and dropped before this returns, on success or error.
 #[cfg(target_os = "linux")]
 pub fn install_trusted_pipe(
-    mut pipe: File,
+    pipe: File,
     binding: &ExternalAuthRunBinding<'_>,
+) -> Result<ExternalAuthReference> {
+    install_trusted_pipe_for_realm(pipe, binding, None)
+}
+#[cfg(target_os = "linux")]
+pub fn install_trusted_pipe_for_realm(
+    mut pipe: File, binding: &ExternalAuthRunBinding<'_>, expected_realm: Option<FactoryWorkerRealm>,
 ) -> Result<ExternalAuthReference> {
     use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
     use rustix::io::{fcntl_setfd, FdFlags};
@@ -524,13 +542,14 @@ pub fn install_trusted_pipe(
         }
     }
     drop(pipe);
-    let guard = ExternalAuthGuard::from_bytes(&bytes, unix_ms()?)?;
-    guard.reference.assert_run(binding)?;
+    let guard = ExternalAuthGuard::from_bytes_for_realm(&bytes, unix_ms()?, expected_realm.as_ref())?;
+    guard.reference.assert_run_for_realm(binding, expected_realm.as_ref())?;
     let reference = guard.reference.clone();
     INGRESS
         .set(Mutex::new(InstalledIngress {
             reference: reference.clone(),
             guard: Some(guard),
+            expected_realm,
         }))
         .map_err(|_| hold(HoldReason::SourceAlreadyConsumed))?;
     Ok(reference)
@@ -539,6 +558,12 @@ pub fn install_trusted_pipe(
 pub fn install_trusted_pipe(
     _pipe: File,
     _binding: &ExternalAuthRunBinding<'_>,
+) -> Result<ExternalAuthReference> {
+    Err(hold(HoldReason::UnsafeSource))
+}
+#[cfg(not(target_os = "linux"))]
+pub fn install_trusted_pipe_for_realm(
+    _pipe: File, _binding: &ExternalAuthRunBinding<'_>, _expected_realm: Option<FactoryWorkerRealm>,
 ) -> Result<ExternalAuthReference> {
     Err(hold(HoldReason::UnsafeSource))
 }
@@ -554,7 +579,7 @@ pub fn assert_selected_run(
             return Err(hold(HoldReason::IncompatibleProvider));
         }
         let slot = slot.lock().map_err(|_| hold(HoldReason::UnsafeSource))?;
-        slot.reference.assert_run(binding)?;
+        slot.reference.assert_run_for_realm(binding, slot.expected_realm.as_ref())?;
     }
     Ok(())
 }
@@ -573,7 +598,7 @@ pub(crate) fn consume_for_provider(
     };
     let mut installed = slot.lock().map_err(|_| hold(HoldReason::UnsafeSource))?;
     if let Some(reference) = reference {
-        reference.validate()?;
+        reference.validate_for_realm(installed.expected_realm.as_ref())?;
         if &installed.reference != reference {
             return Err(hold(HoldReason::BindingMismatch));
         }

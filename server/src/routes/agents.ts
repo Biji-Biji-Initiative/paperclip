@@ -1,5 +1,6 @@
 import { aiConnectionRouterService, poolMemberRuntimeConfig } from "../services/ai-connection-router.js";
 import { assertAiBillingRuntime, subscriptionsOnly } from "../services/ai-billing-policy.js";
+import { isFactoryWorkerPolicy } from "@paperclipai/shared/factory-worker-realm";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { completeConnectionIntentSchema } from "@paperclipai/shared";
 import { agentFileStore, agentFileTokenFromHash } from "../services/agent-file-store.js";
@@ -3506,7 +3507,7 @@ export function agentRoutes(
         const billingEnvironment = await environmentsSvc.getById(testEnvironmentId);
         assertAiBillingRuntime({ managedConnectionSelected: true,
           protectedWorkerSelected: billingEnvironment?.driver === "ssh" &&
-            billingEnvironment.config?.factoryWorkerPolicy === "factory-worker-scope-v2" });
+            isFactoryWorkerPolicy(billingEnvironment.config?.factoryWorkerPolicy) });
       }
       if (testEnvironmentId) await assertAdapterTestEnvironmentForCompany(companyId, testEnvironmentId);
       const target = await resolveAdapterTestExecutionContext({ companyId, adapterType, environmentId: testEnvironmentId });
@@ -3572,7 +3573,7 @@ export function agentRoutes(
         const billingEnvironment = await environmentsSvc.getById(requestedEnvironmentId);
         assertAiBillingRuntime({ managedConnectionSelected: Boolean(aiBinding),
           protectedWorkerSelected: billingEnvironment?.driver === "ssh" &&
-            billingEnvironment.config?.factoryWorkerPolicy === "factory-worker-scope-v2" });
+            isFactoryWorkerPolicy(billingEnvironment.config?.factoryWorkerPolicy) });
       }
       // Fail closed on a foreign environment before any secret resolution, env
       // merge, target resolution, sandbox lease, or adapter test runs.

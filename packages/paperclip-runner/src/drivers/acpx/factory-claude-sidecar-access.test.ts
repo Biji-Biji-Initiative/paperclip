@@ -56,6 +56,25 @@ let closed=0;for(const fd of [3,4]){try{fstatSync(fd)}catch{closed++}}process.st
       child.once("error", reject); child.once("close", code => { clearTimeout(deadline); resolveResult({ code, stdout, stderr }); });
     });
   }
+  it("consumes matching v3 realm frames through both real inherited FDs", async () => {
+    const f = fixture();
+    const realm = { schema: "factory.worker-realm.v1", companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "factory-botak" };
+    const metadata = { ...f.metadata, schema: "paperclip.factory-claude-sidecar.v3", realm };
+    const access = { ...f.access, schema: "paperclip.factory-claude-access.v3", realm };
+    const open = { ...f.open, factoryBinding: { ...f.binding, realm } };
+    expect(await run({ metadata, access, commands: { open, runId: f.binding.runId } }))
+      .toEqual({ code: 0, stdout: '{"guarded":true,"closed":2}\n', stderr: "" });
+    for (const mutation of [
+      { metadata, access: { ...access, realm: { ...realm, authorityId: "factory-mereka" } }, commands: { open } },
+      { metadata, access, commands: { open: { ...open, factoryBinding: { ...open.factoryBinding, realm: { ...realm, companyId: "a2b00000-0000-4000-8000-000000000002" } } } } },
+      { metadata, access: f.access, commands: { open } },
+      { metadata: f.metadata, access, commands: { open } },
+      { metadata: { ...metadata, realm: { ...realm, authorityId: "*" } }, access, commands: { open } },
+    ]) {
+      const rejected = await run(mutation);
+      expect(rejected).toEqual({ code: 1, stdout: "", stderr: "factory_claude_access_unverified\n" });
+    }
+  });
 
   it("consumes two actual inherited pipes before matching session and run; closes both", async () => {
     const f = fixture();

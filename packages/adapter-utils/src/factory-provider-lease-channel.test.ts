@@ -1,27 +1,30 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { FACTORY_COMPANY_ID, FactoryWorkerBusyError, createFactoryWorkerLeaseDescriptor } from "./factory-worker-lease.js";
-import { FACTORY_ADMISSION_SIGNED_SCHEMA, FACTORY_PROVIDER_MARKER, encodeFactoryControllerAdmission,
+import { FACTORY_ADMISSION_SIGNED_SCHEMA, FACTORY_PROVIDER_MARKER, factoryAdmissionSignedSchema, factoryProviderMarker, encodeFactoryControllerAdmission,
   encodeFactoryProviderLaunch, type FactoryControllerAdmission, type FactoryProviderBinding } from "./factory-provider-admission.js";
 import { admitFactoryProviderLease } from "./factory-provider-lease-channel.js";
 import type { SshChannelExit, SshProcessChannel } from "./ssh-process-channel.js";
+import { factoryWorkerRealmSchema, type FactoryWorkerRealm } from "@paperclipai/shared/factory-worker-realm";
 
-function fixture() {
+function fixture(realm?: FactoryWorkerRealm) {
   const workspaceId = randomUUID();
-  const descriptor = createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID, runId: randomUUID(), leaseId: randomUUID(),
-    workspaceId, workspaceRoot: `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`, sessionId: "worker-session", deadlineUnixMs: Date.now() + 60000 });
-  const binding: FactoryProviderBinding = { schema: "factory.provider-worker-binding.v2", provider: "codex", admissionId: randomUUID(),
+  const companyId = realm?.companyId ?? FACTORY_COMPANY_ID;
+  const descriptor = createFactoryWorkerLeaseDescriptor({ companyId, runId: randomUUID(), leaseId: randomUUID(),
+    ...(realm ? { realm } : {}),
+    workspaceId, workspaceRoot: `/workspace/${companyId}/${workspaceId}`, sessionId: "worker-session", deadlineUnixMs: Date.now() + 60000 });
+  const binding: FactoryProviderBinding = { ...(realm ? { schema: "factory.provider-worker-binding.v3", realm } : { schema: "factory.provider-worker-binding.v2" }), provider: "codex", admissionId: randomUUID(),
     capabilityId: randomUUID(), normalizedSessionId: "native-session", runnerInstanceId: "runner-fixture", workerPlanSha256: "a".repeat(64),
     authorization: { schema: "factory.direct-board-wakeup.v1", actorType: "user", actorId: "synthetic-user", actorEmail: "synthetic@example.invalid",
       wakeupRequestId: randomUUID(), agentId: randomUUID(), requestedAtUnixMs: Date.now() - 1000 } };
-  const prepared = { protocol: FACTORY_PROVIDER_MARKER, provider: binding.provider, type: "preparation", status: "prepared", companyId: descriptor.companyId,
+  const prepared = { protocol: factoryProviderMarker(binding), ...(realm ? { realm } : {}), provider: binding.provider, type: "preparation", status: "prepared", companyId: descriptor.companyId,
     runId: descriptor.runId, leaseId: descriptor.leaseId, sessionId: descriptor.sessionId, ownerNonce: "b".repeat(32), bootId: randomUUID(),
     createdUnixMs: Date.now(), deadlineUnixMs: descriptor.deadlineUnixMs, workerPlanSha256: binding.workerPlanSha256, dispatchAttempted: false };
   const command = [`${descriptor.workspaceRoot}/.paperclip-runtime/paperclip-runner/bin/paperclip-runnerd`, "--run-id", descriptor.runId,
     "--environment-lease-id", descriptor.leaseId, "--session-id", binding.normalizedSessionId, "--runner-id", binding.runnerInstanceId];
   const header = encodeFactoryProviderLaunch(descriptor, binding, command);
-  const identity = { companyId: descriptor.companyId, runId: descriptor.runId, leaseId: descriptor.leaseId, sessionId: descriptor.sessionId };
-  const accepted = { protocol: FACTORY_PROVIDER_MARKER, type: "admission", status: "accepted", ...identity, dispatchAttempted: true };
+  const identity = { companyId: descriptor.companyId, runId: descriptor.runId, leaseId: descriptor.leaseId, sessionId: descriptor.sessionId, ...(realm ? { realm } : {}) };
+  const accepted = { protocol: factoryProviderMarker(binding), type: "admission", status: "accepted", ...identity, dispatchAttempted: true };
   return { descriptor, binding, prepared, accepted, identity, header };
 }
 function rawChannel() {
@@ -36,11 +39,32 @@ function rawChannel() {
     bytes(value: string) { data?.(Buffer.from(value)); }, finish(value: SshChannelExit) { exit?.(value); } };
 }
 function signed(record: FactoryControllerAdmission) {
-  return { schema: FACTORY_ADMISSION_SIGNED_SCHEMA, payload: encodeFactoryControllerAdmission(record).toString("base64"),
+  return { schema: factoryAdmissionSignedSchema(record), payload: encodeFactoryControllerAdmission(record).toString("base64"),
     signature: "-----BEGIN SSH SIGNATURE-----\nsynthetic-only\n-----END SSH SIGNATURE-----\n" };
 }
 
 describe("explicit preparing → signed admission → dispatch handshake", () => {
+  const realm = factoryWorkerRealmSchema.parse({ schema: "factory.worker-realm.v1",
+    companyId: "a2b00000-0000-4000-8000-000000000001", authorityId: "factory-botak" });
+  it("preserves the v3 realm through preparation, signing and accepted dispatch", async () => {
+    const f = fixture(realm), raw = rawChannel();
+    raw.writeHook(count => queueMicrotask(() => raw.send(count === 1 ? f.prepared : f.accepted)));
+    const sign = vi.fn(async (record: FactoryControllerAdmission) => signed(record));
+    await admitFactoryProviderLease(raw.raw, f.descriptor, f.binding, f.header, sign);
+    expect(sign).toHaveBeenCalledOnce();
+    expect(sign.mock.calls[0]![0]).toMatchObject({ schema: "factory.provider-controller-admission.v3", realm });
+    expect(JSON.parse(raw.writes[1]!.toString()).schema).toBe("factory.provider-controller-signed.v3");
+  });
+  it("retires a v3 channel for wrong authority or a downgraded accepted receipt", async () => {
+    for (const changes of [{ realm: { ...realm, authorityId: "factory-mereka" } },
+      { realm: undefined }, { protocol: "factory-worker-provider-lease-v2" }]) {
+      const f = fixture(realm), raw = rawChannel();
+      raw.writeHook(count => queueMicrotask(() => raw.send(count === 1 ? f.prepared : { ...f.accepted, ...changes })));
+      await expect(admitFactoryProviderLease(raw.raw, f.descriptor, f.binding, f.header, async record => signed(record)))
+        .rejects.toThrow("transport_unverified");
+      expect(raw.stop).toHaveBeenCalled(); expect(raw.close).toHaveBeenCalled();
+    }
+  });
   it("revalidates controller-owned authority after prepared and before signing", async () => {
     const f = fixture(), raw = rawChannel(), order: string[] = [];
     raw.writeHook(count => queueMicrotask(() => raw.send(count === 1 ? f.prepared : f.accepted)));
