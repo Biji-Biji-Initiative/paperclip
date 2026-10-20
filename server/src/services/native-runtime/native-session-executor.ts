@@ -11176,6 +11176,7 @@ async function createRunnerdBackendWithinSessionClaim(
       : sourceRuntimeContext;
   let remotePrepared = false;
   let remoteHarnessStatePrepared = false;
+  let factoryLaunchAssetsStaged = false;
   let selectedRemoteMode: "dial_wss" | "listen_ws" | null = null;
   let remoteCaBundleMapping: { sourcePath: string; targetPath: string } | null =
     null;
@@ -12015,6 +12016,18 @@ async function createRunnerdBackendWithinSessionClaim(
 
   const materializeRemoteHarnessLaunchState = async () => {
     if (!remoteTarget || !remoteCommandRunner) return;
+    if (isFactoryWorkerTarget(remoteTarget)) {
+      if (!remoteStateDirectory || !remoteRunnerFilesystemRoot || !remoteSessionRoot) {
+        throw new Error("runner_harness_state_mismatch: bootstrap_target_unavailable");
+      }
+      // The worker pins all three roots before it claims an execution slot.
+      // A cold runner has no local durable history to restore these from.
+      for (const targetPath of [remoteStateDirectory, remoteRunnerFilesystemRoot,
+        posix.join(remoteSessionRoot, "diagnostics")]) {
+        await ensureFactoryRemoteRunnerDirectory({ runner: remoteCommandRunner,
+          workspaceRoot: remoteTarget.remoteCwd, targetPath, mode: 0o700 });
+      }
+    }
     for (const directory of persistenceProfile.directories) {
       if (directory.location !== "filesystem") continue;
       const targetPath = remotePersistencePath(directory);
@@ -12592,7 +12605,15 @@ async function createRunnerdBackendWithinSessionClaim(
             remoteBinary,
             remoteCwd: remoteTarget.remoteCwd,
             diagnosticsDirectory: posix.join(remoteSessionRoot!, "diagnostics"),
-            ensureArtifact: ensureRemoteRunner,
+            ensureArtifact: async () => {
+              if (!factoryLaunchAssetsStaged) return ensureRemoteRunner();
+              // Direct Factory registration already staged this launch before
+              // ticket issuance. Revalidate its DB owner without a second upload.
+              await assertFactoryWorkspaceStagingOwned({ db: input.db,
+                companyId: input.execution.binding.companyId,
+                runId: input.execution.binding.runId, leaseId: remoteTarget.leaseId! });
+              factoryLaunchAssetsStaged = false;
+            },
           ...(isFactoryWorkerTarget(remoteTarget) ? {
             createWorkerAdmission: () => createAuthorizedFactoryWorkerAdmission({ db: input.db,
               execution: input.execution, target: remoteTarget, sessionId: nativeSessionKey(input.execution),
@@ -13115,6 +13136,24 @@ async function createRunnerdBackendWithinSessionClaim(
               );
 
               if (transport.mode === "direct_outbound") {
+                let caBundlePath = transport.caBundlePath;
+                if (caBundlePath && remoteBinary) {
+                  const remoteCaBundlePath = posix.join(
+                    posix.dirname(remoteBinary),
+                    "runner-ca-bundle.pem",
+                  );
+                  remoteCaBundleMapping = {
+                    sourcePath: caBundlePath,
+                    targetPath: remoteCaBundlePath,
+                  };
+                  caBundlePath = remoteCaBundlePath;
+                }
+                if (isFactoryWorkerTarget(target)) {
+                  // Full staging can exceed the PRP command startup budget.
+                  // Finish it before returning to ticket issuance and spawn.
+                  await ensureRemoteRunner();
+                  factoryLaunchAssetsStaged = true;
+                }
                 const inbound = await measureNativeRunnerSpan(
                   input.trace,
                   "runner.prp.route.register",
@@ -13130,18 +13169,6 @@ async function createRunnerdBackendWithinSessionClaim(
                     }),
                   { parentName: "runner.transport.connect" },
                 );
-                let caBundlePath = transport.caBundlePath;
-                if (caBundlePath && remoteBinary) {
-                  const remoteCaBundlePath = posix.join(
-                    posix.dirname(remoteBinary),
-                    "runner-ca-bundle.pem",
-                  );
-                  remoteCaBundleMapping = {
-                    sourcePath: caBundlePath,
-                    targetPath: remoteCaBundlePath,
-                  };
-                  caBundlePath = remoteCaBundlePath;
-                }
                 return {
                   connection: {
                     mode: "connect" as const,
@@ -13149,6 +13176,7 @@ async function createRunnerdBackendWithinSessionClaim(
                     ...(caBundlePath ? { caBundlePath } : {}),
                   },
                   startupFailureCode: "runner_direct_wss_failed" as const,
+                  ready: () => remoteRunnerProcessSpawned,
                   checkpoint: checkpointRemoteRunner,
                   release: () => inbound.release(),
                 };

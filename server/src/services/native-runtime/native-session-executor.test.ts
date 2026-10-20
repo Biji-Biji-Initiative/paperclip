@@ -1,5 +1,8 @@
 import * as factoryStaging from "../factory-workspace-staging.js";
 import * as factoryWorkerRuntime from "./factory-worker-runtime.js";
+import * as factoryRemoteStaging from "./factory-remote-staging.js";
+import * as nativeSshRunner from "./native-ssh-command-runner.js";
+import * as runnerPrpWs from "../../realtime/runner-prp-ws.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import {
@@ -42,7 +45,7 @@ import {
   type PrpEvent,
 } from "@paperclipai/paperclip-runner";
 import { createHash, randomUUID } from "node:crypto";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, createFactoryWorkerLeaseDescriptor } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { DatabaseSync } from "node:sqlite";
@@ -8312,6 +8315,115 @@ describe("runnerd provider runtime wiring", () => {
     }
     await rm(isolatedStateDirectory, { recursive: true, force: true });
   });
+
+  it.each(["ready", "directory_refusal"] as const)(
+    "stages the cold Factory scope before ticket issuance and startup readiness (%s)", async (mode) => {
+      const current = { ...execution, binding: { ...execution.binding, companyId: FACTORY_COMPANY_ID,
+        runId: randomUUID(), issueId: randomUUID(), agentId: randomUUID(), executionWorkspaceId: randomUUID() },
+        session: { ...execution.session, normalizedSessionId: randomUUID() } };
+      const runnerInstanceId = randomUUID(), leaseId = randomUUID();
+      const remoteCwd = `/workspace/${FACTORY_COMPANY_ID}/${current.binding.executionWorkspaceId}`;
+      const controllerArtifact = join(isolatedStateDirectory, "runner-build");
+      await writeFile(controllerArtifact, "fixture immutable runner");
+      const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+        environmentId: randomUUID(), leaseId, remoteCwd,
+        spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd, remoteWorkspacePath: remoteCwd,
+          privateKey: "fixture-only-not-a-key", knownHosts: "fixture-public-pin", strictHostKeyChecking: true } }; // ubs:ignore — synthetic fields; SSH execution is mocked and no connection is opened
+      const result = { exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false, stdout: "", stderr: "" };
+      let exit: ((value: { exitCode: number }) => void) | undefined;
+      const openDuplexChannel = vi.fn(async () => ({ write: () => undefined, onData: () => undefined,
+        onStderr: () => undefined, onExit: (listener: typeof exit) => { exit = listener; },
+        stop: () => exit?.({ exitCode: 143 }), close: async () => undefined }));
+      const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async command => {
+        if (command.args?.[0] === "--build-metadata") return { ...result, stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["dial_wss"] }) };
+        if (command.args?.[0] === "--version") return { ...result, stdout: "codex-cli 0.163.0" };
+        if (command.args?.[1]?.includes('sha256sum "$1"')) return { ...result,
+          stdout: createHash("sha256").update("fixture immutable runner").digest("hex") + "  runner\n" };
+        if (command.command === "sh" && command.args?.[1]?.includes("/opt/paperclip-runner/bin/codex")) {
+          return { ...result, stdout: "/opt/paperclip-runner/bin/codex\n" };
+        }
+        return result;
+      });
+      let finishStage!: () => void;
+      const stagingPending = new Promise<void>(resolveStage => { finishStage = resolveStage; });
+      const directories: string[] = [];
+      const directory = vi.spyOn(factoryRemoteStaging, "ensureFactoryRemoteRunnerDirectory").mockImplementation(async input => {
+        directories.push(input.targetPath);
+        if (directories.length === 1) await stagingPending;
+        if (mode === "directory_refusal") throw new Error("factory_remote_staging_unverified");
+      });
+      const staging = vi.spyOn(factoryStaging, "assertFactoryWorkspaceStagingOwned").mockResolvedValue(undefined);
+      const authorization = vi.spyOn(factoryWorkerRuntime, "authorizeFactoryWorker").mockImplementation(vi.fn());
+      const runner = vi.spyOn(nativeSshRunner, "createNativeSshCommandRunner").mockReturnValue({ execute, openDuplexChannel });
+      const register = vi.spyOn(runnerPrpWs, "registerRunnerPrpAuthority").mockResolvedValue({
+        connectUrl: "ws://127.0.0.1/unused", release: async () => undefined });
+      const admission = vi.spyOn(factoryWorkerRuntime, "createAuthorizedFactoryWorkerAdmission").mockImplementation(async () => ({
+        workerLease: createFactoryWorkerLeaseDescriptor({ companyId: FACTORY_COMPANY_ID,
+          workspaceId: current.binding.executionWorkspaceId, workspaceRoot: remoteCwd,
+          runId: current.binding.runId, leaseId, sessionId: current.session.normalizedSessionId!,
+          deadlineUnixMs: Date.now() + 60_000 }) }));
+      try {
+        await createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId,
+          runnerExecutionTarget: target, runnerPublicUrl: "wss://factory.example.invalid",
+          runnerRemoteBinaryPath: controllerArtifact,
+          runnerRemoteProviderPackPath: "/fixture/unused-claude-provider-pack" });
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+          controlPlaneRegistration: (authority: unknown) => Promise<{ ready: () => Promise<void> }>;
+          runnerProcessLauncher: (spec: { command: string; args: string[]; cwd: string; environment: Record<string, string> }) => {
+            child: { kill: () => boolean }; completion: Promise<unknown>;
+          };
+        };
+        expect(options.factoryProviderAuth).toBe("codex");
+        expect(options.providerPackAuthorityDigest).toBeUndefined();
+        vi.useFakeTimers();
+        let registered = false;
+        const registrationPending = options.controlPlaneRegistration({}).then(value => { registered = true; return value; });
+        const checked = registrationPending.catch(error => error);
+        await vi.waitFor(() => expect(directories).toHaveLength(1));
+        // The observed production stage took 39,130ms, longer than run.prepare's
+        // unchanged 30s budget. Registration must still gate ticket/spawn here.
+        await vi.advanceTimersByTimeAsync(39_130);
+        expect(registered).toBe(false);
+        expect(register).not.toHaveBeenCalled();
+        expect(admission).not.toHaveBeenCalled();
+        expect(openDuplexChannel).not.toHaveBeenCalled();
+        finishStage();
+        if (mode === "directory_refusal") {
+          expect(await checked).toMatchObject({ message: "factory_remote_staging_unverified" });
+          expect(register).not.toHaveBeenCalled();
+          expect(admission).not.toHaveBeenCalled();
+          return;
+        }
+        const registration = await registrationPending;
+        const sessionRoot = `${remoteCwd}/.paperclip-runtime/paperclip-runner/sessions/${createHash("sha256")
+          .update(current.session.normalizedSessionId!).digest("hex")}`;
+        expect(directories.slice(0, 3)).toEqual([sessionRoot + "/runner", sessionRoot + "/filesystem", sessionRoot + "/diagnostics"]);
+        const stagedDirectoryCount = directories.length;
+        let ready = false;
+        const readiness = registration.ready().then(() => { ready = true; });
+        await vi.advanceTimersByTimeAsync(30_001);
+        expect(ready).toBe(false);
+        const handle = options.runnerProcessLauncher({ command: controllerArtifact, args: ["--state-dir", sessionRoot + "/runner"],
+          cwd: remoteCwd, environment: {} });
+        await readiness;
+        expect(ready).toBe(true);
+        expect(directories).toHaveLength(stagedDirectoryCount);
+        expect(staging.mock.calls.length).toBeGreaterThanOrEqual(2);
+        expect(admission).toHaveBeenCalledOnce();
+        expect(openDuplexChannel).toHaveBeenCalledOnce();
+        exit?.({ exitCode: 0 });
+        await handle.completion;
+      } finally {
+        finishStage();
+        vi.useRealTimers();
+        directory.mockRestore(); staging.mockRestore(); authorization.mockRestore(); runner.mockRestore(); register.mockRestore(); admission.mockRestore();
+      }
+    },
+  );
 
   it.each(["old_run", "old_lease", "incoming_lease", "same_identity"] as const)(
     "fences Factory durable authority before staging: %s", async mode => {

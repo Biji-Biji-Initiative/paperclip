@@ -133,6 +133,48 @@ async function expectTurnStarted(
   );
 }
 
+it("finalizes Factory launch config and context before registration, ticket issuance or spawn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "runnerd-factory-launch-material-"));
+  const skillRoot = join(root, "assigned-skill"), instructionRoot = join(root, "assigned-instructions");
+  await Promise.all([mkdir(skillRoot), mkdir(instructionRoot)]);
+  await writeFile(join(skillRoot, "SKILL.md"), "# Assigned skill\n");
+  await writeFile(join(instructionRoot, "AGENTS.md"), "Use the assigned workspace.\n");
+  const context = assignedRuntimeContext(skillRoot, instructionRoot);
+  const finalized = new Error("fixture_stop_before_ticket_or_spawn");
+  const launch = vi.fn(() => { throw new Error("unexpected_runner_spawn"); });
+  const issueTicket = vi.spyOn(DurablePrpControlPlane.prototype, "issueBootstrapTicket");
+  const register = vi.fn(async () => {
+    expect(JSON.parse(await readFile(join(root, "runtime-context.json"), "utf8"))).toEqual(context);
+    const config = await readFile(join(root, "codex-home", "config.toml"), "utf8");
+    expect(config).toContain("shell_snapshot = false");
+    expect((await lstat(join(root, "codex-home", "config.toml"))).mode & 0o777).toBe(0o600);
+    expect(await readFile(join(root, "codex-home", "skills", "assigned", "SKILL.md"), "utf8"))
+      .toBe("# Assigned skill\n");
+    await expect(lstat(join(root, "codex-home", "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(issueTicket).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+    throw finalized;
+  });
+  const bundle = createCapabilityRunnerdCodexTransport({
+    // Registration deliberately stops before launch; bind stable local bytes
+    // without requiring or executing a compiled runner in this test.
+    runnerBinary: resolve(import.meta.dirname, "../../package.json"), stateDirectory: root,
+    factoryProviderAuth: "codex", sourceCodexHome: "", environment: {},
+    runtimeContext: context, controlPlaneRegistration: register, runnerProcessLauncher: launch,
+  });
+  try {
+    await expect(bundle.transport.request("thread/start", { cwd: root, dynamicTools: [] })).rejects.toBe(finalized);
+    expect(register).toHaveBeenCalledOnce();
+    expect(issueTicket).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  } finally {
+    await bundle.transport.close().catch(() => undefined);
+    issueTicket.mockRestore();
+    await releaseMaterializedNativeRuntimeSkills(join(root, "codex-home", "skills"));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it.each(["codex_external_auth_operator_required", "factory_claude_access_unverified", "command_execution_failed"] as const)(
   "propagates structured durable %s without reflecting command payloads", async (code) => {
     const root = await mkdtemp(join(tmpdir(), "runnerd-durable-auth-hold-"));
