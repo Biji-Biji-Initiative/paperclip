@@ -138,7 +138,7 @@ export interface AdapterLocalExecutionTarget extends AdapterExecutionTargetWorks
 export interface AdapterSshExecutionTarget extends AdapterExecutionTargetWorkspaceMetadata {
   /** Copied only from the persisted, validated SSH environment config. */
   readonly factoryWorkerPolicy?: "factory-worker-scope-v2";
-  readonly factoryProviderAdmission?: { readonly provider: "codex"; readonly workerPlanSha256: string };
+  readonly factoryProviderAdmission?: { readonly provider: "codex" | "claude"; readonly workerPlanSha256: string };
   kind: "remote";
   transport: "ssh";
   environmentId?: string | null;

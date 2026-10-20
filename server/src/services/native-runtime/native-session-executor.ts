@@ -10975,10 +10975,11 @@ async function createRunnerdBackendWithinSessionClaim(
   if (nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
   })) throw new Error("native_review_assignment_no_longer_available");
-  // Remote Codex already sends dynamic tool calls over authenticated PRP. Keep
+  // Remote Codex and protected Factory Claude send dynamic tools over PRP. Keep
   // the assigned gateway on the control plane instead of asking the sandbox to
   // reach the host's HTTP origin (which may be private or loopback-only).
-  const relayAssignedMcp = remoteTarget !== null && input.execution.provider.kind === "codex";
+  const relayAssignedMcp = remoteTarget !== null && (input.execution.provider.kind === "codex" ||
+    (isFactoryWorkerTarget(target) && input.execution.provider.kind === "acpx" && input.execution.provider.agent === "claude"));
   const assignedMcpUrl = input.runnerEnvironment?.PAPERCLIP_NATIVE_MCP_URL;
   const assignedMcpToken = input.runnerEnvironment?.PAPERCLIP_NATIVE_MCP_TOKEN;
   const assignedMcpName = input.runnerEnvironment?.PAPERCLIP_NATIVE_MCP_NAME;

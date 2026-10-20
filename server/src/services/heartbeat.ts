@@ -1,5 +1,6 @@
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
 import { assertAiBillingRuntime, assertProtectedSubscriptionConfig, prepareAiBillingRuntime } from "./ai-billing-policy.js";
+import { isFactoryProviderEnrollment } from "./native-runtime/factory-worker-provider-selection.js";
 import { prepareConnectionInstructionDelivery } from "./connection-instructions.js";
 import { resolveAssignedConnectionInstructionsForRun } from "./native-runtime/assigned-mcp-tools.js";
 import { externalObjectService } from "./external-objects.js";
@@ -21568,9 +21569,7 @@ export function heartbeatService(
         selectedEnvironmentForConfig?.driver === "ssh" &&
         selectedEnvironmentForConfig.config?.factoryWorkerPolicy === FACTORY_WORKER_POLICY;
       const protectedSubscription = agent.adapterType === "paperclip_runner" && protectedWorkerSelected &&
-        parseObject(selectedEnvironmentForConfig?.config?.factoryProviderAdmission).provider === "codex" &&
-        typeof parseObject(selectedEnvironmentForConfig?.config?.factoryProviderAdmission).workerPlanSha256 === "string" &&
-        /^[a-f0-9]{64}$/.test(String(parseObject(selectedEnvironmentForConfig?.config?.factoryProviderAdmission).workerPlanSha256));
+        isFactoryProviderEnrollment(selectedEnvironmentForConfig?.config?.factoryProviderAdmission);
       assertAiBillingRuntime({ managedConnectionSelected: Boolean(aiBinding), protectedSubscription, protectedWorkerSelected });
       if (protectedSubscription) assertProtectedSubscriptionConfig(config.env, selectedEnvironmentForConfig?.envVars,
         projectContext?.env, routineEnvContext.env);

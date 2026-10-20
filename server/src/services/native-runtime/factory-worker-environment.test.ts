@@ -64,7 +64,7 @@ describe("Factory worker bootstrap environment", () => {
       .toThrow("native_execution_ownership_unverified");
   });
 
-  it("passes the actual Git preparation and runner spawn through protected admission", async () => {
+  it.each(["codex", "claude"] as const)("passes actual Git preparation and %s runner spawn through protected admission", async provider => {
     const { lease, command } = fixture();
     const directory = mkdtempSync("/data/tmp/factory-envelope-test-"); roots.push(directory);
     const runnerInstanceId = randomUUID();
@@ -73,7 +73,9 @@ describe("Factory worker bootstrap environment", () => {
       spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd: lease.workspaceRoot,
         remoteWorkspacePath: lease.workspaceRoot, privateKey: null, knownHosts: null, strictHostKeyChecking: true } };
     const gitEnv = await prepareGitHubExecutionEnvironment({ target, cwd: lease.workspaceRoot,
-      env: { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/paperclip" },
+      env: { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/paperclip",
+        PAPERCLIP_NATIVE_MCP_NAME: "assigned-fixture", PAPERCLIP_NATIVE_MCP_URL: "https://controller.invalid/mcp/gateways/fixture",
+        PAPERCLIP_NATIVE_MCP_TOKEN: "synthetic-app-mcp-bearer-not-for-worker" },
       hostCredentials: false, networkAccess: true });
     const createBrokerToken = vi.fn(() => { throw new Error("broker_not_qualified"); });
     const prepared = await prepareHeartbeatGitHubLaunchers({ target, cwd: lease.workspaceRoot, runId: lease.runId,
@@ -87,7 +89,7 @@ describe("Factory worker bootstrap environment", () => {
     const processLauncher = owner.createLauncher({ runner: { openDuplexChannel }, remoteBinary: command[0],
       remoteCwd: lease.workspaceRoot, diagnosticsDirectory: lease.diagnosticsDirectory, ensureArtifact: async () => {},
       createWorkerAdmission: async () => ({ workerLease: lease, providerAdmission: {
-        schema: "factory.provider-worker-binding.v2", provider: "codex", admissionId: randomUUID(), capabilityId: randomUUID(),
+        schema: "factory.provider-worker-binding.v2", provider, admissionId: randomUUID(), capabilityId: randomUUID(),
         normalizedSessionId: lease.sessionId, runnerInstanceId, workerPlanSha256: "a".repeat(64),
         authorization: { schema: "factory.direct-board-wakeup.v1", actorType: "user", actorId: "synthetic-user",
           actorEmail: "synthetic@example.invalid", wakeupRequestId: randomUUID(), agentId: randomUUID(), requestedAtUnixMs: Date.now() - 1 } },
@@ -102,5 +104,7 @@ describe("Factory worker bootstrap environment", () => {
     expect(openDuplexChannel).toHaveBeenCalledOnce();
     expect(openDuplexChannel.mock.calls[0]?.[0]).toMatchObject({ environment: {
       PATH: "/usr/local/bin:/usr/bin:/bin", HTTPS_PROXY: "http://factory-gateway:3128" } });
+    expect(JSON.stringify(openDuplexChannel.mock.calls)).not.toContain("synthetic-app-mcp-bearer-not-for-worker");
+    expect(openDuplexChannel.mock.calls[0]?.[0]).toMatchObject({ providerAdmission: { provider } });
   });
 });

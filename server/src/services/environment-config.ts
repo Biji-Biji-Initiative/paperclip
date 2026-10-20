@@ -39,7 +39,7 @@ const secretRefSchema = z.object({
 
 const sshEnvironmentConfigBaseSchema = z.object({
   factoryWorkerPolicy: z.literal("factory-worker-scope-v2").optional(),
-  factoryProviderAdmission: z.object({ provider: z.literal("codex"),
+  factoryProviderAdmission: z.object({ provider: z.enum(["codex", "claude"]),
     workerPlanSha256: z.string().regex(/^[a-f0-9]{64}$/),
   }).strict().optional(),
   host: z.string({ error: "SSH environments require a host." }).trim().min(1, "SSH environments require a host."),

@@ -9,6 +9,7 @@ import { validateDedicatedSshTarget } from "@paperclipai/adapter-utils/ssh-duple
 import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import { randomUUID } from "node:crypto";
 import { validateFactoryOwnRunAuthorization, validateFactoryProviderBinding, type FactoryOwnRunAuthorization, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
+import { factoryExecutionProvider, isFactoryProviderEnrollment } from "./factory-worker-provider-selection.js";
 
 export interface FactoryWorkerAttempt {
   readonly runId: string;
@@ -35,14 +36,13 @@ export function assertFactoryWorkerCredentialBoundary(environment: NodeJS.Proces
 
 const FACTORY_RUN_ENV_KEYS = new Set([
   "DO_NOT_TRACK", "PAPERCLIP_RUNNER_TRACE", "PAPERCLIP_PROVIDER_TRACE_PATH", "PAPERCLIP_WORKSPACE_CWD",
-  "PAPERCLIP_NATIVE_MCP_NAME", "PAPERCLIP_NATIVE_MCP_URL", "PAPERCLIP_NATIVE_MCP_TOKEN",
 ]);
 const FACTORY_GITHUB_CREDENTIAL_KEYS = [
   "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN",
   "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
 ];
 
-/** Only run controls and the fixed worker contract cross the provider boundary. */
+/** Assigned MCP credentials stay with the controller's PRP tool authority. */
 export function buildFactoryWorkerEnvironment(environment: NodeJS.ProcessEnv | undefined): Record<string, string> {
   assertFactoryWorkerCredentialBoundary(environment, undefined);
   if (FACTORY_GITHUB_CREDENTIAL_KEYS.some(key => environment?.[key] !== undefined && environment[key] !== "")) {
@@ -98,13 +98,9 @@ export async function authorizeFactoryWorker(input: {
   }
   const registered = environment!.config?.factoryProviderAdmission;
   const selected = target.factoryProviderAdmission;
-  const validMode = (value: unknown): value is { provider: "codex"; workerPlanSha256: string } =>
-    value !== null && typeof value === "object" && Object.keys(value).length === 2 &&
-    (value as Record<string, unknown>).provider === "codex" &&
-    typeof (value as Record<string, unknown>).workerPlanSha256 === "string" &&
-    /^[a-f0-9]{64}$/.test((value as Record<string, string>).workerPlanSha256);
   if (registered !== undefined || selected !== undefined) {
-    if (!validMode(registered) || !validMode(selected) || input.execution.provider.kind !== "codex" ||
+    if (!isFactoryProviderEnrollment(registered) || !isFactoryProviderEnrollment(selected) ||
+        registered.provider !== selected.provider || selected.provider !== factoryExecutionProvider(input.execution) ||
         registered.workerPlanSha256 !== selected.workerPlanSha256) fail();
   }
   return { run, lease, providerMode: selected };
@@ -174,19 +170,19 @@ export async function createAuthorizedFactoryWorkerAdmission(input: {
   const fail = (): never => { throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified"); };
   const stored = run.runnerProfileJson?.nativeExecutionInput as NativeExecutionInput | undefined;
   const nativeSession = attempt.execution.session.normalizedSessionId ?? `session-${run.id}`;
-  if (attempt.execution.provider.kind !== "codex" || attempt.execution.session.lifecyclePolicy.mode !== "per_turn" ||
+  if (factoryExecutionProvider(attempt.execution) !== providerMode.provider || attempt.execution.session.lifecyclePolicy.mode !== "per_turn" ||
       attempt.sessionId !== nativeSession || run.runnerInstanceId !== attempt.runnerInstanceId ||
       !stored || stored.binding?.runId !== run.id || stored.binding?.companyId !== run.companyId ||
       stored.binding?.agentId !== attempt.execution.binding.agentId || stored.binding?.issueId !== attempt.execution.binding.issueId ||
       stored.binding?.executionWorkspaceId !== attempt.execution.binding.executionWorkspaceId ||
-      stored.provider?.kind !== "codex" ||
+      !stored.provider || !stored.session || factoryExecutionProvider(stored) !== providerMode.provider ||
       stored.session?.lifecyclePolicy?.mode !== "per_turn" ||
       stored.session?.driverKind !== attempt.execution.session.driverKind || stored.session?.protocolVersion !== 1 ||
       (attempt.durableEnvironmentLeaseId !== undefined && attempt.durableEnvironmentLeaseId !== lease.id) ||
       (run.runnerProfileJson?.durableEnvironmentLeaseId !== undefined && run.runnerProfileJson.durableEnvironmentLeaseId !== lease.id) ||
       (stored.session?.normalizedSessionId ?? `session-${run.id}`) !== nativeSession) fail();
   const providerAdmission: FactoryProviderBinding = {
-    schema: "factory.provider-worker-binding.v2", provider: "codex",
+    schema: "factory.provider-worker-binding.v2", provider: providerMode.provider,
     admissionId: randomUUID(), capabilityId: randomUUID(), normalizedSessionId: nativeSession,
     runnerInstanceId: attempt.runnerInstanceId, workerPlanSha256: providerMode.workerPlanSha256,
     authorization: await readFactoryOwnRunAuthorization(input.db, attempt.execution.binding),

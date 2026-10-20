@@ -2,21 +2,23 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { agentWakeupRequests, authUsers, environmentLeases, environments, executionWorkspaces, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import type { FactoryAdmissionProvider } from "@paperclipai/adapter-utils/factory-provider-admission";
 import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { createAuthorizedFactoryWorkerAdmission, createAuthorizedFactoryWorkerLease } from "./factory-worker-runtime.js";
 
 // DB-current mutation fixtures. Existing capacity integration suite proves SQL/company predicates.
-function fixture(mode = true) {
+function fixture(mode = true, provider: FactoryAdmissionProvider = "codex") {
   const runId = randomUUID(), leaseId = randomUUID(), environmentId = randomUUID(), workspaceId = randomUUID();
   const runnerInstanceId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = "session-" + randomUUID();
   const cwd = `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`;
-  const admission = { provider: "codex" as const, workerPlanSha256: "a".repeat(64) };
+  const admission = { provider, workerPlanSha256: "a".repeat(64) };
   const config = { factoryWorkerPolicy: FACTORY_WORKER_POLICY, host: "fixture.invalid", port: 2222,
     username: "node", knownHosts: "fixture-pin", strictHostKeyChecking: true, remoteWorkspacePath: cwd,
     ...(mode ? { factoryProviderAdmission: admission } : {}) };
   const execution = { binding: { companyId: FACTORY_COMPANY_ID, runId, agentId, issueId, executionWorkspaceId: workspaceId },
-    provider: { kind: "codex" }, session: { normalizedSessionId: sessionId, driverKind: "codex_app_server",
+    provider: provider === "codex" ? { kind: "codex" } : { kind: "acpx", agent: "claude" },
+    session: { normalizedSessionId: sessionId, driverKind: provider === "codex" ? "codex_app_server" : "acpx_runtime",
       protocolVersion: 1, lifecyclePolicy: { mode: "per_turn" } } } as NativeExecutionInput;
   const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", environmentId, leaseId,
     factoryWorkerPolicy: FACTORY_WORKER_POLICY, ...(mode ? { factoryProviderAdmission: { ...admission } } : {}),
@@ -48,10 +50,10 @@ describe("Factory provider DB-current admission", () => {
     expect(await createAuthorizedFactoryWorkerLease(f)).toMatchObject({ runId: f.run.id });
     await expect(createAuthorizedFactoryWorkerLease(fixture())).rejects.toThrow();
   });
-  it("binds real IDs/plan and creates fresh attempt IDs after authorization", async () => {
-    const f = fixture();
+  it.each(["codex", "claude"] as const)("binds %s IDs/plan and creates fresh attempt IDs after authorization", async provider => {
+    const f = fixture(true, provider);
     const a = await createAuthorizedFactoryWorkerAdmission(f), b = await createAuthorizedFactoryWorkerAdmission(f);
-    expect(a.providerAdmission).toMatchObject({ schema: "factory.provider-worker-binding.v2", provider: "codex", normalizedSessionId: f.sessionId, runnerInstanceId: f.runnerInstanceId,
+    expect(a.providerAdmission).toMatchObject({ schema: "factory.provider-worker-binding.v2", provider, normalizedSessionId: f.sessionId, runnerInstanceId: f.runnerInstanceId,
       workerPlanSha256: f.target.factoryProviderAdmission!.workerPlanSha256 });
     expect(a.providerAdmission!.admissionId).not.toBe(b.providerAdmission!.admissionId);
     expect(a.providerAdmission!.capabilityId).not.toBe(b.providerAdmission!.capabilityId);
@@ -63,7 +65,7 @@ describe("Factory provider DB-current admission", () => {
     f.user.email = "changed@example.invalid";
     await expect(a.revalidateProviderAdmission!()).rejects.toThrow("native_execution_ownership_unverified");
   });
-  it("rechecks source wake cancellation, actor identity and current lease before signing", async () => {
+  it.each(["codex", "claude"] as const)("rechecks %s wake cancellation, actor identity and current lease before signing", async provider => {
     for (const change of [
       (f: ReturnType<typeof fixture>) => { f.wake.status = "cancelled"; },
       (f: ReturnType<typeof fixture>) => { f.wake.payload.manualUserWake = false; },
@@ -72,25 +74,40 @@ describe("Factory provider DB-current admission", () => {
       (f: ReturnType<typeof fixture>) => { f.wake.coalescedCount = 1; },
       (f: ReturnType<typeof fixture>) => { f.lease.status = "released"; },
     ]) {
-      const f = fixture(), admitted = await createAuthorizedFactoryWorkerAdmission(f);
+      const f = fixture(true, provider), admitted = await createAuthorizedFactoryWorkerAdmission(f);
       change(f);
       await expect(admitted.revalidateProviderAdmission!()).rejects.toThrow("native_execution_ownership_unverified");
     }
   });
-  it.each(["registration", "execution", "stored execution"])("keeps %s Codex-only despite the low-level Claude v2 contract", async boundary => {
-    const f = fixture();
-    if (boundary === "registration") {
-      Reflect.set(f.environment.config.factoryProviderAdmission!, "provider", "claude");
-      Reflect.set(f.target.factoryProviderAdmission!, "provider", "claude");
-    } else if (boundary === "execution") {
-      f.execution = { ...f.execution, provider: { kind: "acpx", agent: "claude" } } as NativeExecutionInput;
-    } else {
-      const stored = f.run.runnerProfileJson.nativeExecutionInput;
-      f.run.runnerProfileJson.nativeExecutionInput = { ...stored, provider: { kind: "acpx", agent: "claude" } } as NativeExecutionInput;
+  it.each(["codex", "claude"] as const)("rejects %s provider substitution at each admission boundary", async provider => {
+    const otherProvider = provider === "codex" ? "claude" : "codex";
+    for (const boundary of ["registration", "selected target", "execution", "stored execution", "driver", "stored driver"]) {
+      const f = fixture(true, provider), other = fixture(true, otherProvider).execution;
+      if (boundary === "registration") f.environment.config.factoryProviderAdmission!.provider = otherProvider;
+      else if (boundary === "selected target") Reflect.set(f.target.factoryProviderAdmission!, "provider", otherProvider);
+      else if (boundary === "execution") f.execution = { ...f.execution, provider: other.provider, session: { ...f.execution.session, driverKind: other.session.driverKind } } as NativeExecutionInput;
+      else if (boundary === "driver") f.execution = { ...f.execution, session: { ...f.execution.session, driverKind: other.session.driverKind } };
+      else {
+        const stored = f.run.runnerProfileJson.nativeExecutionInput;
+        f.run.runnerProfileJson.nativeExecutionInput = { ...stored,
+          ...(boundary === "stored execution" ? { provider: other.provider } : {}),
+          session: { ...stored.session, driverKind: other.session.driverKind } } as NativeExecutionInput;
+      }
+      await expect(createAuthorizedFactoryWorkerAdmission(f), boundary).rejects.toMatchObject({
+        name: "NativeRunnerOwnershipUnverifiedError", reason: "ssh_foreground_ownership_unverified",
+      });
     }
-    await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toMatchObject({
-      name: "NativeRunnerOwnershipUnverifiedError", reason: "ssh_foreground_ownership_unverified",
-    });
+  });
+  it("rejects a different ACPX agent and provider changes before signing", async () => {
+    const f = fixture(true, "claude"), admitted = await createAuthorizedFactoryWorkerAdmission(f);
+    f.environment.config.factoryProviderAdmission!.provider = "codex";
+    await expect(admitted.revalidateProviderAdmission!()).rejects.toThrow();
+    for (const stored of [false, true]) {
+      const f = fixture(true, "claude");
+      const execution = stored ? f.run.runnerProfileJson.nativeExecutionInput : f.execution;
+      execution.provider = { kind: "acpx", agent: "codex" } as NativeExecutionInput["provider"];
+      await expect(createAuthorizedFactoryWorkerAdmission(f)).rejects.toThrow();
+    }
   });
   it("rejects changed registration, omitted mode, stale runner/session and inactive lease", async () => {
     const mutations = [

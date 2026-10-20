@@ -8906,6 +8906,38 @@ describe("runnerd provider runtime wiring", () => {
     expect(options.environment.PAPERCLIP_NATIVE_MCP_TOKEN).toBeUndefined();
   });
 
+  it.each(["name", "url", "token", "complete"])("routes Factory Claude assigned MCP through controller authority (%s)", async mode => {
+    const current = { ...execution, binding: { ...execution.binding, companyId: FACTORY_COMPANY_ID,
+      runId: randomUUID(), executionWorkspaceId: randomUUID() },
+      provider: { kind: "acpx", agent: "claude", model: "claude-sonnet-5", permissionPolicy: "interactive" },
+      session: { ...execution.session, normalizedSessionId: randomUUID(), driverKind: "acpx_runtime",
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } } as NativeExecutionInputV1;
+    const remoteCwd = `/workspace/${FACTORY_COMPANY_ID}/${current.binding.executionWorkspaceId}`;
+    const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+      environmentId: randomUUID(), leaseId: randomUUID(), remoteCwd,
+      spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd, remoteWorkspacePath: remoteCwd,
+        privateKey: "fixture-only-not-a-key", knownHosts: "fixture-public-pin", strictHostKeyChecking: true } };
+    const bindings = { name: { PAPERCLIP_NATIVE_MCP_NAME: "paperclip-assigned" },
+      url: { PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1:3217/mcp/gateways/assigned-claude" },
+      token: { PAPERCLIP_NATIVE_MCP_TOKEN: "synthetic-controller-mcp-token" } };
+    const runnerEnvironment = mode === "complete" ? { ...bindings.name, ...bindings.url, ...bindings.token } : bindings[mode as keyof typeof bindings];
+    const authorize = vi.spyOn(factoryWorkerRuntime, "authorizeFactoryWorker").mockImplementation(vi.fn());
+    const staging = vi.spyOn(factoryStaging, "assertFactoryWorkspaceStagingOwned").mockResolvedValue(undefined);
+    const assignedMcpTools = { definitions: () => [], has: () => false, execute: vi.fn() };
+    state.createAssignedMcpTools.mockClear().mockResolvedValueOnce(assignedMcpTools);
+    state.toolAuthorityDefinitions.mockClear();
+    try {
+      await expect(createRunnerdBackend({ db: leaseDb(current), execution: current, runnerInstanceId: randomUUID(),
+        runnerExecutionTarget: target, runnerEnvironment })).rejects.toThrow(mode === "complete"
+          ? "configure PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH" : "assigned native MCP launch binding is incomplete");
+      if (mode === "complete") {
+        expect(state.createAssignedMcpTools).toHaveBeenCalledWith(expect.objectContaining({
+          gatewayPublicId: "assigned-claude", bearerToken: "synthetic-controller-mcp-token" }));
+        expect(state.toolAuthorityDefinitions).toHaveBeenCalledWith(expect.objectContaining({ assignedMcpTools }));
+      } else expect(state.createAssignedMcpTools).not.toHaveBeenCalled();
+    } finally { authorize.mockRestore(); staging.mockRestore(); }
+  });
+
   it("makes remote authority archival idempotent and returns the archived state", async () => {
     const remoteExecute = vi.fn();
     const remoteTarget = {
