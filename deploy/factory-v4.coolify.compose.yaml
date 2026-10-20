@@ -66,6 +66,7 @@ services:
       PAPERCLIP_PUBLIC_URL: "https://factory.mereka.io"
       # Native SSH transport requires wss:, independently of the HTTPS web URL.
       PAPERCLIP_RUNNER_PUBLIC_URL: "wss://factory.mereka.io"
+      PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH: "${PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH:-/opt/paperclip-runner/provider-pack}"
       PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true"
       PAPERCLIP_AUTHENTIK_REQUIRED: "true"
       PAPERCLIP_AUTHENTIK_ISSUER: "https://auth0.mereka.io/application/o/factory/"
