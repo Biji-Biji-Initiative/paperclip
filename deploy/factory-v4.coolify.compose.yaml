@@ -64,6 +64,8 @@ services:
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
       PAPERCLIP_PUBLIC_URL: "https://factory.mereka.io"
+      # SSH runners dial the authenticated PRP WebSocket on this origin.
+      PAPERCLIP_RUNNER_PUBLIC_URL: "https://factory.mereka.io"
       PAPERCLIP_AUTH_DISABLE_SIGN_UP: "true"
       PAPERCLIP_AUTHENTIK_REQUIRED: "true"
       PAPERCLIP_AUTHENTIK_ISSUER: "https://auth0.mereka.io/application/o/factory/"
