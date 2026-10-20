@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 PREFIX = "xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-"
@@ -35,8 +36,8 @@ class RecoveryVolumes(unittest.TestCase):
         result = config()
         self.assertEqual(result.returncode, 0, result.stderr)
         model = json.loads(result.stdout)
-        for tail in ("pgdata", "data"):
-            self.assertEqual(model["volumes"]["paperclip-factory-v4-r1-" + tail],
+        for alias, tail in (("factory-qualified-pgdata", "pgdata"), ("factory-qualified-state", "data")):
+            self.assertEqual(model["volumes"][alias],
                              {"name": PREFIX + tail, "external": True})
         self.assertEqual(model["services"]["server"]["pull_policy"], "never")
         self.assertNotIn("build", model["services"]["server"])
@@ -46,9 +47,21 @@ class RecoveryVolumes(unittest.TestCase):
         result = config(suffix)
         self.assertEqual(result.returncode, 0, result.stderr)
         model = json.loads(result.stdout)
-        for tail in ("pgdata", "data"):
-            self.assertEqual(model["volumes"]["paperclip-factory-v4-r1-" + tail],
+        for alias, tail in (("factory-qualified-pgdata", "pgdata"), ("factory-qualified-state", "data")):
+            self.assertEqual(model["volumes"][alias],
                              {"name": PREFIX + tail + suffix, "external": True})
+
+    def test_native_runner_uses_secure_websocket_on_the_canonical_web_origin(self):
+        result = config()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = json.loads(result.stdout)["services"]["server"]["environment"]
+        web = urlsplit(env["PAPERCLIP_PUBLIC_URL"])
+        runner = urlsplit(env["PAPERCLIP_RUNNER_PUBLIC_URL"])
+        self.assertEqual(web.scheme, "https")
+        self.assertEqual(runner.scheme, "wss", "Native transport refuses an https: runner URL before SSH dispatch")
+        self.assertEqual(runner.netloc, web.netloc)
+        self.assertEqual(runner.netloc, "factory.mereka.io")
+        self.assertEqual((runner.path, runner.query, runner.fragment), ("", "", ""))
 
     def test_missing_qualified_image_fails_before_any_resource_is_started(self):
         result = config(missing_image=True)
