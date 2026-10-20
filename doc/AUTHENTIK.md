@@ -31,7 +31,8 @@ mapping. Stock Authentik email mapping reports false; do not change the shared
 mapping or invent an app-local managed-domain verification rule.
 
 Provider, admission policy, signing key, blueprint realization and AUTH_REGISTRY
-belong in `bbi-infrastructure`, through its current held-production GitOps route.
+belong in `bbi-infrastructure`, through production promotion and owner-targeted
+sync under that repository's current GitOps procedure.
 This consumer repository does not own those runtime resources. Do not copy
 archived reference blueprints into a second authority. Project isolation is not
 provided by project names within a shared company.
@@ -40,10 +41,52 @@ provided by project names within a shared company.
 
 A fresh verified Authentik exchange creates an `operator` membership in the
 configured company, with the existing role's minimal task-assignment grant.
-It never grants instance administration. Existing roles, removed grants and
+By default it grants no instance administration. Existing roles, removed grants and
 suspended memberships are preserved; a suspended membership blocks new staff
 sessions. Membership writes and their audit event are transactional and occur
 before the session is issued. No company is silently created.
+
+### Optional verified admin claim
+
+Admin projection is disabled by default, including the additional scope request.
+The IdP owner must realize and independently qualify the `factory_admin` scope
+before the consumer requests it. Its signed claim is
+`https://factory.mereka.io/claims/authorization`, with
+`{"v":1,"instance_admin":true}` for the existing `authentik Admins` group and
+an explicit boolean false for ordinary staff. Factory follows the estate's
+existing global superadmin policy; no separate admin group or email-based
+authority is introduced.
+
+Only after IdP realization and qualification of the changed consumer image, set
+these values together through the deployment's existing configuration owner:
+
+| Variable | Meaning |
+|---|---|
+| `PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED` | `true` to request and accept the dedicated admin scope |
+| `PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS` | Comma-separated unique UUIDs of existing authorized companies, including the staff company |
+
+For Factory, the explicit list covers Biji-Biji, Mereka and Botak & Bunga. The
+consumer does not infer it from all companies in the instance. Ordinary staff
+continue to join only the configured staff company. Missing, false or malformed
+admin claims never elevate a user. Signature, issuer, audience, nonce and existing
+issuer/subject/account binding checks remain mandatory.
+
+A verified admin callback uses native `accessService` to add `instance_admin`
+and the existing join behavior to create only missing company memberships and
+initial grants. Existing owner/operator roles and individually removed grants
+remain unchanged. A disabled company or suspended/archived target membership
+refuses the callback; the entire role/membership/grant/audit transaction rolls
+back. Repeated and concurrent callbacks for the same bound user are idempotent.
+Native instance admin does not itself bypass company membership.
+
+This projection is additive. False or absent claims never demote existing roles,
+including manual founder or Miranda grants. Central admin removal requires
+explicit native operator reconciliation until the application has a supported
+managed-grant provenance contract. No bidirectional role synchronization or
+immediate central session revocation is claimed. To stop projection and additional
+scope requests, set the option to `false` and remove the admin company list
+together; partial configuration fails startup. This does not revoke previously
+granted roles. Preserve founder access during any explicit reconciliation.
 
 New staff—including `miranda@mereka.my`—use **Continue with Staff SSO**. Authentik
 owns Google/MFA/passkey choices and staff admission. Password sign-in is disabled
@@ -87,6 +130,11 @@ identities, minimal grants, unchanged existing identities/roles, authenticated
 linking, suspension, token encryption and logout/session invalidation. UI tests
 cover the staff button, hidden password form, profile linking and logout.
 These are controlled protocol tests; they are not real Miranda/Google/MFA proof.
+Admin callback tests additionally exercise all configured companies, strict claim
+types and opt-in scopes, invalid signed exchanges, replay, concurrent receipt
+isolation, preserved manual roles/removed grants and atomic rollback on disabled
+membership or admin-audit failure. Source qualification does not prove IdP scope
+realization, consumer release or attended staff acceptance.
 
 Before enabling this in Factory, build and identify the actual changed image,
 rehearse its migration and application behavior on copied state, qualify the

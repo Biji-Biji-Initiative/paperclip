@@ -1,8 +1,8 @@
 import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
-import { activityLog, authAccounts, authSessions, authUsers, companies, companyMemberships, createDb, instanceUserRoles, principalPermissionGrants } from "@paperclipai/db";
-import { authentikAuthOptions, authentikConfiguration } from "../auth/authentik.js";
+import { activityLog, authAccounts, authSessions, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, instanceUserRoles, principalPermissionGrants } from "@paperclipai/db";
+import { AUTHENTIK_ADMIN_CLAIM, AUTHENTIK_ADMIN_SCOPE, authentikAuthOptions, authentikConfiguration } from "../auth/authentik.js";
 import { createBetterAuthInstance } from "../auth/better-auth.js";
 import type { Config } from "../config.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -10,6 +10,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 const issuer = "https://authentik.fixture/application/o/factory/";
 const origin = "https://factory.fixture";
 const companyId = "0da2d522-a3c2-4658-87e9-c089698fc111";
+const adminCompanyIds = [companyId, "00000000-0000-4000-8000-000000000002", "00000000-0000-4000-8000-000000000003"];
+const adminClaim = { [AUTHENTIK_ADMIN_CLAIM]: { v: 1, instance_admin: true } };
 const settings = { PAPERCLIP_AUTHENTIK_ISSUER: issuer, PAPERCLIP_AUTHENTIK_CLIENT_ID: "factory-fixture",
   PAPERCLIP_AUTHENTIK_CLIENT_SECRET: "test-fixture-not-a-real-secret", PAPERCLIP_AUTHENTIK_COMPANY_ID: companyId };
 
@@ -29,6 +31,24 @@ describe("Authentik configuration", () => {
     expect(authentikConfiguration({ ...settings, PAPERCLIP_AUTHENTIK_ALLOW_PASSWORD_LOGIN: "true",
       PAPERCLIP_AUTHENTIK_RECOVERY_EMAIL: "operator@mereka.my", PAPERCLIP_AUTHENTIK_RECOVERY_UNTIL: new Date(Date.now() - 1000).toISOString() })?.allowPasswordLogin).toBe(false);
   });
+  it("requires explicit admin scope enablement and a bounded existing company list", () => {
+    expect(authentikConfiguration(settings)?.adminClaimEnabled).toBe(false);
+    expect(authentikConfiguration({ PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED: "false" })).toBeNull();
+    expect(authentikConfiguration({ ...settings, PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED: "false",
+      PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS: "" })?.adminCompanyIds).toEqual([]);
+    const admin = { ...settings, PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED: "true",
+      PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS: adminCompanyIds.join(",") };
+    expect(authentikConfiguration(admin)?.adminCompanyIds).toEqual([...adminCompanyIds].sort());
+    for (const change of [
+      { PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED: "yes" },
+      { PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS: "" },
+      { PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS: "missing" },
+      { PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS: companyId + "," + companyId.toUpperCase() },
+      { PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS: adminCompanyIds[1] },
+      { PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED: "false" },
+    ]) expect(() => authentikConfiguration({ ...admin, ...change })).toThrow(/admin/);
+    expect(() => authentikConfiguration({ PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED: "true" })).toThrow(/staff SSO/);
+  });
 });
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -37,6 +57,7 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let auth: ReturnType<typeof createBetterAuthInstance>;
+  let adminAuth: ReturnType<typeof createBetterAuthInstance>;
   const keys = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const jwk = { ...keys.publicKey.export({ format: "jwk" }), kid: "fixture-key", alg: "RS256", use: "sig" };
   let discoveryOverride: Record<string, unknown> = {};
@@ -65,6 +86,7 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
     }));
     if (start.status !== 200) return start;
     const authorize = new URL((await start.json()).url);
+    expect(authorize.searchParams.get("scope")?.split(" ").includes(AUTHENTIK_ADMIN_SCOPE)).toBe(instance === adminAuth);
     const nonce = authorize.searchParams.get("nonce");
     expect(nonce).toBeTruthy();
     expect(authorize.searchParams.get("code_challenge_method")).toBe("S256");
@@ -90,6 +112,8 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
     for (const [key, value] of Object.entries(settings)) vi.stubEnv(key, value);
     vi.stubEnv("BETTER_AUTH_SECRET", "authentik-integration-fixture-secret-not-for-deployment");
     vi.stubEnv("PAPERCLIP_AUTH_RATE_LIMIT_ENABLED", "false");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED", "false");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS", "");
     vi.stubGlobal("fetch", vi.fn(async (input: Request | URL | string, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url === issuer + ".well-known/openid-configuration") return Response.json({ issuer,
@@ -113,9 +137,19 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
     database = await startEmbeddedPostgresTestDatabase("paperclip-authentik-");
     db = createDb(database.connectionString);
     await db.insert(companies).values({ id: companyId, name: "Factory fixture", issuePrefix: "SSO" });
+    await db.insert(companies).values(adminCompanyIds.slice(1).map((id, index) => ({
+      id, name: "Admin company " + index, issuePrefix: "ADM" + index,
+    })));
     auth = createBetterAuthInstance(db, { deploymentMode: "authenticated", deploymentExposure: "public",
       authBaseUrlMode: "explicit", authPublicBaseUrl: origin, authDisableSignUp: true } as Config, [origin]);
-  }, 60_000);
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED", "true");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS", adminCompanyIds.join(","));
+    adminAuth = createBetterAuthInstance(db, { deploymentMode: "authenticated", deploymentExposure: "public",
+      authBaseUrlMode: "explicit", authPublicBaseUrl: origin, authDisableSignUp: true } as Config, [origin]);
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ADMIN_CLAIM_ENABLED", "false");
+    vi.stubEnv("PAPERCLIP_AUTHENTIK_ADMIN_COMPANY_IDS", "");
+    await Promise.all([auth.$context, adminAuth.$context]);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterAll(async () => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); await database?.cleanup(); });
   it("issues verified staff sessions with operator membership and no instance admin", async () => {
     expect((await login("miranda@mereka.my")).status).toBe(302);
@@ -348,5 +382,128 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
     expect(await db.select().from(authAccounts).where(eq(authAccounts.userId, "existing-founder"))).toHaveLength(0);
     const [membership] = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, "existing-founder"));
     expect(membership.membershipRole).toBe("owner");
+  });
+
+  it("projects one verified admin claim into native admin and three company memberships idempotently", async () => {
+    const email = "central-admin@mereka.my";
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    const roles = await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id));
+    expect(roles).toMatchObject([{ userId: user.id, role: "instance_admin" }]);
+    const memberships = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id));
+    expect(memberships.map((m) => m.companyId).sort()).toEqual([...adminCompanyIds].sort());
+    expect(memberships.every((m) => m.membershipRole === "operator" && m.status === "active")).toBe(true);
+    const grants = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, user.id));
+    expect(grants).toHaveLength(3);
+    expect(grants.every((g) => g.permissionKey === "tasks:assign")).toBe(true);
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id))).toEqual(roles);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id))).toEqual(memberships);
+    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, user.id))).toEqual(grants);
+    const audits = await db.select().from(activityLog).where(eq(activityLog.entityId, user.id));
+    expect(audits.filter((a) => a.action === "authentik.instance_admin_granted")).toMatchObject([
+      { details: { roleId: roles[0].id, claimVersion: 1, role: "instance_admin" } },
+    ]);
+  });
+
+  it.each([undefined, false, true, "true", {}, { v: 1, instance_admin: false },
+    { v: 1, instance_admin: "true" }, { v: 2, instance_admin: true }])("never elevates an ordinary staff claim %j", async (claim) => {
+    const email = "ordinary-staff-claim-" + randomUUID() + "@mereka.my";
+    expect((await login(email, true, { [AUTHENTIK_ADMIN_CLAIM]: claim }, adminAuth)).status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id))).toHaveLength(0);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id))).toMatchObject([{ companyId }]);
+  });
+
+  it("ignores an admin claim until the additional scope is explicitly enabled", async () => {
+    const email = "admin-claim-opt-out@mereka.my";
+    expect((await login(email, true, adminClaim)).status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id))).toHaveLength(0);
+  });
+
+  it("does not grant native admin for wrong issuer, audience, signature, nonce, expiry or replay", async () => {
+    const before = await db.select().from(instanceUserRoles);
+    for (const [index, invalid] of [{ iss: "https://wrong.fixture/" }, { aud: "another-client" },
+      { fixtureBadSignature: true }, { nonce: "wrong-nonce" }, { exp: Math.floor(Date.now() / 1000) - 30 }].entries()) {
+      expect((await login("invalid-admin-" + index + "@mereka.my", true, { ...adminClaim, ...invalid }, adminAuth)).status).toBe(401);
+    }
+    expect(await db.select().from(instanceUserRoles)).toEqual(before);
+    const email = "admin-replay@mereka.my";
+    expect((await login(email, true, adminClaim, adminAuth, undefined, { replay: true })).status).toBe(401);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id))).toHaveLength(1);
+    expect(await db.select().from(authSessions).where(eq(authSessions.userId, user.id))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, user.id))).toHaveLength(4);
+  });
+
+  it("isolates concurrent admin and ordinary staff receipts", async () => {
+    const emails = ["concurrent-admin@mereka.my", "concurrent-staff@mereka.my"];
+    expect((await Promise.all([login(emails[0], true, adminClaim, adminAuth),
+      login(emails[1], true, {}, adminAuth)])).map((r) => r.status)).toEqual([302, 302]);
+    for (const [index, email] of emails.entries()) {
+      const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+      expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id))).toHaveLength(index === 0 ? 1 : 0);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id))).toHaveLength(index === 0 ? 3 : 1);
+    }
+  });
+
+  it("serializes concurrent admin callbacks for the same bound native user", async () => {
+    const email = "same-admin@mereka.my", userId = "same-admin-user";
+    await seedBoundIdentity(userId, email);
+    expect((await Promise.all([login(email, true, adminClaim, adminAuth),
+      login(email, true, adminClaim, adminAuth)])).map((r) => r.status)).toEqual([302, 302]);
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId))).toHaveLength(1);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId))).toHaveLength(3);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, userId))).toHaveLength(4);
+  });
+
+  it("preserves manual admin, owner membership and individually removed grants when central authority changes", async () => {
+    const email = "manual-admin@mereka.my", userId = "manual-admin-user";
+    await seedBoundIdentity(userId, email);
+    const [role] = await db.insert(instanceUserRoles).values({ userId, role: "instance_admin" }).returning();
+    const [owner] = await db.insert(companyMemberships).values({ companyId, principalId: userId,
+      principalType: "user", status: "active", membershipRole: "owner" }).returning();
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    const memberships = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId));
+    expect(memberships.find((m) => m.companyId === companyId)).toEqual(owner);
+    const grants = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId));
+    expect(grants).toHaveLength(2);
+    expect(grants.every((g) => g.companyId !== companyId)).toBe(true);
+    expect((await login(email, true, { [AUTHENTIK_ADMIN_CLAIM]: { v: 1, instance_admin: false } }, adminAuth)).status).toBe(302);
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId))).toEqual([role]);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId))).toEqual(memberships);
+    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId))).toEqual(grants);
+  });
+
+  it("refuses disabled memberships without retaining partial admin or cross-company provisioning", async () => {
+    for (const status of ["suspended", "archived"] as const) {
+      const userId = "disabled-admin-" + status, email = userId + "@mereka.my";
+      await seedBoundIdentity(userId, email);
+      const [membership] = await db.insert(companyMemberships).values({ companyId, principalId: userId,
+        principalType: "user", status, membershipRole: "operator" }).returning();
+      expect((await login(email, true, adminClaim, adminAuth)).status).toBe(401);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId))).toEqual([membership]);
+      expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId))).toHaveLength(0);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, userId))).toHaveLength(0);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, userId))).toHaveLength(0);
+    }
+  });
+
+  it("rolls back native role, all memberships, grants and audits if admin audit persistence fails", async () => {
+    const userId = "admin-audit-rollback", email = "admin-audit-rollback@mereka.my";
+    await seedBoundIdentity(userId, email);
+    await db.execute(sql`ALTER TABLE activity_log ADD CONSTRAINT fixture_reject_admin_audit CHECK (entity_id <> 'admin-audit-rollback' OR action <> 'authentik.instance_admin_granted')`);
+    try {
+      expect((await login(email, true, adminClaim, adminAuth)).status).toBe(401);
+      expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId))).toHaveLength(0);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, userId))).toHaveLength(0);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, userId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, userId))).toHaveLength(0);
+      expect(await db.select().from(authSessions).where(eq(authSessions.userId, userId))).toHaveLength(0);
+    } finally { await db.execute(sql`ALTER TABLE activity_log DROP CONSTRAINT fixture_reject_admin_audit`); }
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId))).toHaveLength(1);
   });
 });

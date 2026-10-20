@@ -1966,7 +1966,17 @@ their existing operator recovery requirements.
 
 An explicitly configured Authentik OIDC provider may authenticate staff while
 public password signup stays disabled. Verified provider exchanges provision
-only operator membership in one existing active company. Existing identities,
+operator membership in one existing active company by default. An explicitly
+enabled, versioned admin claim from the verified provider may add the native
+instance-admin role and only missing operator memberships/initial grants in an
+explicit set of existing active companies. Its dedicated scope must be realized
+at the IdP before the consumer requests it. Ordinary staff, email domains and
+missing/false/malformed claims do not establish admin authority. Admin projection
+is additive and idempotent; disabled target membership refuses the exchange and
+rolls back the role/membership/grant/audit transaction. Existing manual roles are
+never demoted by a false or missing claim. Central role removal requires explicit
+operator reconciliation until managed-grant provenance is supported; this is not
+bidirectional role synchronization. Existing identities,
 roles, suspensions and missing grant rows must survive repeat login and startup.
 Existing local accounts require authenticated linking, never silent mailbox
 merging or a database verification override. Only authorization-code exchanges
