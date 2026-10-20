@@ -26,7 +26,7 @@ services:
       timeout: 5s
       retries: 30
     volumes:
-      - paperclip-factory-v4-r1-pgdata:/var/lib/postgresql/data
+      - factory-qualified-pgdata:/var/lib/postgresql/data
 
   server:
     # These bounds apply to the control plane and its native child processes.
@@ -94,15 +94,18 @@ services:
       retries: 20
       start_period: 90s
     volumes:
-      - paperclip-factory-v4-r1-data:/paperclip
+      - factory-qualified-state:/paperclip
 
 volumes:
   # Existing V4 volumes: fail instead of silently creating an empty replacement.
   # Normal operation leaves the suffix empty. Recovery selects one independently
   # restored database/state pair using the suffix in its verified restore receipt.
-  paperclip-factory-v4-r1-pgdata:
+  # Fresh logical aliases avoid Coolify's compatibility mapping for the old
+  # managed storage rows, which otherwise ignores name's recovery suffix.
+  # The explicit physical names below still select the existing V4 data.
+  factory-qualified-pgdata:
     external: true
     name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-pgdata${PAPERCLIP_FACTORY_RECOVERY_SUFFIX:-}
-  paperclip-factory-v4-r1-data:
+  factory-qualified-state:
     external: true
     name: xc4zcdntt8nw7kd3vdqkzuo8_paperclip-factory-v4-r1-data${PAPERCLIP_FACTORY_RECOVERY_SUFFIX:-}
