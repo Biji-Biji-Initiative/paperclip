@@ -8377,8 +8377,8 @@ describe("runnerd provider runtime wiring", () => {
             child: { kill: () => boolean }; completion: Promise<unknown>;
           };
         };
-        expect(options.factoryProviderAuth).toBe("codex");
-        expect(options.providerPackAuthorityDigest).toBeUndefined();
+        expect(options).toHaveProperty("factoryProviderAuth", "codex");
+        expect(options).not.toHaveProperty("providerPackAuthorityDigest");
         vi.useFakeTimers();
         let registered = false;
         const registrationPending = options.controlPlaneRegistration({}).then(value => { registered = true; return value; });
