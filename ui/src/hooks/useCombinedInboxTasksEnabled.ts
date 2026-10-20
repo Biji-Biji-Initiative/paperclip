@@ -1,4 +1,5 @@
 import { useContext } from "react";
+import { useBoardSession } from "./useBoardSession";
 import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import { QueryClient, QueryClientContext, useQuery } from "@tanstack/react-query";
 import { instanceSettingsApi } from "@/api/instanceSettings";
@@ -29,11 +30,12 @@ function getDetachedClient(): QueryClient {
  */
 export function useCombinedInboxTasksEnabled(): { enabled: boolean; loaded: boolean } {
   const contextClient = useContext(QueryClientContext);
+  const hasBoardSession = useBoardSession();
   const query = useQuery(
     {
       queryKey: queryKeys.instance.experimentalSettings,
       queryFn: () => instanceSettingsApi.getExperimental(),
-      enabled: contextClient != null,
+      enabled: contextClient != null && hasBoardSession,
     },
     contextClient ?? getDetachedClient(),
   );
@@ -42,6 +44,6 @@ export function useCombinedInboxTasksEnabled(): { enabled: boolean; loaded: bool
 
   return {
     enabled: resolveCombinedInboxTasksEnabled(query.data),
-    loaded: query.isFetched,
+    loaded: !hasBoardSession || query.isFetched,
   };
 }

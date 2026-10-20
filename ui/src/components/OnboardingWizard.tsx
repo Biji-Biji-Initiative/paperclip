@@ -933,7 +933,7 @@ function OnboardingWizardInner({
     // Models are picked on step 4 (Connect a model).
     enabled: Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4
   });
-  const getCapabilities = useAdapterCapabilities();
+  const getCapabilities = useAdapterCapabilities({ enabled: effectiveOnboardingOpen });
   const adapterCaps = getCapabilities(adapterType);
 
   // Resolve the login environment at render time, so the wizard can decide

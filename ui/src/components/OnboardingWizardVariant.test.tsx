@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
 import { flushSync } from "react-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { queryKeys } from "../lib/queryKeys";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OnboardingWizardVariant } from "./OnboardingWizardVariant";
@@ -24,7 +26,9 @@ describe("OnboardingWizardVariant (PAP-138)", () => {
   function renderVariant() {
     root = createRoot(container);
     flushSync(() => {
-      root!.render(<OnboardingWizardVariant />);
+      const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
+      client.setQueryData(queryKeys.auth.session, { user: { id: "board-user" } });
+      root!.render(<QueryClientProvider client={client}><OnboardingWizardVariant /></QueryClientProvider>);
     });
   }
 

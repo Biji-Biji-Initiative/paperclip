@@ -1,4 +1,5 @@
 import { useContext } from "react";
+import { useBoardSession } from "./useBoardSession";
 import { QueryClient, QueryClientContext, useQuery } from "@tanstack/react-query";
 import type { InstanceExperimentalSettings } from "@paperclipai/shared";
 import { instanceSettingsApi } from "@/api/instanceSettings";
@@ -26,11 +27,12 @@ function getDetachedClient(): QueryClient {
  */
 export function useStreamlinedUiEnabled(): { enabled: boolean; loaded: boolean } {
   const contextClient = useContext(QueryClientContext);
+  const hasBoardSession = useBoardSession();
   const query = useQuery(
     {
       queryKey: queryKeys.instance.experimentalSettings,
       queryFn: () => instanceSettingsApi.getExperimental(),
-      enabled: contextClient != null,
+      enabled: contextClient != null && hasBoardSession,
     },
     contextClient ?? getDetachedClient(),
   );
@@ -39,6 +41,6 @@ export function useStreamlinedUiEnabled(): { enabled: boolean; loaded: boolean }
 
   return {
     enabled: resolveStreamlinedUiEnabled(query.data),
-    loaded: query.isFetched,
+    loaded: !hasBoardSession || query.isFetched,
   };
 }

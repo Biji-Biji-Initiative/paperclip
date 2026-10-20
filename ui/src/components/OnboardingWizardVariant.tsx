@@ -1,3 +1,4 @@
+import { useBoardSession } from "../hooks/useBoardSession";
 import { OnboardingWizard } from "./OnboardingWizard";
 
 /**
@@ -6,5 +7,6 @@ import { OnboardingWizard } from "./OnboardingWizard";
  * experimental flag.
  */
 export function OnboardingWizardVariant() {
-  return <OnboardingWizard />;
+  const hasBoardSession = useBoardSession();
+  return hasBoardSession ? <OnboardingWizard /> : null;
 }

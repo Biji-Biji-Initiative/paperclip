@@ -39,10 +39,11 @@ const KNOWN_DEFAULTS: Record<string, AdapterCapabilities> = {
  * via react-query. Before the data loads, known built-in adapter types
  * return correct synchronous defaults to avoid cold-load regressions.
  */
-export function useAdapterCapabilities(): (type: string) => AdapterCapabilities {
+export function useAdapterCapabilities(options: { enabled?: boolean } = {}): (type: string) => AdapterCapabilities {
   const { data: adapters } = useQuery({
     queryKey: queryKeys.adapters.all,
     queryFn: () => adaptersApi.list(),
+    enabled: options.enabled ?? true,
     staleTime: 5 * 60 * 1000,
   });
 

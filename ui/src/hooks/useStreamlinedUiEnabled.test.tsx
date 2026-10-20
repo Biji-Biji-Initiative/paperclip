@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { queryKeys } from "../lib/queryKeys";
 import { createRoot, type Root } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,6 +9,9 @@ import {
   resolveStreamlinedUiEnabled,
   useStreamlinedUiEnabled,
 } from "./useStreamlinedUiEnabled";
+
+const mockAuthApi = vi.hoisted(() => ({ getSession: vi.fn() }));
+vi.mock("@/api/auth", () => ({ authApi: mockAuthApi }));
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
@@ -35,6 +39,7 @@ describe("useStreamlinedUiEnabled", () => {
   let root: Root;
 
   beforeEach(() => {
+    mockAuthApi.getSession.mockResolvedValue({ user: { id: "board-user" } });
     host = document.createElement("div");
     document.body.appendChild(host);
     root = createRoot(host);
@@ -52,6 +57,7 @@ describe("useStreamlinedUiEnabled", () => {
 
     mockInstanceSettingsApi.getExperimental.mockImplementation(() => new Promise(() => {}));
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.auth.session, { user: { id: "board-user" } });
     flushSync(() => {
       root.render(
         <QueryClientProvider client={queryClient}>
@@ -66,6 +72,7 @@ describe("useStreamlinedUiEnabled", () => {
   it("uses the legacy shell only for an explicit false value", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: false });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.auth.session, { user: { id: "board-user" } });
     flushSync(() => {
       root.render(
         <QueryClientProvider client={queryClient}>
