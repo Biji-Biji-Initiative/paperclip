@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { agentWakeupRequests, authUsers, environmentLeases, environments, executionWorkspaces, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import type { AdapterExecutionTarget, AdapterSshExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
-import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, createFactoryWorkerLeaseDescriptor,
+import { FACTORY_COMPANY_ID, FACTORY_WORKER_POLICY, FACTORY_LEASE_FIXED_ENV, createFactoryWorkerLeaseDescriptor,
   type FactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
 import type { NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { hasFactoryBusyReceipt } from "./factory-worker-capacity.js";
@@ -31,6 +31,14 @@ export function assertFactoryWorkerCredentialBoundary(environment: NodeJS.Proces
     /(?:^|_)(?:API_KEY|ACCESS_TOKEN|REFRESH_TOKEN|ID_TOKEN|OAUTH_TOKEN|AUTH_TOKEN|BASE_URL|API_BASE|ENDPOINT)$/.test(key))) {
     throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
   }
+}
+
+/** Controller bootstrap paths and proxy values never override the worker contract. */
+export function buildFactoryWorkerEnvironment(environment: NodeJS.ProcessEnv | undefined): Record<string, string> {
+  assertFactoryWorkerCredentialBoundary(environment, undefined);
+  const bootstrap = Object.fromEntries(Object.entries(environment ?? {})
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  return { ...bootstrap, ...FACTORY_LEASE_FIXED_ENV };
 }
 
 /** Environments are instance-wide; the acquired lease and workspace establish company authority. */

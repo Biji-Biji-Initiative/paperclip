@@ -99,11 +99,11 @@ import {
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { NativeSshForegroundOwner } from "./native-ssh-foreground-owner.js";
-import { authorizeFactoryWorker, assertFactoryWorkerColdExecution, assertFactoryWorkerCredentialBoundary, createAuthorizedFactoryWorkerAdmission,
+import { authorizeFactoryWorker, assertFactoryWorkerColdExecution, assertFactoryWorkerCredentialBoundary, buildFactoryWorkerEnvironment, createAuthorizedFactoryWorkerAdmission,
   isFactoryWorkerTarget, type FactoryWorkerAttempt } from "./factory-worker-runtime.js";
 import { deferFactoryWorkerCapacity, factoryProviderAttempt, hasFactoryBusyReceipt } from "./factory-worker-capacity.js";
 import { ensureFactoryRemoteRunnerDirectory, stageFactoryRemoteRunnerText, stageFactoryRemoteRunnerFile, stageFactoryRemoteRunnerDirectory } from "./factory-remote-staging.js";
-import { FACTORY_LEASE_FIXED_ENV, isFactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
+import { isFactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
 import { assertFactoryWorkspaceStagingOwned, settleFactoryWorkspaceStaging } from "../factory-workspace-staging.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import {
@@ -12637,7 +12637,7 @@ async function createRunnerdBackendWithinSessionClaim(
     : input.execution;
   const isGrok = input.execution.provider.kind === "acpx" && input.execution.provider.agent === "grok";
   let effectiveRunnerEnvironmentBase: NodeJS.ProcessEnv = {
-    ...(isFactoryWorkerTarget(target) ? { ...FACTORY_LEASE_FIXED_ENV, ...(input.runnerEnvironment ?? {}) } : isGrok
+    ...(isFactoryWorkerTarget(target) ? buildFactoryWorkerEnvironment(input.runnerEnvironment) : isGrok
       ? input.runnerEnvironment ?? {}
       : resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment)),
   };
