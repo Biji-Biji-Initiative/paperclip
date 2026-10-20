@@ -12,6 +12,10 @@ const { spawnRunner } = await import(new URL(
   "../../../../packages/paperclip-runner/src/control-plane/durable-prp-control-plane.ts", import.meta.url,
 ).href) as typeof import("../../../../packages/paperclip-runner/dist/control-plane/durable-prp-control-plane.js");
 
+const { createCapabilityRunnerdProviderEnvironment } = await import(new URL(
+  "../../../../packages/paperclip-runner/src/live/runnerd-codex-transport.ts", import.meta.url,
+).href) as typeof import("../../../../packages/paperclip-runner/dist/live/runnerd-codex-transport.js");
+
 function fixture() {
   const workspaceId = randomUUID();
   const workspaceRoot = `/workspace/${FACTORY_COMPANY_ID}/${workspaceId}`;
@@ -64,7 +68,12 @@ describe("Factory worker bootstrap environment", () => {
       .toThrow("native_execution_ownership_unverified");
   });
 
-  it.each(["codex", "claude"] as const)("passes actual Git preparation and %s runner spawn through protected admission", async provider => {
+  it.each([
+    { provider: "codex", deniedKey: null }, { provider: "claude", deniedKey: null },
+    { provider: "claude", deniedKey: "ANTHROPIC_API_KEY" }, { provider: "claude", deniedKey: "CLAUDE_CODE_OAUTH_TOKEN" },
+    { provider: "claude", deniedKey: "OPENAI_API_KEY" }, { provider: "claude", deniedKey: "PAPERCLIP_NATIVE_MCP_TOKEN" },
+    { provider: "claude", deniedKey: "UNEXPECTED_WORKER_ENV" },
+  ] as const)("serializes actual $provider producer with deniedKey=$deniedKey", async ({ provider, deniedKey }) => {
     const { lease, command } = fixture();
     const directory = mkdtempSync("/data/tmp/factory-envelope-test-"); roots.push(directory);
     const runnerInstanceId = randomUUID();
@@ -86,7 +95,7 @@ describe("Factory worker bootstrap environment", () => {
     const openDuplexChannel = vi.fn(async (_input: unknown) => { throw new FactoryWorkerBusyError(); });
     const owner = new NativeSshForegroundOwner({ directory, runId: lease.runId, runnerInstanceId,
       ownershipError: () => new Error("ownership-held") });
-    const processLauncher = owner.createLauncher({ runner: { openDuplexChannel }, remoteBinary: command[0],
+    const launch = owner.createLauncher({ runner: { openDuplexChannel }, remoteBinary: command[0],
       remoteCwd: lease.workspaceRoot, diagnosticsDirectory: lease.diagnosticsDirectory, ensureArtifact: async () => {},
       createWorkerAdmission: async () => ({ workerLease: lease, providerAdmission: {
         schema: "factory.provider-worker-binding.v2", provider, admissionId: randomUUID(), capabilityId: randomUUID(),
@@ -94,14 +103,37 @@ describe("Factory worker bootstrap environment", () => {
         authorization: { schema: "factory.direct-board-wakeup.v1", actorType: "user", actorId: "synthetic-user",
           actorEmail: "synthetic@example.invalid", wakeupRequestId: randomUUID(), agentId: randomUUID(), requestedAtUnixMs: Date.now() - 1 } },
         revalidateProviderAdmission: async () => {} }) });
+    // Inject at the final remote boundary: spawnRunner itself legitimately
+    // omits unknown host keys before that boundary is reached.
+    const processLauncher: typeof launch = (spec) => launch({ ...spec,
+      environment: deniedKey ? { ...spec.environment, [deniedKey]: "synthetic-denied-provider-value" } : spec.environment });
+    const identity = { runId: lease.runId, environmentLeaseId: lease.leaseId,
+      normalizedSessionId: lease.sessionId, runnerInstanceId, turnId: randomUUID(), itemId: randomUUID() };
+    const environment = createCapabilityRunnerdProviderEnvironment({
+      provider: provider === "claude" ? "acpx" : "codex",
+      options: { environment: buildFactoryWorkerEnvironment(prepared.env), acpxAgent: "claude" },
+      identity, codexHome: lease.filesystemDirectory + "/codex-home",
+      runtimeContextPath: lease.filesystemDirectory + "/runtime-context.json", hasRuntimeContext: true,
+      acpxSidecarPath: lease.workspaceRoot + "/.paperclip-runtime/paperclip-runner/provider-pack/dist/cli/acpx-runtime-sidecar.cjs",
+    });
     const handle = spawnRunner({ connectUrl: "wss://factory.mereka.io/api/runner/v1/connect/" + lease.runId,
-      stateDirectory: lease.stateDirectory, identity: { runId: lease.runId, environmentLeaseId: lease.leaseId,
-        normalizedSessionId: lease.sessionId, runnerInstanceId, turnId: randomUUID(), itemId: randomUUID() },
+      stateDirectory: lease.stateDirectory, identity,
       ticket: "bootstrap_" + randomUUID(), runnerBinaryPath: command[0], runnerVersion: "fixture",
       runnerDigest: "sha256:" + "a".repeat(64), maxOutboxBytes: 1048576, p0ReserveBytes: 262144,
-      environment: buildFactoryWorkerEnvironment(prepared.env), processLauncher });
+      environment, processLauncher });
+    if (deniedKey) {
+      await expect(handle.completion).rejects.toThrow("ownership-held");
+      expect(openDuplexChannel).not.toHaveBeenCalled();
+      expect(() => owner.assertAvailable()).toThrow("ownership-held");
+      return;
+    }
     await expect(handle.completion).rejects.toBeInstanceOf(FactoryWorkerBusyError);
     expect(openDuplexChannel).toHaveBeenCalledOnce();
+    const workerEnvironment = (openDuplexChannel.mock.calls[0]![0] as { environment: Record<string, string> }).environment;
+    expect(workerEnvironment).not.toHaveProperty("PAPERCLIP_RUN_ID");
+    expect(workerEnvironment).not.toHaveProperty("PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT");
+    if (provider === "codex") expect(workerEnvironment).toMatchObject({
+      HOME: lease.filesystemDirectory + "/codex-home", CODEX_HOME: lease.filesystemDirectory + "/codex-home" });
     expect(openDuplexChannel.mock.calls[0]?.[0]).toMatchObject({ environment: {
       PATH: "/usr/local/bin:/usr/bin:/bin", HTTPS_PROXY: "http://factory-gateway:3128" } });
     expect(JSON.stringify(openDuplexChannel.mock.calls)).not.toContain("synthetic-app-mcp-bearer-not-for-worker");

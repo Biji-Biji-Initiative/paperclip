@@ -32,6 +32,7 @@ if(input.host){const {AcpxRuntimeHost}=await import(${JSON.stringify(resolve("sr
 const host=await AcpxRuntimeHost.open({...input.open,agent:'claude',model:'claude-sonnet-5',factoryClaudeAccess:access,environment:{PATH:'/usr/bin:/bin',...(input.nativeMcp?{PAPERCLIP_NATIVE_MCP_NAME:'paperclip-assigned',PAPERCLIP_NATIVE_MCP_URL:'http://127.0.0.1:3211/mcp',PAPERCLIP_NATIVE_MCP_TOKEN:'synthetic-gateway-token-0123456789'.repeat(2)}:{})},semanticTools:{tools:[{name:'report_progress',inputSchema:{type:'object'}},{name:'unknown_tool',inputSchema:{type:'object'},annotations:{readOnlyHint:true}}],handler:async()=>({})}},
 {verifyInstallation:async(profile)=>({commandDigest:profile.commandDigest,agentServerPackageJsonPath:'/unused/package.json',agentRuntimePackageJsonPath:null,openCommand:async()=>({spawn(){throw Error('no_provider_allowed')},close:async()=>{}})}),reportRetainedCleanupFailure:()=>{},openRuntime:async(options)=>{const owned=claimFactoryClaudeAccessHandoff(options.factoryClaudeAccess);observed={buffered:owned.fd===null,allowed:owned.policy.allowedMcpTools,bridge:owned.policy.bridgeUrl===options.mcpServers.find(s=>s.name==='paperclip').url,workspace:owned.policy.workspaceRoot===input.open.workingDirectory,runtime:owned.policy.runtimeRoot.startsWith(input.open.runtimeDirectory+'/'),run:owned.policy.runId,lease:owned.policy.environmentLeaseId,runner:owned.policy.runnerInstanceId};owned.close();return {identity:async()=>({acpxRecordId:'record',backendSessionId:'backend',agentSessionId:'agent'}),getStatus:async()=>({models:{currentModelId:'claude-sonnet-5'}}),startTurn(){throw Error('no_turn_allowed')},close:async()=>{}}}});
 await host.close({reason:'synthetic proof complete'});process.stdout.write(JSON.stringify(observed)+'\\n');return;}
+if(input.providerAuthority){process.stdout.write(JSON.stringify({root:process.env.PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT,manifest:process.env.PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST,builtins:process.env.PAPERCLIP_ACPX_BUILTIN_ROOT})+'\\n');return;}
 let closed=0;for(const fd of [3,4]){try{fstatSync(fd)}catch{closed++}}process.stdout.write(JSON.stringify({guarded:access!==undefined,closed})+'\\n');}).catch(()=>{process.stderr.write('factory_claude_access_unverified\\n');process.exitCode=1;});`, resolveDir: process.cwd() }, bundle: true, format: "cjs", platform: "node", write: false, logLevel: "silent", define: { "import.meta.dirname": "__dirname", "import.meta.url": "__paperclipVerifiedEntrypointUrl" }, banner: { js: "const __paperclipVerifiedEntrypointUrl=require('node:url').pathToFileURL(__filename).href;" } });
     await writeFile(program, bundle.outputFiles[0]!.contents, { mode: 0o600 });
     compiledEntrypoint = join(directory, "entrypoint.cjs");
@@ -42,9 +43,9 @@ let closed=0;for(const fd of [3,4]){try{fstatSync(fd)}catch{closed++}}process.st
   }, 30_000);
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
 
-  function run(input: { metadata: unknown; access: unknown; commands?: unknown; flag?: boolean; script?: string; holdAccess?: boolean }) {
+  function run(input: { metadata: unknown; access: unknown; commands?: unknown; flag?: boolean; script?: string; holdAccess?: boolean; environment?: NodeJS.ProcessEnv }) {
     return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveResult, reject) => {
-      const child = spawn(process.execPath, [input.script ?? program, ...(input.flag === false ? [] : [FACTORY_CLAUDE_SIDECAR_FLAG])], { env: { PATH: process.env.PATH }, stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] });
+      const child = spawn(process.execPath, [input.script ?? program, ...(input.flag === false ? [] : [FACTORY_CLAUDE_SIDECAR_FLAG])], { env: { PATH: process.env.PATH, ...input.environment }, stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"] });
       const deadline = setTimeout(() => child.kill("SIGKILL"), 10_000);
       let stdout = "", stderr = "";
       child.stdout!.on("data", data => { stdout += data; }); child.stderr!.on("data", data => { stderr += data; });
@@ -60,6 +61,16 @@ let closed=0;for(const fd of [3,4]){try{fstatSync(fd)}catch{closed++}}process.st
     const f = fixture();
     const result = await run({ metadata: f.metadata, access: f.access, commands: { open: f.open, runId: f.binding.runId } });
     expect(result).toEqual({ code: 0, stdout: '{"guarded":true,"closed":2}\n', stderr: "" });
+    expect(JSON.stringify(result)).not.toContain(canary);
+  });
+  it("derives descriptor-loaded provider package paths from authenticated workspace, overriding controller paths", async () => {
+    const f = fixture();
+    const root = join(f.metadata.workingDirectory, ".paperclip-runtime/paperclip-runner/provider-pack");
+    const result = await run({ metadata: f.metadata, access: f.access, commands: { providerAuthority: true },
+      environment: { PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT: "/controller/wrong-pack",
+        PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST: "/controller/wrong-package.json", PAPERCLIP_ACPX_BUILTIN_ROOT: "/controller/wrong-builtins" } });
+    expect(result.code).toBe(0); expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({ root, manifest: join(root, "package.json"), builtins: join(root, "dist/providers") });
     expect(JSON.stringify(result)).not.toContain(canary);
   });
   it.each(["open", "run"])("rejects actual token expiry before %s even while its timer is delayed", async stage => {

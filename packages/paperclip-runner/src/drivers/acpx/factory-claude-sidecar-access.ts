@@ -1,6 +1,6 @@
 import { closeSync, fstatSync } from "node:fs";
 import { Socket } from "node:net";
-import { isAbsolute, normalize } from "node:path";
+import { isAbsolute, join, normalize } from "node:path";
 import type { FactoryClaudeAccessHandoff } from "./factory-claude-access.js";
 
 export const FACTORY_CLAUDE_SIDECAR_FLAG = "--factory-claude-access-v1";
@@ -103,6 +103,13 @@ export async function initializeFactoryClaudeSidecarAccess(): Promise<void> {
       !bindingKeys.filter(key => key !== "deadlineAtMs").every(key => grant[key] === binding[key]) ||
       typeof grant.expiresAtMs !== "number" || !Number.isSafeInteger(grant.expiresAtMs) || grant.expiresAtMs <= Date.now() || grant.expiresAtMs > binding.deadlineAtMs ||
       typeof grant.accessToken !== "string" || !/^[A-Za-z0-9._-]{32,4096}$/.test(grant.accessToken)) return fail();
+    // The worker's closed SSH environment excludes controller-local package
+    // paths. Its authenticated workspace fixes the read-only staged pack; the
+    // descriptor-loaded sidecar cannot derive it from /proc/self/fd/__filename.
+    const providerRoot = join(raw.workingDirectory, ".paperclip-runtime/paperclip-runner/provider-pack");
+    process.env.PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT = providerRoot;
+    process.env.PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST = join(providerRoot, "package.json");
+    process.env.PAPERCLIP_ACPX_BUILTIN_ROOT = join(providerRoot, "dist/providers");
     const cap = Object.freeze({}) as FactoryClaudeSidecarAccess;
     const bytes = access; access = undefined;
     const timer = setTimeout(() => { bytes.fill(0); capabilities.delete(cap); }, Math.max(1, grant.expiresAtMs - Date.now()));

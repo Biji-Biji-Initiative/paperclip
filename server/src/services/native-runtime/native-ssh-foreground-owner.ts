@@ -7,6 +7,14 @@ import {
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
+// Identity/context travel in authenticated PRP/FD data. Factory's sidecar
+// derives package paths from that workspace; controller paths are not SSH env.
+const FACTORY_CONTROLLER_ENVIRONMENT_KEYS = new Set([
+  "PAPERCLIP_RUNNER_INSTANCE_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_NORMALIZED_SESSION_ID",
+  "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH", "PAPERCLIP_ACPX_BUILTIN_ROOT",
+  "PAPERCLIP_ACPX_PROVIDER_PACKAGE_ROOT", "PAPERCLIP_ACPX_PROVIDER_PACKAGE_MANIFEST",
+]);
+
 // Deliberately structural: assignable to the existing command-runner duplex seam
 // and RunnerProcessHandle without importing the 19k-line executor or database.
 interface Channel {
@@ -257,7 +265,9 @@ export class NativeSshForegroundOwner {
             if (index + 1 >= args.length) throw new Error("Missing diagnostics argument");
             args[index + 1] = input.diagnosticsDirectory;
           } else args.push("--diagnostics-directory", input.diagnosticsDirectory);
-          const env = Object.entries(spec.environment).filter((entry): entry is [string, string] => typeof entry[1] === "string");
+          const env = Object.entries(spec.environment)
+            .filter((entry): entry is [string, string] => typeof entry[1] === "string")
+            .filter(([key]) => !workerLease || !FACTORY_CONTROLLER_ENVIRONMENT_KEYS.has(key));
           for (const [key, value] of env) {
             if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || value.includes("\0")) throw new Error("Invalid native runner environment");
           }
