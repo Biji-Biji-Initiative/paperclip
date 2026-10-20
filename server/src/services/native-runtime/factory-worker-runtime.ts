@@ -33,11 +33,23 @@ export function assertFactoryWorkerCredentialBoundary(environment: NodeJS.Proces
   }
 }
 
-/** Controller bootstrap paths and proxy values never override the worker contract. */
+const FACTORY_RUN_ENV_KEYS = new Set([
+  "DO_NOT_TRACK", "PAPERCLIP_RUNNER_TRACE", "PAPERCLIP_PROVIDER_TRACE_PATH", "PAPERCLIP_WORKSPACE_CWD",
+  "PAPERCLIP_NATIVE_MCP_NAME", "PAPERCLIP_NATIVE_MCP_URL", "PAPERCLIP_NATIVE_MCP_TOKEN",
+]);
+const FACTORY_GITHUB_CREDENTIAL_KEYS = [
+  "GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "PAPERCLIP_GIT_TOKEN",
+  "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+];
+
+/** Only run controls and the fixed worker contract cross the provider boundary. */
 export function buildFactoryWorkerEnvironment(environment: NodeJS.ProcessEnv | undefined): Record<string, string> {
   assertFactoryWorkerCredentialBoundary(environment, undefined);
+  if (FACTORY_GITHUB_CREDENTIAL_KEYS.some(key => environment?.[key] !== undefined && environment[key] !== "")) {
+    throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+  }
   const bootstrap = Object.fromEntries(Object.entries(environment ?? {})
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+    .filter((entry): entry is [string, string] => FACTORY_RUN_ENV_KEYS.has(entry[0]) && typeof entry[1] === "string"));
   return { ...bootstrap, ...FACTORY_LEASE_FIXED_ENV };
 }
 
