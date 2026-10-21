@@ -4,6 +4,7 @@ import { eq, sql } from "drizzle-orm";
 import { activityLog, authAccounts, authSessions, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, instanceUserRoles, principalPermissionGrants } from "@paperclipai/db";
 import { AUTHENTIK_ADMIN_CLAIM, AUTHENTIK_ADMIN_SCOPE, authentikAuthOptions, authentikConfiguration } from "../auth/authentik.js";
 import { createBetterAuthInstance } from "../auth/better-auth.js";
+import { accessService } from "../services/access.js";
 import type { Config } from "../config.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -506,4 +507,57 @@ if (!support.supported && process.env.PAPERCLIP_REQUIRE_EMBEDDED_POSTGRES_TESTS 
     expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
     expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, userId))).toHaveLength(1);
   });
+  it("removes only its managed admin grant on verified false while retaining the original staff session and company appointments", async () => {
+    const email = "managed-removal@mereka.my";
+    const callback = await login(email, true, adminClaim, adminAuth);
+    expect(callback.status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    const [role] = await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id));
+    expect(role.grantProvenance).toEqual({source: "authentik", issuer, subject: subjectFor(email)});
+    const memberships = await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id));
+    const grants = await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, user.id));
+    const cookie = callback.headers.getSetCookie().map(value => value.split(";")[0]).join("; ");
+    expect(await accessService(db).isInstanceAdmin(user.id)).toBe(true);
+    expect((await login(email, true, { [AUTHENTIK_ADMIN_CLAIM]: {v: 1, instance_admin: false} }, adminAuth)).status).toBe(302);
+    expect(await accessService(db).isInstanceAdmin(user.id)).toBe(false);
+    expect(await db.select().from(companyMemberships).where(eq(companyMemberships.principalId, user.id))).toEqual(memberships);
+    expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, user.id))).toEqual(grants);
+    const retained = await adminAuth.handler(new Request(origin + "/api/auth/get-session", {headers: {Cookie: cookie}}));
+    expect((await retained.json()).user.id).toBe(user.id);
+    expect(await accessService(db).isInstanceAdmin(user.id)).toBe(false);
+    expect((await db.select().from(activityLog).where(eq(activityLog.entityId, user.id))).filter(row => row.action === "authentik.instance_admin_removed")).toMatchObject([{details: {roleId: role.id, grantProvenance: role.grantProvenance}}]);
+  });
+
+  it("keeps managed authority on absent/malformed or unrequested claims rather than guessing a revocation", async () => {
+    const email = "managed-unknown@mereka.my";
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    for (const claim of [undefined, {v: 2, instance_admin: false}, {v: 1, instance_admin: "false"}]) {
+      expect((await login(email, true, {[AUTHENTIK_ADMIN_CLAIM]: claim}, adminAuth)).status).toBe(302);
+      expect(await accessService(db).isInstanceAdmin(user.id)).toBe(true);
+    }
+    expect((await login(email, true, {[AUTHENTIK_ADMIN_CLAIM]: {v: 1, instance_admin: false}}, auth)).status).toBe(302);
+    expect(await accessService(db).isInstanceAdmin(user.id)).toBe(true);
+  });
+
+  it("preserves an explicit native local appointment made after the directory grant", async () => {
+    const email = "managed-local-appointment@mereka.my";
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    const local = await accessService(db).promoteInstanceAdmin(user.id);
+    expect(local.grantProvenance).toEqual({source: "local"});
+    expect((await login(email, true, {[AUTHENTIK_ADMIN_CLAIM]: {v: 1, instance_admin: false}}, adminAuth)).status).toBe(302);
+    expect(await db.select().from(instanceUserRoles).where(eq(instanceUserRoles.userId, user.id))).toEqual([local]);
+    expect(await accessService(db).isInstanceAdmin(user.id)).toBe(true);
+  });
+
+  it("preserves a derived grant whose issuer/subject provenance does not match this exchange", async () => {
+    const email = "managed-other-authority@mereka.my";
+    expect((await login(email, true, adminClaim, adminAuth)).status).toBe(302);
+    const [user] = await db.select().from(authUsers).where(eq(authUsers.email, email));
+    await db.update(instanceUserRoles).set({grantProvenance: {source: "authentik", issuer: "https://other.fixture/", subject: "other"}}).where(eq(instanceUserRoles.userId, user.id));
+    expect((await login(email, true, {[AUTHENTIK_ADMIN_CLAIM]: {v: 1, instance_admin: false}}, adminAuth)).status).toBe(302);
+    expect(await accessService(db).isInstanceAdmin(user.id)).toBe(true);
+  });
+
 });

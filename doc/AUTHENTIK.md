@@ -16,7 +16,7 @@ Set these four values together through the owning secret projection:
 
 The auth public base URL must be an explicit canonical HTTPS origin. Partial
 configuration stops startup. With no configuration, existing authentication
-behavior remains. No new database schema is required beyond the base release.
+behavior remains. Admin provenance adds migration0306; run it through the owning deployment recovery procedure before adopting the changed image.
 
 ## Factory provider contract
 
@@ -79,14 +79,25 @@ refuses the callback; the entire role/membership/grant/audit transaction rolls
 back. Repeated and concurrent callbacks for the same bound user are idempotent.
 Native instance admin does not itself bypass company membership.
 
-This projection is additive. False or absent claims never demote existing roles,
-including manual founder or Miranda grants. Central admin removal requires
-explicit native operator reconciliation until the application has a supported
-managed-grant provenance contract. No bidirectional role synchronization or
-immediate central session revocation is claimed. To stop projection and additional
-scope requests, set the option to `false` and remove the admin company list
-together; partial configuration fails startup. This does not revoke previously
-granted roles. Preserve founder access during any explicit reconciliation.
+Native instance-admin rows now carry `grant_provenance`. Migration0306 adds one
+JSONB column: pre-existing rows remain `unattributed`, not silently classified.
+New verified directory grants record `source=authentik`, exact issuer and subject.
+An explicit local promotion records `source=local` and takes local ownership of
+an existing managed row. Callback and local promotion serialize on the user row.
+
+With the dedicated scope enabled, a fresh verified version1 explicit boolean
+false removes only a matching directory-owned instance-admin grant and records
+the removal transactionally. Missing/malformed/unrequested claims do not remove
+authority. Local and unattributed grants, memberships, individual permissions
+and original staff sessions remain. Per-request native admin lookup observes
+role removal; no asynchronous directory watcher or faster IdP offboarding bound
+is claimed. Existing unattributed rows require a separately reviewed native
+inventory and operator provenance decision, never an email-based backfill.
+
+Migrate before adopting this server image. Preserve the additive column during
+rollback; revert the matching application image/config, never drop role/history
+rows. Deployment must bind the actual admin-claim flag and signed scope to its
+native grant inventory; the compose default is not runtime evidence.
 
 New staff—including `miranda@mereka.my`—use **Continue with Staff SSO**. Authentik
 owns Google/MFA/passkey choices and staff admission. Password sign-in is disabled

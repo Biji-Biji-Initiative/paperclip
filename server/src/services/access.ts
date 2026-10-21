@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  authUsers,
   companyMemberships,
   companySecretBindings,
   companySecrets,
@@ -8,6 +9,7 @@ import {
   connectionGrantMembers,
   connectionGrants,
   instanceUserRoles,
+  type InstanceAdminGrantProvenance,
   issues,
   principalPermissionGrants,
   toolAccessAuditEvents,
@@ -737,21 +739,33 @@ export function accessService(db: Db) {
     });
   }
 
-  async function promoteInstanceAdmin(userId: string) {
-    const existing = await db
-      .select()
-      .from(instanceUserRoles)
-      .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
-      .then((rows) => rows[0] ?? null);
-    if (existing) return existing;
-    return db
-      .insert(instanceUserRoles)
-      .values({
-        userId,
-        role: "instance_admin",
-      })
-      .returning()
-      .then((rows) => rows[0]);
+  async function promoteInstanceAdmin(userId: string, grantProvenance: InstanceAdminGrantProvenance = { source: "local" }) {
+    return db.transaction(async (tx) => {
+      await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).for("update");
+      const existing = await tx
+        .select()
+        .from(instanceUserRoles)
+        .where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin")))
+        .then((rows) => rows[0] ?? null);
+      if (existing) {
+        // An explicit local appointment supersedes directory-derived ownership.
+        // A fresh directory claim can never take ownership of an existing local row.
+        if (grantProvenance.source === "local" && existing.grantProvenance?.source !== "local") {
+          return tx.update(instanceUserRoles).set({ grantProvenance, updatedAt: new Date() })
+            .where(eq(instanceUserRoles.id, existing.id)).returning().then((rows) => rows[0]);
+        }
+        return existing;
+      }
+      return tx
+        .insert(instanceUserRoles)
+        .values({
+          userId,
+          role: "instance_admin",
+          grantProvenance,
+        })
+        .returning()
+        .then((rows) => rows[0]);
+    });
   }
 
   async function demoteInstanceAdmin(userId: string) {

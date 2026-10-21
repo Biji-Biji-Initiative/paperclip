@@ -1,0 +1,1 @@
+ALTER TABLE "instance_user_roles" ADD COLUMN "grant_provenance" jsonb DEFAULT '{"source":"unattributed"}'::jsonb NOT NULL;

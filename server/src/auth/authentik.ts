@@ -2,7 +2,7 @@ import type { BetterAuthOptions } from "better-auth";
 import { APIError, createAuthMiddleware } from "better-auth/api";
 import { genericOAuth } from "better-auth/plugins";
 import { and, eq } from "drizzle-orm";
-import { activityLog, authAccounts, authUsers, companies, companyMemberships, principalPermissionGrants, type Db } from "@paperclipai/db";
+import { activityLog, authAccounts, authUsers, companies, companyMemberships, instanceUserRoles, principalPermissionGrants, type Db } from "@paperclipai/db";
 import { accessService } from "../services/access.js";
 
 const KEYS = ["PAPERCLIP_AUTHENTIK_ISSUER", "PAPERCLIP_AUTHENTIK_CLIENT_ID", "PAPERCLIP_AUTHENTIK_CLIENT_SECRET", "PAPERCLIP_AUTHENTIK_COMPANY_ID"] as const;
@@ -99,7 +99,7 @@ export async function joinAuthentikCompany(db: Db, companyId: string, userId: st
 }
 
 /** Called only with the single-use receipt of a verified provider exchange. */
-async function projectAuthentikAdmin(db: Db, companyIds: string[], auditCompanyId: string, userId: string, email: string) {
+async function projectAuthentikAdmin(db: Db, companyIds: string[], auditCompanyId: string, userId: string, email: string, issuer: string, subject: string) {
   await db.transaction(async (tx) => {
     // Serialize callbacks for this existing user before testing/inserting its native role.
     await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).for("update");
@@ -108,11 +108,29 @@ async function projectAuthentikAdmin(db: Db, companyIds: string[], auditCompanyI
     for (const companyId of companyIds) await joinAuthentikCompany(txDb, companyId, userId, email);
     const access = accessService(txDb);
     if (await access.isInstanceAdmin(userId)) return;
-    const role = await access.promoteInstanceAdmin(userId);
+    const role = await access.promoteInstanceAdmin(userId, { source: "authentik", issuer, subject });
     await tx.insert(activityLog).values({
       companyId: auditCompanyId, actorType: "system", actorId: "authentik", action: "authentik.instance_admin_granted",
       entityType: "user", entityId: userId, responsibleUserId: userId,
       details: { roleId: role.id, claimVersion: 1, role: "instance_admin" },
+    });
+  });
+}
+
+/** Remove only an explicitly managed grant for this verified bound issuer/subject.
+ * Unattributed historical rows, local appointments and company grants are retained.
+ */
+async function removeAuthentikAdmin(db: Db, auditCompanyId: string, userId: string, issuer: string, subject: string) {
+  await db.transaction(async (tx) => {
+    await tx.select({ id: authUsers.id }).from(authUsers).where(eq(authUsers.id, userId)).for("update");
+    const [role] = await tx.select().from(instanceUserRoles).where(and(eq(instanceUserRoles.userId, userId), eq(instanceUserRoles.role, "instance_admin"))).for("update");
+    const origin = role?.grantProvenance;
+    if (origin?.source !== "authentik" || origin.issuer !== issuer || origin.subject !== subject) return;
+    await tx.delete(instanceUserRoles).where(eq(instanceUserRoles.id, role.id));
+    await tx.insert(activityLog).values({
+      companyId: auditCompanyId, actorType: "system", actorId: "authentik", action: "authentik.instance_admin_removed",
+      entityType: "user", entityId: userId, responsibleUserId: userId,
+      details: { roleId: role.id, claimVersion: 1, role: "instance_admin", grantProvenance: origin },
     });
   });
 }
@@ -126,7 +144,7 @@ export function authentikAuthOptions(db: Db, publicUrl: string | undefined, env:
   // Better Auth passes the same request-scoped endpoint context to identity
   // validation and DB hooks. This receipt cannot be supplied by the browser or
   // reused across requests; membership is granted before the session is issued.
-  const verifiedContexts = new WeakMap<object, { email: string; userId?: string; subject: string; instanceAdmin: boolean }>();
+  const verifiedContexts = new WeakMap<object, { email: string; userId?: string; subject: string; instanceAdmin: boolean | null }>();
   return {
     hooks: { before: createAuthMiddleware(async (context) => {
       if (context.path === "/sign-in/email" || context.path === "/sign-up/email") {
@@ -160,7 +178,8 @@ export function authentikAuthOptions(db: Db, publicUrl: string | undefined, env:
         if (typeof subject !== "string" || !subject) return { error: "staff_subject_missing" };
         const claim = source.oauth.profile?.[AUTHENTIK_ADMIN_CLAIM];
         const instanceAdmin = config.adminClaimEnabled && typeof claim === "object" && claim !== null &&
-          "v" in claim && claim.v === 1 && "instance_admin" in claim && claim.instance_admin === true;
+          "v" in claim && claim.v === 1 && "instance_admin" in claim && typeof claim.instance_admin === "boolean"
+          ? claim.instance_admin : null;
         verifiedContexts.set(context, { email: user.email, userId: user.id, subject, instanceAdmin });
       },
     },
@@ -181,10 +200,15 @@ export function authentikAuthOptions(db: Db, publicUrl: string | undefined, env:
           ));
           if (!account) throw new APIError("FORBIDDEN", { message: "Staff account binding is required" });
           if (receipt.instanceAdmin) {
-            await projectAuthentikAdmin(db, config.adminCompanyIds, config.companyId, session.userId, receipt.email);
+            await projectAuthentikAdmin(db, config.adminCompanyIds, config.companyId, session.userId, receipt.email, config.issuer, receipt.subject);
           } else {
-            // False/missing claims never demote a manual role or revive disabled access.
-            await joinAuthentikCompany(db, config.companyId, session.userId, receipt.email);
+            // Missing/malformed/disabled scope claims cannot remove grants. Explicit false
+            // removes only this directory-owned native role after membership admission.
+            await db.transaction(async (tx) => {
+              const txDb = tx as unknown as Db;
+              await joinAuthentikCompany(txDb, config.companyId, session.userId, receipt.email);
+              if (receipt.instanceAdmin === false) await removeAuthentikAdmin(txDb, config.companyId, session.userId, config.issuer, receipt.subject);
+            });
           }
         }
       } } },
