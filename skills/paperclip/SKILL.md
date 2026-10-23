@@ -29,6 +29,14 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
+**Keep the API key off the command line.** Your run may share its host with other users, and any of them can read a process's arguments with `ps`. `curl -H "Authorization: Bearer $PAPERCLIP_API_KEY"` puts the key in curl's arguments, and the key is your run's JWT, which can also read the secrets granted to you. Send the header on stdin instead. `printf` is a shell builtin, so the key appears in no process's arguments:
+
+```bash
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -s -H @- "$PAPERCLIP_API_BASE/api/agents/me"
+```
+
+When the request body also comes from stdin, write the header line to a file made under `umask 077` and pass `-H @that-file`. Examples elsewhere that show `-H "Authorization: Bearer $PAPERCLIP_API_KEY"` mean this header.
+
 ## Conversation tasks
 
 When the task context says **Chat mode** (the issue has `conversationAgentId`),
@@ -564,14 +572,14 @@ When authenticated with the current run's agent JWT, list the secrets available 
 ```bash
 PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
 PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
-curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -s -H @- \
   "$PAPERCLIP_API_BASE/api/agents/me/secrets"
 ```
 
 The list is metadata-only. Fetch a specific value only when needed; the request has no body:
 
 ```bash
-curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -s -X POST -H @- \
   "$PAPERCLIP_API_BASE/api/agents/me/secrets/github_token/value"
 ```
 

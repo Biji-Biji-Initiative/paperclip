@@ -658,11 +658,24 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
   remoteCwd: string;
   timeoutMs?: number | null;
   shellCommand?: "bash" | "sh" | null;
+  // When set, an empty `listJsonFiles` keeps re-checking inside the one remote
+  // exec, every 0.2s for up to this long, and returns as soon as a request file
+  // appears. Unset keeps one listing per exec. Set it where an exec is expensive:
+  // over SSH each exec is a new login, and the 100ms poll loop made the Factory
+  // open ~2.8 logins/s on its worker host (2026-10-23), each paying sshd, PAM and
+  // login-profile cost. The wait stays under half the control-command deadline.
+  listWaitMs?: number | null;
 }): SandboxCallbackBridgeQueueClient {
   const timeoutMs = normalizeTimeoutMs(input.timeoutMs, DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS);
   const shellCommand = preferredShellForSandbox(input.shellCommand);
   const runChecked = async (action: string, script: string) =>
     requireSuccessfulResult(action, await runShell(input.runner, input.remoteCwd, script, timeoutMs, shellCommand));
+  const listWaitSeconds = typeof input.listWaitMs === "number" && Number.isFinite(input.listWaitMs)
+    ? Math.max(0, Math.min(
+        Math.floor(input.listWaitMs / 1000),
+        Math.floor(Math.min(timeoutMs, MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS) / 2000),
+      ))
+    : 0;
 
   return {
     makeDir: async (remotePath) => {
@@ -676,17 +689,35 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       await runChecked(`mkdir ${remotePaths.join(" ")}`, `mkdir -p ${quoted.join(" ")}`);
     },
     listJsonFiles: async (remotePath) => {
+      const listing = [
+        `if [ -d ${shellQuote(remotePath)} ]; then`,
+        `  for file in ${shellQuote(remotePath)}/*.json; do`,
+        `    [ -f "$file" ] || continue`,
+        "    basename \"$file\"",
+        ...(listWaitSeconds > 0 ? ["    found=1"] : []),
+        "  done",
+        "fi",
+      ];
+      // The deadline uses `date +%s`; a shell without it lists once, as before.
+      const script = listWaitSeconds > 0
+        ? [
+            "found=0",
+            "start=$(date +%s 2>/dev/null) || start=",
+            `case "$start" in ''|*[!0-9]*) deadline=0 ;; *) deadline=$((start + ${listWaitSeconds})) ;; esac`,
+            "while :; do",
+            ...listing.map((line) => `  ${line}`),
+            "  [ \"$found\" = 1 ] && break",
+            "  now=$(date +%s 2>/dev/null) || now=",
+            "  case \"$now\" in ''|*[!0-9]*) break ;; esac",
+            "  [ \"$now\" -lt \"$deadline\" ] || break",
+            "  sleep 0.2 2>/dev/null || sleep 1",
+            "done",
+          ]
+        : listing;
       const result = await runShell(
         input.runner,
         input.remoteCwd,
-        [
-          `if [ -d ${shellQuote(remotePath)} ]; then`,
-          `  for file in ${shellQuote(remotePath)}/*.json; do`,
-          `    [ -f "$file" ] || continue`,
-          "    basename \"$file\"",
-          "  done",
-          "fi",
-        ].join("\n"),
+        script.join("\n"),
         timeoutMs,
         shellCommand,
       );

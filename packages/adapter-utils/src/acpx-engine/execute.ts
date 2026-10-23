@@ -2976,13 +2976,14 @@ function renderApiAccessNote(env: Record<string, string>): string {
     "Use terminal commands with curl to make Paperclip API requests.",
     "Normalize the base URL before adding API paths:",
     `  PAPERCLIP_API_BASE="\${PAPERCLIP_API_URL%/}"; PAPERCLIP_API_BASE="\${PAPERCLIP_API_BASE%/api}"`,
+    "Send the Authorization header on stdin (printf is a shell builtin), so the key never shows in a process's arguments, which other users on the host can read with ps.",
     "GET example:",
-    `  curl -s -H "Authorization: Bearer $PAPERCLIP_API_KEY" "$PAPERCLIP_API_BASE/api/agents/me"`,
+    `  printf 'Authorization: Bearer %s\\n' "$PAPERCLIP_API_KEY" | curl -s -H @- "$PAPERCLIP_API_BASE/api/agents/me"`,
   ];
   if (env.PAPERCLIP_TASK_ID) {
     lines.push(
       "Scoped issue comment example:",
-      `  curl -s -X POST -H "Authorization: Bearer $PAPERCLIP_API_KEY" -H "Content-Type: application/json" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"body":"Status update from agent."}' "$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID/comments"`,
+      `  printf 'Authorization: Bearer %s\\n' "$PAPERCLIP_API_KEY" | curl -s -X POST -H @- -H "Content-Type: application/json" -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" -d '{"body":"Status update from agent."}' "$PAPERCLIP_API_BASE/api/issues/$PAPERCLIP_TASK_ID/comments"`,
     );
   } else {
     lines.push("Use a real issue id from the current context before making issue write requests.");

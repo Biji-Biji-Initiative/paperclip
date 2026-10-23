@@ -4873,6 +4873,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       remoteCwd: target.remoteCwd,
       timeoutMs: bridgeTimeoutMs,
       shellCommand,
+      // Over SSH every poll is a new login, so an idle request queue waits on
+      // the remote side (4s, under the worker's 10s per-iteration timeout)
+      // instead of logging in every 100ms. A request still returns within 0.2s.
+      listWaitMs: target.transport === "ssh" ? 4_000 : null,
     });
     // `startSandboxCallbackBridgeWorker` keeps its awaited queue-directory
     // setup on the active `bridge.paperclip` step, and runs each request under

@@ -1562,6 +1562,61 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("lists once per exec unless listWaitMs is set, and caps the wait at half the control deadline", async () => {
+    const scripts: string[] = [];
+    const runner = {
+      execute: vi.fn(async (input: { args?: string[] }): Promise<RunProcessResult> => {
+        scripts.push(input.args?.[1] ?? "");
+        return {
+          exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null,
+          startedAt: new Date().toISOString(),
+        };
+      }),
+    };
+    await createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: "/workspace" })
+      .listJsonFiles("/workspace/requests");
+    await createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: "/workspace", listWaitMs: 4_000 })
+      .listJsonFiles("/workspace/requests");
+    await createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner, remoteCwd: "/workspace", timeoutMs: 4_000, listWaitMs: 60_000,
+    }).listJsonFiles("/workspace/requests");
+    expect(scripts[0]).not.toContain("sleep");
+    expect(scripts[0]).toContain("for file in '/workspace/requests'/*.json; do");
+    expect(scripts[1]).toContain("deadline=$((start + 4))");
+    expect(scripts[1]).toContain("sleep 0.2");
+    expect(scripts[2]).toContain("deadline=$((start + 2))");
+  });
+
+  it("returns a request that appears during the remote wait, and an empty listing at the deadline", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-list-wait-"));
+    cleanupDirs.push(rootDir);
+    const requestsDir = path.join(rootDir, "requests");
+    await mkdir(requestsDir);
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner: createExecRunner(), remoteCwd: rootDir, listWaitMs: 2_000,
+    });
+
+    let startedAt = Date.now();
+    expect(await client.listJsonFiles(requestsDir)).toEqual([]);
+    const emptyMs = Date.now() - startedAt;
+    expect(emptyMs).toBeGreaterThanOrEqual(900);
+    expect(emptyMs).toBeLessThan(4_000);
+
+    startedAt = Date.now();
+    const arrival = new Promise<void>((resolve) => setTimeout(() => {
+      void writeFile(path.join(requestsDir, "000000000001.json"), "{}").then(() => resolve());
+    }, 300));
+    const listed = await client.listJsonFiles(requestsDir);
+    await arrival;
+    expect(listed).toEqual(["000000000001.json"]);
+    expect(Date.now() - startedAt).toBeLessThan(1_500);
+
+    startedAt = Date.now();
+    expect(await client.listJsonFiles(requestsDir)).toEqual(["000000000001.json"]);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(await client.listJsonFiles(path.join(rootDir, "missing"))).toEqual([]);
+  });
+
   it("abandons a timed-out upload without replaying it or continuing after a late response", async () => {
     vi.useFakeTimers();
     try {
