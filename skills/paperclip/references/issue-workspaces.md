@@ -7,7 +7,7 @@ Use this reference when an issue has an isolated execution workspace and you nee
 Start from the issue, not from memory:
 
 ```sh
-curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -H @- \
   "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/heartbeat-context"
 ```
 
@@ -26,24 +26,24 @@ Prefer Paperclip-managed runtime service controls over manual `pnpm dev &` or ad
 
 ```sh
 # Start all configured services; waits for configured readiness checks.
-curl -sS -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   "$PAPERCLIP_API_URL/api/execution-workspaces/<workspace-id>/runtime-services/start" \
   -d '{}'
 
 # Restart all configured services.
-curl -sS -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   "$PAPERCLIP_API_URL/api/execution-workspaces/<workspace-id>/runtime-services/restart" \
   -d '{}'
 
 # Stop all running services.
-curl -sS -X POST \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   "$PAPERCLIP_API_URL/api/execution-workspaces/<workspace-id>/runtime-services/stop" \

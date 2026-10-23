@@ -123,18 +123,18 @@ request_json() {
   response_file="$(mktemp)"
   if [[ -n "$body" ]]; then
     status_code="$(
-      curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
+      printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
         "$url" \
-        -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+        -H @- \
         -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
         -H 'Content-Type: application/json' \
         --data-binary "$body"
     )"
   else
     status_code="$(
-      curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
+      printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X "$method" -w '%{http_code}' -o "$response_file" \
         "$url" \
-        -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+        -H @- \
         -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID"
     )"
   fi
@@ -165,9 +165,9 @@ upload_file() {
   escaped_path="${escaped_path//\"/\\\"}"
   response_file="$(mktemp)"
   status_code="$(
-    curl -sS -X POST -w '%{http_code}' -o "$response_file" \
+    printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST -w '%{http_code}' -o "$response_file" \
       "$url" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+      -H @- \
       -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
       -F "file=@\"${escaped_path}\";type=${content_type}"
   )" || curl_status=$?

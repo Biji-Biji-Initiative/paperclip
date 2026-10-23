@@ -152,9 +152,9 @@ bash skills/paperclip/scripts/paperclip-upload-artifact.sh render.bin \
 If the helper is unavailable, use the same API shape:
 
 ```sh
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -F 'file=@"dist/demo.mp4";type=video/mp4'
 ```
@@ -162,9 +162,9 @@ curl -sS -X POST \
 Then create a work product when the uploaded file is the deliverable:
 
 ```sh
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/work-products" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   --data-binary @artifact-work-product.json

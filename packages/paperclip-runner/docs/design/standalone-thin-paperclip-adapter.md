@@ -1054,8 +1054,8 @@ pnpm --filter @paperclipai/paperclip-runner trace:standalone -- \
 
 PAPERCLIP_API_BASE="${PAPERCLIP_API_URL%/}"
 PAPERCLIP_API_BASE="${PAPERCLIP_API_BASE%/api}"
-curl -fsS \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -fsS \
+  -H @- \
   "$PAPERCLIP_API_BASE/api/heartbeat-runs/$PAPERCLIP_RUN_ID/events?after=0&limit=200" \
   | jq '[.[] | select(.sourceEventId != null)] | {count: length, events: map({sourceSeq, sourceEventId, eventType})}'
 ```

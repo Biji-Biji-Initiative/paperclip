@@ -35,7 +35,7 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -s -H @- "$PAPERCLIP_API_BASE/api/agents/me"
 ```
 
-When the request body also comes from stdin, write the header line to a file made under `umask 077` and pass `-H @that-file`. Examples elsewhere that show `-H "Authorization: Bearer $PAPERCLIP_API_KEY"` mean this header.
+When the request body also comes from stdin, give the header its own file descriptor instead: `-H @<(printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY")` (bash and zsh). Every example in this skill and its references uses one of these two forms.
 
 ## Conversation tasks
 

@@ -167,8 +167,8 @@ When the behavior you care about is a branch-only route, hit it directly against
 
 ```bash
 # Same base URL you installed into; expect JSON, not "API route not found".
-curl -s "http://127.0.0.1:3120/api/companies/<companyId>/<branch-route>" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" | head
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -s "http://127.0.0.1:3120/api/companies/<companyId>/<branch-route>" \
+  -H @- | head
 ```
 
 If that returns the route's JSON, the branch runtime is serving the route and the plugin is exercising real published behavior. If it returns `API route not found`, the service on that port is not running your branch code — restart the branch server (step 1) and re-check `plugin target` before continuing.

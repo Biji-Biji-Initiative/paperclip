@@ -52,9 +52,9 @@ workspace root; do not use host-local absolute paths in `resourceRef`.
 Create the work product with:
 
 ```bash
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/work-products" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   --data-binary @workspace-file-work-product.json
@@ -63,9 +63,9 @@ curl -sS -X POST \
 If the helper is unavailable, use the Paperclip API directly:
 
 ```bash
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues/$PAPERCLIP_TASK_ID/attachments" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -F 'file=@"path/to/output.webm";type=video/webm'
 ```
@@ -73,9 +73,9 @@ curl -sS -X POST \
 Then create a work product when the file is the deliverable. The server canonicalizes attachment-backed artifact metadata from the `attachmentId`:
 
 ```bash
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/issues/$PAPERCLIP_TASK_ID/work-products" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   --data-binary '{

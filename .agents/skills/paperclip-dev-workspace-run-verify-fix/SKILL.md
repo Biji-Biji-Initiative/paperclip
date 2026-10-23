@@ -114,18 +114,18 @@ Use the runtime-service endpoints on the main control plane. Include
 `X-Paperclip-Run-Id` so the mutation is associated with the current heartbeat.
 
 ```sh
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/execution-workspaces/$EXECUTION_WORKSPACE_ID/runtime-services/stop" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   --data-binary '{"workspaceCommandId":"service:paperclip-dev"}'
 ```
 
 ```sh
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/execution-workspaces/$EXECUTION_WORKSPACE_ID/runtime-services/start" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   --data-binary '{"workspaceCommandId":"service:paperclip-dev"}'
@@ -179,9 +179,9 @@ If the port owner is a sibling workspace's process (port squat):
    service and re-run the identity check:
 
 ```sh
-curl -sS -X POST \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X POST \
   "$PAPERCLIP_API_URL/api/execution-workspaces/$EXECUTION_WORKSPACE_ID/runtime-services/restart" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  -H @- \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
   -H "Content-Type: application/json" \
   --data-binary '{"workspaceCommandId":"service:paperclip-dev"}'
@@ -256,9 +256,9 @@ Read the execution workspace from the main API and inspect the runtime service
 record.
 
 ```sh
-curl -sS \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS \
   "$PAPERCLIP_API_URL/api/execution-workspaces/$EXECUTION_WORKSPACE_ID" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" | jq
+  -H @- | jq
 ```
 
 The target service should show:
@@ -278,9 +278,9 @@ The cloned Paperclip app must also know about the service. Query the same
 execution workspace through the served app when agent auth is available there:
 
 ```sh
-curl -sS \
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS \
   "$SERVICE_URL/api/execution-workspaces/$EXECUTION_WORKSPACE_ID" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" | jq
+  -H @- | jq
 ```
 
 The served app should agree that the service is `running` / `healthy` at the
@@ -298,10 +298,10 @@ Minimum API checks:
 
 ```sh
 curl -sS "$SERVICE_URL/api/health" | jq '.status, .bootstrapStatus'
-curl -sS "$SERVICE_URL/api/companies" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" | jq
-curl -sS "$SERVICE_URL/api/agents/me" \
-  -H "Authorization: Bearer $PAPERCLIP_API_KEY" | jq
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS "$SERVICE_URL/api/companies" \
+  -H @- | jq
+printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS "$SERVICE_URL/api/agents/me" \
+  -H @- | jq
 ```
 
 Then verify at least one expected cloned product record through the API, such

@@ -31,14 +31,14 @@ api_json() {
   local path="$2"
   local body="${3:-}"
   if [[ -n "$body" ]]; then
-    curl -sS -X "$method" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+    printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X "$method" \
+      -H @- \
       -H "Content-Type: application/json" \
       --data "$body" \
       "${PAPERCLIP_API_URL%/}$path"
   else
-    curl -sS -X "$method" \
-      -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+    printf 'Authorization: Bearer %s\n' "$PAPERCLIP_API_KEY" | curl -sS -X "$method" \
+      -H @- \
       "${PAPERCLIP_API_URL%/}$path"
   fi
 }
