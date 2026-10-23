@@ -31,8 +31,10 @@ services:
   server:
     # These bounds apply to the control plane and its native child processes.
     # Qualify one real run before increasing execution concurrency.
+    # 2 -> 4 CPUs (2026-10-23): with about 10 concurrent SSH-environment runs the
+    # control plane sat at 200% and callback-bridge requests timed out.
     mem_limit: 4g
-    cpus: 2
+    cpus: 4
     pids_limit: 512
     user: "1000:1000"
     cap_drop: [ALL]
