@@ -105,6 +105,7 @@ import { deferFactoryWorkerCapacity, factoryProviderAttempt, hasFactoryBusyRecei
 import { ensureFactoryRemoteRunnerDirectory, stageFactoryRemoteRunnerText, stageFactoryRemoteRunnerFile, stageFactoryRemoteRunnerDirectory } from "./factory-remote-staging.js";
 import { isFactoryWorkerBusyError } from "@paperclipai/adapter-utils/factory-worker-lease";
 import { assertFactoryWorkspaceStagingOwned, settleFactoryWorkspaceStaging } from "../factory-workspace-staging.js";
+import { FactoryWorkerPreparation, FactoryPublicPackMismatchError, FACTORY_PACK_MISMATCH_SCRIPT } from "./factory-worker-preparation.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import {
   resolvePaperclipRunnerTransport,
@@ -7399,7 +7400,8 @@ export async function executePaperclipNativeSession(input: {
     if (!input.useRunnerd || input.backend) throw new Error("factory_worker_native_backend_required");
     await authorizeFactoryWorker({ db: input.db, execution: input.execution,
       target: input.runnerExecutionTarget, beforeClaim: true });
-    input = { ...input, factoryWorkerAttempt: { runId: input.execution.binding.runId } };
+    input = { ...input, factoryWorkerAttempt: { runId: input.execution.binding.runId,
+      preparation: new FactoryWorkerPreparation(input.execution.binding.runId, input.runnerExecutionTarget.leaseId!) } };
   }
   const runId = input.execution.binding.runId;
   if (nativeSessionStartups.has(runId)) {
@@ -8759,7 +8761,10 @@ async function executePaperclipNativeSessionWithinScope(
       // with a retry or release the still-live runner's lease.
       throw new NativeControllerDetachedForRestartError();
     }
-    if (isFactoryWorkerTarget(input.runnerExecutionTarget)) {
+    const preparation = input.factoryWorkerAttempt?.preparation;
+    const knownPreAdmissionMismatch = isFactoryWorkerTarget(input.runnerExecutionTarget) &&
+      preparation?.canSettle(error, input.execution.binding.runId, input.runnerExecutionTarget.leaseId!) === true;
+    if (isFactoryWorkerTarget(input.runnerExecutionTarget) && !knownPreAdmissionMismatch) {
       await leaseRenewal.stop().catch(() => undefined);
       liveQuestions.close();
       activeNativeSessions.delete(input.execution.binding.runId);
@@ -8786,8 +8791,8 @@ async function executePaperclipNativeSessionWithinScope(
           // reflecting its exception. The existing ownership marker still wins.
         }
       }
-      // Every post-admission failure retains the original run. No automatic
-      // fresh environment lease can authorize replay of the worker run journal.
+      // Every other preparation/admission failure retains the original run.
+      // A fresh environment lease cannot authorize replay of the worker journal.
       await trace.finish("failed").catch(() => undefined);
       throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
     }
@@ -8940,7 +8945,7 @@ async function executePaperclipNativeSessionWithinScope(
       // transitions the run into "failed". Read after the transaction
       // commits, so a rolled-back write never reports a false failure.
       let terminalRunToReport: typeof heartbeatRuns.$inferSelect | null = null;
-      await input.db.transaction(async (tx) => {
+      const persistFailure = async (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => {
         await tx.execute(
           sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
         );
@@ -8968,6 +8973,8 @@ async function executePaperclipNativeSessionWithinScope(
             failureCode,
             failureDetail: {
               message,
+              ...(knownPreAdmissionMismatch && error instanceof FactoryPublicPackMismatchError
+                ? { publicArtifactFailure: error.diagnostic } : {}),
               originalFailureCode:
                 error instanceof NativeProviderTerminalFailure
                   ? error.providerCode
@@ -9192,7 +9199,21 @@ async function executePaperclipNativeSessionWithinScope(
           supersedeOnIdentityChange:
             recoveryProjection.supersedeOnIdentityChange,
         });
-      });
+      };
+      if (knownPreAdmissionMismatch && isFactoryWorkerTarget(input.runnerExecutionTarget)) {
+        try {
+          await settleFactoryWorkspaceStaging({ db: input.db, companyId: input.execution.binding.companyId,
+            runId: input.execution.binding.runId, leaseId: input.runnerExecutionTarget.leaseId!,
+            verifyQuiescence: async () => {
+              if (!preparation?.canSettle(error, input.execution.binding.runId, input.runnerExecutionTarget!.leaseId!))
+                throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+            }, settleFailureInTransaction: persistFailure });
+        } catch {
+          throw new NativeRunnerOwnershipUnverifiedError("ssh_foreground_ownership_unverified");
+        }
+      } else {
+        await input.db.transaction(persistFailure);
+      }
       if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport);
       await boundedExecutionCleanup(async () => {
         await stoppedLeaseRenewal;
@@ -10931,7 +10952,7 @@ async function createRunnerdBackendWithinSessionClaim(
   let recoveryPending = retainedTransition !== undefined;
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
   const remoteTarget = target.kind === "remote" ? target : null;
-  const remoteCommandRunner = remoteTarget
+  const baseRemoteCommandRunner = remoteTarget
     ? remoteTarget.transport === "ssh"
       ? createNativeSshCommandRunner({
           spec: remoteTarget.spec,
@@ -10940,6 +10961,11 @@ async function createRunnerdBackendWithinSessionClaim(
         })
       : remoteTarget.runner
     : null;
+  const preparation = input.factoryWorkerAttempt?.preparation;
+  const remoteCommandRunner = baseRemoteCommandRunner && isFactoryWorkerTarget(target) && preparation
+    ? { ...baseRemoteCommandRunner, execute: (command: Parameters<typeof baseRemoteCommandRunner.execute>[0]) =>
+        preparation.command(() => baseRemoteCommandRunner.execute(command)) }
+    : baseRemoteCommandRunner;
   if (remoteTarget && !remoteCommandRunner) {
     throw new Error(
       "runner_transport_ineligible: remote process runner is unavailable",
@@ -11262,7 +11288,7 @@ async function createRunnerdBackendWithinSessionClaim(
       "const actual=fs.readFileSync(path.join(root,'provider-pack.json'),'utf8').trim()",
       "const canonical=(v)=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}':JSON.stringify(v)",
       "const manifest=JSON.parse(actual)",
-      "if(canonical(manifest)!==expected)throw new Error('manifest mismatch')",
+      isFactoryWorkerTarget(remoteTarget) ? FACTORY_PACK_MISMATCH_SCRIPT : "if(canonical(manifest)!==expected)throw new Error('manifest mismatch')",
       "const hash=(p)=>'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(path.join(root,p))).digest('hex')",
       "const tree=(treeRoot)=>{const digest=crypto.createHash('sha256');const visit=(directory,prefix='')=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true}).sort((a,b)=>a.name.localeCompare(b.name))){const relative=prefix?prefix+'/'+entry.name:entry.name;const absolute=path.join(directory,entry.name);if(entry.isDirectory()){digest.update('directory\\0'+relative+'\\n');visit(absolute,relative)}else if(entry.isFile()){digest.update('file\\0'+relative+'\\0'+'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex')+'\\n')}else if(entry.isSymbolicLink()){digest.update('symlink\\0'+relative+'\\0'+fs.readlinkSync(absolute)+'\\n')}else throw new Error('unsupported dist entry '+relative)}};visit(treeRoot);return 'sha256:'+digest.digest('hex')}",
       "for(const name of ['nodeCommand','productionLock','opencodeCommand','opencodeExecutable','opencodeProxy','acpxSidecar','grokLauncher']){const artifact=manifest.payload.artifacts[name];if(hash(artifact.path)!==artifact.sha256)throw new Error(name+' digest mismatch')}",
@@ -11284,6 +11310,8 @@ async function createRunnerdBackendWithinSessionClaim(
       timeoutMs: 30_000,
     });
     if (verified.exitCode !== 0 || verified.timedOut) {
+      const mismatch = preparation?.mismatch(verified, canonicalJson(expectedProviderPackManifest));
+      if (mismatch) throw mismatch;
       throw new Error(
         `runner_remote_provider_artifact_incompatible: provider pack verification failed (${verified.stderr.trim().slice(-1_024)})`,
       );
@@ -12615,10 +12643,14 @@ async function createRunnerdBackendWithinSessionClaim(
               factoryLaunchAssetsStaged = false;
             },
           ...(isFactoryWorkerTarget(remoteTarget) ? {
-            createWorkerAdmission: () => createAuthorizedFactoryWorkerAdmission({ db: input.db,
+            createWorkerAdmission: () => {
+              preparation?.markAdmissionAttempted();
+              return createAuthorizedFactoryWorkerAdmission({ db: input.db,
               execution: input.execution, target: remoteTarget, sessionId: nativeSessionKey(input.execution),
               runnerInstanceId: effectiveRunnerInstanceId, durableEnvironmentLeaseId: input.durableEnvironmentLeaseId,
-              timeoutMs: input.turnTimeoutMs }),
+              timeoutMs: input.turnTimeoutMs });
+            },
+            onForegroundLaunchAttempted: () => preparation?.markForegroundAttempted(),
             onVerifiedBusy: (error: Error) => {
               if (!input.factoryWorkerAttempt || input.factoryWorkerAttempt.runId !== input.execution.binding.runId ||
                   !isFactoryWorkerBusyError(error)) throw new Error("factory_worker_capacity_authority_missing");

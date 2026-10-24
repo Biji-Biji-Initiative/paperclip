@@ -21,7 +21,8 @@ import {
   truncate,
   writeFile,
 } from "node:fs/promises";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { FactoryWorkerPreparation } from "./factory-worker-preparation.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11878,6 +11879,133 @@ describe("runnerd provider runtime wiring", () => {
         runnerProcessLauncher: expect.any(Function),
       }),
     );
+  });
+
+  it.each(["completed", "timeout", "255", "null", "forged", "post-admission", "foreground", "release-failed"] as const)(
+    "settles only a completed pre-admission mismatch through the full Factory prepare path (%s)", async scenario => {
+    const stable = (v: unknown): string => v && typeof v === "object" && !Array.isArray(v)
+      ? "{" + Object.keys(v).sort().map(k => JSON.stringify(k) + ":" + stable((v as Record<string, unknown>)[k])).join(",") + "}"
+      : Array.isArray(v) ? "[" + v.map(stable).join(",") + "]" : JSON.stringify(v);
+    const hash = (v: string) => "sha256:" + createHash("sha256").update(v).digest("hex");
+    const packRoot = join(isolatedStateDirectory, "controller-pack");
+    const assets = {
+      nodeCommand: "node_modules/node/bin/node", productionLock: "pnpm-lock.yaml",
+      opencodeCommand: "node_modules/.bin/opencode", opencodeExecutable: "node_modules/opencode-ai/bin/opencode.exe",
+      opencodeProxy: "dist/cli/opencode-app-server-proxy.cjs", acpxSidecar: "dist/cli/acpx-runtime-sidecar.cjs",
+      grokLauncher: "dist/providers/grok/launcher.cjs",
+    };
+    const artifacts: Record<string, { path: string; sha256: string }> = {};
+    for (const [name, path] of Object.entries(assets)) {
+      const file = join(packRoot, path), body = "public fixture artifact " + name;
+      await mkdir(join(file, ".."), { recursive: true }); await writeFile(file, body);
+      artifacts[name] = { path, sha256: hash(body) };
+    }
+    const payload = {
+      pins: { nodeMinimum: "24.11.0", codex: "0.163.0", opencode: "1.18.34", acpx: "0.13.1", claudeAcp: "0.73.0", codexAcp: "1.6.2", grok: "1.0.13" },
+      target: { platform: "linux", architecture: "x64" }, runnerSourceRevision: "1".repeat(40),
+      distDigest: sha256DirectoryTree(join(packRoot, "dist")),
+      bridgeDigest: hash(artifacts.opencodeProxy.sha256 + "\n" + artifacts.acpxSidecar.sha256 + "\n" + sha256DirectoryTree(join(packRoot, "dist"))),
+      acpxProfileDigests: {
+        grok: "sha256:f0b698395a3704ed2ffaf84ea19bdb20c36c8a0a70b7c629c7b6ffe144e59e55",
+        claude: "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
+        codex: "sha256:c4538599d1ab767db5dff50934f13bb5ba313a59d9c4a83e993fac4617ea63d3",
+      }, artifacts,
+    };
+    const manifest = { schema: "paperclip-runner/remote-provider-pack/v1", digest: hash(stable(payload)), payload };
+    await writeFile(join(packRoot, "provider-pack.json"), stable(manifest));
+    expect(readRemoteProviderPackManifest(packRoot)).toEqual(manifest);
+    const workerPack = join(isolatedStateDirectory, "worker-pack"); await mkdir(workerPack);
+    const oldPayload = { ...payload, runnerSourceRevision: "2".repeat(40) };
+    await writeFile(join(workerPack, "provider-pack.json"), stable({ ...manifest, digest: hash(stable(oldPayload)), payload: oldPayload }));
+    const controllerBinary = join(isolatedStateDirectory, "fixture-runner"); await writeFile(controllerBinary, "public fixture runner");
+    const current = { ...execution, binding: { ...execution.binding, companyId: FACTORY_COMPANY_ID,
+      runId: randomUUID(), executionWorkspaceId: randomUUID() }, session: { ...execution.session, driverKind: "acpx_runtime",
+      normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null } },
+      provider: { kind: "acpx", agent: "claude", model: null, permissionMode: "approve-paperclip", profile: {
+        driverKind: "acpx_runtime", protocolVersion: 1, acpxVersion: "0.13.1", agent: "claude", agentProfileVersion: 1,
+        agentServerPackage: "@agentclientprotocol/claude-agent-acp", agentServerVersion: "0.73.0",
+        agentRuntimePackage: "@anthropic-ai/claude-agent-sdk", agentRuntimeVersion: "0.3.286",
+        commandDigest: payload.acpxProfileDigests.claude } } } as unknown as NativeExecutionInputV1;
+    const remoteCwd = `/workspace/${FACTORY_COMPANY_ID}/${current.binding.executionWorkspaceId}`;
+    const target: AdapterSshExecutionTarget = { kind: "remote", transport: "ssh", factoryWorkerPolicy: FACTORY_WORKER_POLICY,
+      environmentId: randomUUID(), leaseId: randomUUID(), remoteCwd,
+      spec: { host: "fixture.invalid", port: 2222, username: "node", remoteCwd, remoteWorkspacePath: remoteCwd,
+        privateKey: "fixture-only-not-a-key", knownHosts: "fixture-public-pin", strictHostKeyChecking: true } };
+    let verifierCalls = 0;
+    const fixtureWorkspace = join(isolatedStateDirectory, "worker-workspace");
+    await mkdir(fixtureWorkspace, { mode: 0o700 });
+    const execute = vi.fn(async (command: { command: string; args?: string[]; stdin?: string }) => {
+      if (command.command === "/usr/bin/python3") {
+        const args = [...command.args!], request = JSON.parse(args.at(-1)!);
+        expect(request.workspaceRoot).toBe(remoteCwd);
+        request.workspaceRoot = fixtureWorkspace;
+        args[args.length - 1] = JSON.stringify(request);
+        const child = spawnSync(command.command, args, { input: command.stdin, encoding: "utf8", timeout: 5000 });
+        expect(child.status).toBe(0);
+        return { exitCode: child.status, signal: child.signal, timedOut: Boolean(child.error), stdout: child.stdout, stderr: child.stderr };
+      }
+      if (command.args?.[0] === "--build-metadata") return { exitCode: 0, signal: null, timedOut: false, stdout: JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner",
+        binaryContractVersion: 2, durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["dial_wss"] }), stderr: "" };
+      if (command.args?.[0] === "-e" && command.command.includes("provider-pack")) {
+        verifierCalls++;
+        // Execute the actual complete verifier generated by prepareRemoteRunner,
+        // changing only the fixture mount path. No provider executable is run.
+        const child = spawnSync(process.execPath, ["-e", command.args[1], workerPack, command.args[3]], { encoding: "utf8", timeout: 5000 });
+        expect(child.status).toBe(78); expect(child.stderr).toBe("");
+        return { exitCode: scenario === "null" ? null : scenario === "255" ? 255 : child.status,
+          signal: child.signal, timedOut: scenario === "timeout", stdout: scenario === "forged" ? "manifest mismatch" : child.stdout,
+          stderr: child.stderr };
+      }
+      throw new Error("unexpected fixture preparation command");
+    });
+    const openDuplexChannel = vi.fn();
+    const runner = vi.spyOn(nativeSshRunner, "createNativeSshCommandRunner").mockReturnValue({ execute, openDuplexChannel } as never);
+    const authorize = vi.spyOn(factoryWorkerRuntime, "authorizeFactoryWorker").mockImplementation(vi.fn());
+    const admit = vi.spyOn(factoryWorkerRuntime, "createAuthorizedFactoryWorkerAdmission");
+    const staging = vi.spyOn(factoryStaging, "assertFactoryWorkspaceStagingOwned").mockResolvedValue(undefined);
+    const updateIssue = vi.fn(async () => ({ status: "blocked", statusVersion: 7 }));
+    const issueService = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: updateIssue } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    const settlement = vi.spyOn(factoryStaging, "settleFactoryWorkspaceStaging").mockImplementation(async input => {
+      await input.verifyQuiescence();
+      if (scenario === "release-failed") throw new Error("owned_staging_CAS_failed");
+      await input.db.transaction(async tx => { await input.settleFailureInTransaction?.(tx); });
+    });
+    const originalMismatch = FactoryWorkerPreparation.prototype.mismatch;
+    const phase = vi.spyOn(FactoryWorkerPreparation.prototype, "mismatch").mockImplementation(function (this: FactoryWorkerPreparation, result, expected) {
+      if (scenario === "post-admission") this.markAdmissionAttempted();
+      if (scenario === "foreground") this.markForegroundAttempted();
+      return originalMismatch.call(this, result, expected);
+    });
+    const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    state.createBackend.mockClear(); state.createTransport.mockClear(); state.upsertRecoveryAction.mockClear();
+    state.execute.mockReset().mockImplementationOnce(async () => {
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { controlPlaneRegistration: (v: unknown) => Promise<unknown> };
+      await options.controlPlaneRegistration({});
+      throw new Error("mismatch must prevent provider dispatch");
+    });
+    try {
+      const failure = await executePaperclipNativeSession({ db: leaseDb(current, {}, {}, updates), execution: current,
+        runnerInstanceId: "fixture-pre-admission", runnerExecutionTarget: target, useRunnerd: true,
+        runnerRemoteBinaryPath: controllerBinary, runnerRemoteProviderPackPath: packRoot,
+        runnerPublicUrl: "wss://factory.example.invalid" }).catch(error => error);
+      expect(verifierCalls, String(failure?.stack ?? failure) + "; backend=" + state.createBackend.mock.calls.length + "; execute=" + state.execute.mock.calls.length + "; remote=" + execute.mock.calls.map(([x]) => x.command + ':' + x.args?.[0]).join(',')).toBe(1);
+      expect(admit).not.toHaveBeenCalled(); expect(openDuplexChannel).not.toHaveBeenCalled();
+      if (scenario === "completed") {
+        expect(settlement, String(failure?.stack) + '; mismatch=' + JSON.stringify(phase.mock.results.map(x => x.value?.diagnostic))).toHaveBeenCalledOnce();
+        expect(failure.message, String(failure?.stack)).toContain("immutable provider-pack manifest mismatch");
+        expect(updates).toContainEqual({ table: heartbeatRuns, values: expect.objectContaining({ status: "failed", errorCode: "runner_remote_provider_artifact_incompatible" }) });
+        expect(updates).toContainEqual({ table: nativeRunFinalizations, values: expect.objectContaining({ phase: "terminal_failure", nextAttemptAt: null,
+          failureDetail: expect.objectContaining({ publicArtifactFailure: expect.objectContaining({ expectedPackDigest: manifest.digest }) }) }) });
+        expect(state.upsertRecoveryAction).toHaveBeenCalledWith(expect.objectContaining({ ownerType: "board", wakePolicy: null }));
+        expect(updateIssue).toHaveBeenCalledWith(current.binding.issueId, { status: "blocked" }, expect.anything());
+      } else {
+        expect(failure).toBeInstanceOf(NativeRunnerOwnershipUnverifiedError);
+        expect(updates.some(x => x.table === heartbeatRuns && x.values.status === "failed")).toBe(false);
+        expect(settlement).toHaveBeenCalledTimes(scenario === "release-failed" ? 1 : 0);
+      }
+    } finally { runner.mockRestore(); authorize.mockRestore(); admit.mockRestore(); staging.mockRestore(); issueService.mockRestore(); settlement.mockRestore(); phase.mockRestore(); }
   });
 
   it.each([

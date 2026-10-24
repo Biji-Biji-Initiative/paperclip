@@ -76,6 +76,30 @@ describe("Factory durable ownership before workspace preparation", () => {
     await expect(acquireFactoryWorkspaceStagingLease({ ...a, db: second })).rejects.toThrow("factory_workspace_staging_busy");
   });
 
+  it("commits a known pre-admission failure with staging release, and rolls back both on persistence failure", async () => {
+    const a = await fixture();
+    const lease = await acquireFactoryWorkspaceStagingLease(a);
+    const [before] = await first.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    await expect(settleFactoryWorkspaceStaging({ db: first, companyId, runId: a.runId, leaseId: lease.id,
+      verifyQuiescence: async () => {}, settleFailureInTransaction: async tx => {
+        await tx.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, a.runId));
+        throw new Error("failure_persistence_rejected");
+      } })).rejects.toThrow("failure_persistence_rejected");
+    const [held] = await first.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    const [running] = await first.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, a.runId));
+    expect(held).toEqual(before); expect(running.status).toBe("running");
+    await expect(assertFactoryWorkspaceStagingOwned({ db: first, companyId, runId: a.runId, leaseId: lease.id })).resolves.toBeUndefined();
+    await settleFactoryWorkspaceStaging({ db: first, companyId, runId: a.runId, leaseId: lease.id,
+      verifyQuiescence: async () => {}, settleFailureInTransaction: async tx => {
+        await tx.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, a.runId));
+      } });
+    const [released] = await first.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    const [failed] = await first.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, a.runId));
+    expect(released.metadata?.factoryWorkspaceStaging).toMatchObject({ state: "released" });
+    expect(failed.status).toBe("failed");
+    await expect(assertFactoryWorkspaceStagingOwned({ db: first, companyId, runId: a.runId, leaseId: lease.id })).rejects.toThrow();
+  });
+
   it("resolved legacy, wrong pre-admission issue, non-Paperclip agent and admitted native mismatch cannot stage", async () => {
     const a = await fixture(); let prepared = 0;
     const input = { ...a, prepareWorkspace: async () => { prepared++; return { remoteCwd: a.config.remoteWorkspacePath }; } };

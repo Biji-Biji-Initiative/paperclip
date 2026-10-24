@@ -228,13 +228,18 @@ export async function assertFactoryWorkspaceStagingOwned(input: Binding & { db: 
  */
 export async function settleFactoryWorkspaceStaging(input: Binding & {
   db: Db; verifyQuiescence: () => Promise<void>;
+  /** A proven pre-admission failure commits its normal failure writes with release. */
+  settleFailureInTransaction?: (tx: Parameters<Parameters<Db["transaction"]>[0]>[0]) => Promise<void>;
 }): Promise<void> {
   const controller = owners.get(input.db), owner = controller?.get(input.leaseId);
   if (!owner || owner.companyId !== input.companyId || owner.runId !== input.runId || owner.preparationPending) denied();
   try { await input.verifyQuiescence(); }
   catch { denied(); }
   await input.db.transaction(async tx => {
+    if (input.settleFailureInTransaction) await tx.execute(sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`);
     await tx.execute(sql`select pg_advisory_xact_lock(${advisoryKey(owner.scope)}::bigint)`);
+    // Failure settlement keeps the normal issue-before-run-before-lease order.
+    await input.settleFailureInTransaction?.(tx);
     const [row] = await tx.update(environmentLeases).set({
       metadata: sql`jsonb_set(${environmentLeases.metadata}, array[${MARKER}],
         (${environmentLeases.metadata}->${MARKER}) || ${JSON.stringify({ state: "released", releasedAt: new Date().toISOString() })}::jsonb)`,

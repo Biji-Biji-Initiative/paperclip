@@ -192,6 +192,7 @@ export class NativeSshForegroundOwner {
     createWorkerAdmission?: () => Promise<{ workerLease: FactoryWorkerLeaseDescriptor; providerAdmission?: FactoryProviderBinding;
       revalidateProviderAdmission?: () => Promise<void> }>;
     onVerifiedBusy?: (error: Error) => void;
+    onForegroundLaunchAttempted?: () => void;
     onDispatched?: () => void | Promise<void>;
   }): (spec: LaunchSpec) => ProcessHandle {
     if (!input.runner.openDuplexChannel) throw new Error("native_ssh_foreground_channel_required");
@@ -285,6 +286,7 @@ export class NativeSshForegroundOwner {
           }
           this.update("dispatched");
           dispatchAttempted = true;
+          input.onForegroundLaunchAttempted?.();
           const opening = input.runner.openDuplexChannel!({ command, signal: abort.signal,
             ...(workerLease ? {workerLease, environment: Object.fromEntries(env)} : {}),
             ...(providerAdmission ? {providerAdmission, revalidateProviderAdmission} : {}),

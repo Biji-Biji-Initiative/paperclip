@@ -11,9 +11,11 @@ import { randomUUID } from "node:crypto";
 import { validateFactoryOwnRunAuthorization, validateFactoryProviderBinding, type FactoryOwnRunAuthorization, type FactoryProviderBinding } from "@paperclipai/adapter-utils/factory-provider-admission";
 import { factoryExecutionProvider, isFactoryProviderEnrollment } from "./factory-worker-provider-selection.js";
 import { factoryEnrollmentMatchesCompany, factoryWorkerScopeMatchesCompany, isFactoryWorkerPolicy, sameFactoryProviderEnrollment } from "@paperclipai/shared/factory-worker-realm";
+import type { FactoryWorkerPreparation } from "./factory-worker-preparation.js";
 
 export interface FactoryWorkerAttempt {
   readonly runId: string;
+  readonly preparation: FactoryWorkerPreparation;
   busy?: FactoryWorkerBusyError;
 }
 export function isFactoryWorkerTarget(target: AdapterExecutionTarget | null | undefined): target is AdapterSshExecutionTarget {

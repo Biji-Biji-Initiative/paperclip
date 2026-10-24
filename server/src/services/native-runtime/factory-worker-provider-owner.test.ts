@@ -36,9 +36,9 @@ describe("post-staging Factory provider caller", () => {
       ensureArtifact: async () => { events.push("stage"); }, createWorkerAdmission: async () => {
         events.push("authorize"); return { workerLease: f.workerLease, providerAdmission: f.providerAdmission,
           revalidateProviderAdmission: f.revalidateProviderAdmission };
-      } });
+      }, onForegroundLaunchAttempted: () => { events.push("foreground-attempt"); } });
     await expect(launch(f.spec).completion).rejects.toBeInstanceOf(FactoryWorkerBusyError);
-    expect(events).toEqual(["stage", "authorize", "open"]);
+    expect(events).toEqual(["stage", "authorize", "foreground-attempt", "open"]);
     expect(openDuplexChannel.mock.calls[0]?.[0]).toMatchObject({ workerLease: f.workerLease, providerAdmission: f.providerAdmission });
     expect(openDuplexChannel.mock.calls[0]?.[0]).toHaveProperty("revalidateProviderAdmission", f.revalidateProviderAdmission);
   });
