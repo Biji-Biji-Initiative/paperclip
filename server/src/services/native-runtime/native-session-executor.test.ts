@@ -317,6 +317,7 @@ import {
   prepareFactoryCodexFromImage,
   nativeUsageCostUsd,
   nativeUsageBiller,
+  nativeClaudeUsage,
   normalizeNativeUsage,
   parseRemoteRunnerProcessIdentity,
   REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT,
@@ -990,6 +991,10 @@ describe("native incomplete-bootstrap evidence", () => {
   });
 });
 
+const accountingDriverFixture = await import(new URL(
+  "../../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.ts", import.meta.url,
+).href);
+
 describe("native provider usage normalization", () => {
   // Public provider profile and counters retained from the CAAM Claude
   // document pilot; no account or credential material belongs in this fixture.
@@ -1011,6 +1016,82 @@ describe("native provider usage normalization", () => {
       protocolVersion: 1,
     },
   } satisfies NativeExecutionInput["provider"];
+
+  const claudeDelta = { inputTokens: 18, outputTokens: 4087,
+    cacheReadTokens: 405727, cacheWriteTokens: 56220, requests: 1, providerCostUsd: 0 };
+  const claudeReceipt = { runDeltaAvailable: true, runDelta: claudeDelta,
+    cumulative: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+      cacheWriteTokens: 0, requests: 1, providerCostUsd: 0.34693140000000006 } };
+
+  it("normalizes the actual remote Claude snapshot once and preserves only numeric receipt categories", async () => {
+    // Exercise the source rehydrator that feeds the facade's usage() snapshot,
+    // rather than inventing an availability field the RPC never delivered.
+    const { rehydrateRunnerdUsageNotification } = await import(new URL(
+      "../../../../packages/paperclip-runner/src/live/runnerd-codex-transport.ts", import.meta.url,
+    ).href) as typeof import("@paperclipai/paperclip-runner/live");
+    const notification = rehydrateRunnerdUsageNotification(
+      { ...claudeReceipt, providerRequestId: "not-for-result-metadata", arbitrary: "not-for-result-metadata" },
+      "opened-thread-1", "active-turn-1",
+    );
+    const transport = new accountingDriverFixture.FakeCodexTransport("opened-thread-1");
+    const driver = accountingDriverFixture.makeDriver([transport], {
+      driverIdentity: { kind: "acpx_runtime", displayName: "ACPX Claude", version: "phase6-v1" },
+    });
+    const session = await driver.openSession({ runId: "usage-component-test", normalizedSessionId: "claude-usage-test",
+      workingDirectory: accountingDriverFixture.WORKSPACE });
+    try {
+      const { turnId } = await session.startTurn({ message: { role: "user", text: "Usage component test" } });
+      for (let observation = 0; observation < 2; observation++) {
+        transport.push("thread/tokenUsage/updated", { ...notification, turnId });
+        for await (const event of session.events()) {
+          if (event.payload.kind === "usage") break;
+        }
+        const usage = await session.usage();
+        expect(usage).toEqual(notification.tokenUsage);
+        // Observations168/169 repeat one prompt, not additive token deltas.
+        expect(normalizeNativeUsage(usage, claudeProvider)).toEqual({
+          inputTokens: 461965, outputTokens: 4087, cachedInputTokens: 405727,
+        });
+        expect(nativeClaudeUsage(usage, claudeProvider)).toEqual({
+          basis: "prompt", runDeltaAvailable: true, inputTokens: 18, outputTokens: 4087,
+          cacheReadTokens: 405727, cacheWriteTokens: 56220, totalInputTokens: 461965,
+        });
+        expect(nativeUsageCostUsd(usage, claudeProvider)).toBeUndefined();
+      }
+    } finally {
+      await session.close();
+    }
+  });
+
+  it.each([undefined, false, null, "true", 1])("leaves Claude usage unavailable without an explicit true receipt: %s", availability => {
+    const usage = { ...claudeReceipt, runDeltaAvailable: availability };
+    expect(nativeClaudeUsage(usage, claudeProvider)).toBeUndefined();
+    expect(normalizeNativeUsage(usage, claudeProvider)).toBeUndefined();
+  });
+
+  it.each(["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"])("refuses missing or invalid Claude %s without falling back to cumulative defaults", key => {
+    for (const value of [undefined, null, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "18"]) {
+      const usage = { ...claudeReceipt, runDelta: { ...claudeDelta, [key]: value } };
+      expect(nativeClaudeUsage(usage, claudeProvider)).toBeUndefined();
+      expect(normalizeNativeUsage(usage, claudeProvider)).toBeUndefined();
+    }
+  });
+
+  it("refuses an unsafe Claude category sum and a foreign profile", () => {
+    expect(normalizeNativeUsage({ ...claudeReceipt,
+      runDelta: { ...claudeDelta, inputTokens: Number.MAX_SAFE_INTEGER } }, claudeProvider)).toBeUndefined();
+    const foreign = { ...claudeProvider, profile: { ...claudeProvider.profile, agent: "codex" as const } };
+    expect(nativeClaudeUsage(claudeReceipt, foreign)).toBeUndefined();
+    expect(normalizeNativeUsage(claudeReceipt, foreign)).toBeUndefined();
+    expect(nativeClaudeUsage(claudeReceipt, { kind: "codex", model: "gpt-6.1-sol" })).toBeUndefined();
+  });
+
+  it("retains explicitly reported zero Claude counters", () => {
+    const usage = { runDeltaAvailable: true,
+      runDelta: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } };
+    expect(normalizeNativeUsage(usage, claudeProvider)).toEqual({ inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 });
+    expect(nativeUsageCostUsd(usage, claudeProvider)).toBeUndefined();
+  });
 
   it("attributes the qualified Claude profile to Anthropic", () => {
     expect(nativeUsageBiller(claudeProvider)).toBe("anthropic");
@@ -1040,7 +1121,7 @@ describe("native provider usage normalization", () => {
   it("keeps normalized Codex cost unknown when tokens were billed without a USD receipt", () => {
     const provider = { kind: "codex", model: "gpt-6.1-sol" } as NativeExecutionInput["provider"];
     const usage = { inputTokens: 258693, cachedInputTokens: 227658, outputTokens: 2612, costUsd: 0 };
-    expect(normalizeNativeUsage(usage)).toMatchObject({ inputTokens: 258693, outputTokens: 2612 });
+    expect(normalizeNativeUsage(usage, provider)).toEqual({ inputTokens: 258693, outputTokens: 2612, cachedInputTokens: 227658 });
     expect(nativeUsageCostUsd(usage, provider)).toBeUndefined();
     expect(nativeUsageBiller(provider)).toBe("openai");
   });

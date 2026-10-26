@@ -2119,7 +2119,20 @@ it("rehydrates normalized usage with the opened driver binding", () => {
     tokenUsage: {
       total: { inputTokens: 10 },
       runDelta: { inputTokens: 3 },
+      runDeltaAvailable: true,
     },
+  });
+});
+
+it.each([false, undefined, null, "true", 0])("preserves usage availability without inventing it: %s", availability => {
+  const notification = rehydrateRunnerdUsageNotification(
+    { cumulative: {}, runDelta: {}, runDeltaAvailable: availability },
+    "opened-thread-1",
+    "active-turn-1",
+  );
+  expect(notification.tokenUsage).toEqual({
+    total: {}, runDelta: {},
+    ...(availability === false ? { runDeltaAvailable: false } : {}),
   });
 });
 

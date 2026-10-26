@@ -9380,6 +9380,7 @@ async function executePaperclipNativeSessionWithinScope(
     if (collectInstructions && !collectedByOwner) await instructionCopy!.collectStopped();
   }
   const providerFailure = providerFailureObservation.forTerminal(native.turnId, native.terminal);
+  const claudeUsage = nativeClaudeUsage(native.usage, input.execution.provider);
   const adapterResult: AdapterExecutionResult = {
     exitCode: native.terminal.runTerminalState === "succeeded" ? 0 : 1,
     signal: null,
@@ -9394,6 +9395,7 @@ async function executePaperclipNativeSessionWithinScope(
       nativeTerminal: native.terminal as unknown as Record<string, unknown>,
       ...(providerFailure ? { nativeProviderFailure: providerFailure.diagnostic } : {}),
       ...(native.goalRolloverRequired ? { goalRolloverRequired: true } : {}),
+      ...(claudeUsage ? { nativeUsage: claudeUsage } : {}),
       planSynchronizations,
     },
     summary: native.result.summary,
@@ -9401,7 +9403,7 @@ async function executePaperclipNativeSessionWithinScope(
     sessionDisplayId: native.providerSessionId ?? native.normalizedSessionId,
     provider: nativeUsageBiller(input.execution.provider),
     model: input.execution.provider.model,
-    usage: normalizeNativeUsage(native.usage),
+    usage: normalizeNativeUsage(native.usage, input.execution.provider),
     costUsd: nativeUsageCostUsd(native.usage, input.execution.provider),
     usageBasis: "per_run",
     nativeFinalization: finalization,
@@ -9501,7 +9503,39 @@ export function nativeUsageCostUsd(
   return numericUsageField(cost, ["amount", "total"]);
 }
 
-export function normalizeNativeUsage(usage: Record<string, unknown> | null) {
+/** Claude's uncached input excludes both cache categories; retain all four. */
+export function nativeClaudeUsage(
+  usage: Record<string, unknown> | null,
+  provider?: NativeExecutionInput["provider"],
+) {
+  if (provider?.kind !== "acpx" || provider.agent !== "claude" ||
+    provider.profile.agent !== "claude" || provider.profile.driverKind !== "acpx_runtime" ||
+    usage?.runDeltaAvailable !== true) return undefined;
+  const delta = record(usage.runDelta);
+  const keys = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"] as const;
+  const counters = keys.map(key => delta[key]);
+  if (!counters.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) {
+    return undefined;
+  }
+  const inputTokens = delta.inputTokens as number;
+  const outputTokens = delta.outputTokens as number;
+  const cacheReadTokens = delta.cacheReadTokens as number;
+  const cacheWriteTokens = delta.cacheWriteTokens as number;
+  const totalInputTokens = inputTokens + cacheReadTokens + cacheWriteTokens;
+  if (!Number.isSafeInteger(totalInputTokens)) return undefined;
+  return { basis: "prompt" as const, runDeltaAvailable: true as const,
+    inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalInputTokens };
+}
+
+export function normalizeNativeUsage(
+  usage: Record<string, unknown> | null,
+  provider?: NativeExecutionInput["provider"],
+) {
+  if (provider?.kind === "acpx" && provider.agent === "claude") {
+    const counters = nativeClaudeUsage(usage, provider);
+    return counters ? { inputTokens: counters.totalInputTokens,
+      outputTokens: counters.outputTokens, cachedInputTokens: counters.cacheReadTokens } : undefined;
+  }
   if (!usage) return undefined;
   const measurement = nativeUsageMeasurement(usage);
   const cache = record(measurement.cache);

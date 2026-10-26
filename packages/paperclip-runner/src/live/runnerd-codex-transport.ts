@@ -1709,6 +1709,9 @@ export function rehydrateRunnerdUsageNotification(
     tokenUsage: {
       total: record(rawParams.cumulative),
       runDelta: record(rawParams.runDelta),
+      ...(typeof rawParams.runDeltaAvailable === "boolean"
+        ? { runDeltaAvailable: rawParams.runDeltaAvailable }
+        : {}),
     },
   };
 }
