@@ -393,6 +393,7 @@ class HarnessNativeSession implements NativeSession {
   readonly #session: HarnessSession;
   #terminal: PrpTerminalState | null = null;
   #explicitlyCancelled = false;
+  #eventCancellation = new AbortController();
   #protocolIntegrityFailure: NativeSessionProtocolIntegrityError | null = null;
 
   #assertProtocolIntegrity(): void {
@@ -495,6 +496,7 @@ class HarnessNativeSession implements NativeSession {
     this.#input = { ...this.#input, identity: structuredClone(input.identity) };
     this.#terminal = null;
     this.#explicitlyCancelled = false;
+    this.#eventCancellation = new AbortController();
   }
 
   async detachControllerForRestart(): Promise<void> {
@@ -504,6 +506,8 @@ class HarnessNativeSession implements NativeSession {
 
   async *events(): AsyncIterable<PrpEvent> {
     this.#assertProtocolIntegrity();
+    const cancellation = this.#eventCancellation.signal;
+    const source = this.#session.events()[Symbol.asyncIterator]();
     let sourceInstanceId: string | null = null;
     let lastSourceSequence = 0;
     let sawTerminal = false;
@@ -511,13 +515,10 @@ class HarnessNativeSession implements NativeSession {
     let streamFailure: unknown = null;
     const observedPendingInputs = new Map<string, Record<string, unknown>>();
     try {
-      for await (const event of this.#session.events()) {
-        const isCancellationEvent =
-          event.eventType === "turn.cancelled" ||
-          event.eventType === "turn.interrupted" ||
-          (event.eventType === "item.completed" &&
-            event.payload.kind === "interrupt_acknowledgement");
-        if (this.#explicitlyCancelled && !isCancellationEvent) continue;
+      while (true) {
+        const next = await this.#nextEvent(source, cancellation);
+        if (next.done) break;
+        const event = next.value;
         sourceInstanceId = event.sourceInstanceId;
         lastSourceSequence = Math.max(lastSourceSequence, event.sourceSeq);
         if (event.eventType === "runtime_request.created") {
@@ -579,11 +580,21 @@ class HarnessNativeSession implements NativeSession {
             reportedWorkDisposition: disposition,
           };
         }
+        cancellation.throwIfAborted();
         yield structuredClone(event);
       }
     } catch (error) {
       this.#rethrowProtocolIntegrity(error);
       streamFailure = error;
+    } finally {
+      const returning = Promise.resolve().then(() => source.return?.());
+      if (cancellation.aborted) {
+        // A pending provider next() can also block return(). The execution's
+        // existing close owner must run first; it still proves physical cleanup.
+        void returning.catch(() => undefined);
+      } else {
+        await returning;
+      }
     }
 
     // The provider can disappear while its native RPC is awaiting the user.
@@ -667,6 +678,22 @@ class HarnessNativeSession implements NativeSession {
     if (streamFailure && !synthesizedDurableWait) throw streamFailure;
   }
 
+  async #nextEvent(source: AsyncIterator<PrpEvent>, signal: AbortSignal): Promise<IteratorResult<PrpEvent>> {
+    signal.throwIfAborted();
+    let abort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      abort = () => reject(signal.reason);
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      const next = await Promise.race([source.next(), cancelled]);
+      signal.throwIfAborted();
+      return next;
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  }
+
   async startTurn(input: Parameters<HarnessSession["startTurn"]>[0]) {
     this.#assertProtocolIntegrity();
     // Stop can arrive after session publication but before the first turn.
@@ -713,6 +740,10 @@ class HarnessNativeSession implements NativeSession {
     // interruption happens afterward as passive cleanup, so a slow or broken
     // transport cannot synthesize or publish new accepted output for the turn.
     this.#explicitlyCancelled = true;
+    // A driver may already be terminal while its consumer is backlogged. Its
+    // interrupt can then reject without producing another event. Wake next()
+    // independently so execution reaches guarded close instead of its deadline.
+    this.#eventCancellation.abort(new Error("native_session_cancelled"));
     const interrupt = this.#session.interrupt;
     return {
       cleanup:

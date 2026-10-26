@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { HarnessDriver, HarnessSession, PersistedHarnessSession } from "../contracts/harness-driver.js";
+import { HarnessOperationAlreadyTerminalError, type HarnessDriver, type HarnessSession, type PersistedHarnessSession } from "../contracts/harness-driver.js";
 import type { PrpEvent, PrpStructuredRunResult, PrpTerminalState } from "../protocol/replay-contract.js";
-import { NativeSessionProtocolIntegrityError } from "../contracts/native-session-backend.js";
+import { NativeSessionProtocolIntegrityError, NativeSessionCloseUnrecoverableError, type NativeSession } from "../contracts/native-session-backend.js";
+import type { NativeExecutionInputV1 } from "../contracts/native-execution.js";
+import type { ControlPlanePort } from "../contracts/control-plane-port.js";
+import { executeNativeSession } from "../native-session-runtime.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 
 const result: PrpStructuredRunResult = {
@@ -988,6 +991,123 @@ describe("HarnessDriverBackend", () => {
     expect(start).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("closes after cancellation behind an already-produced terminal without accepting it (retirement fails=%s)", async retirementFails => {
+    let terminalProduced!: () => void;
+    const produced = new Promise<void>(resolve => { terminalProduced = resolve; });
+    let releaseAppend!: () => void;
+    const appendGate = new Promise<void>(resolve => { releaseAppend = resolve; });
+    let appendStarted!: () => void;
+    const appending = new Promise<void>(resolve => { appendStarted = resolve; });
+    let closeSource!: () => void;
+    const sourceClosed = new Promise<void>(resolve => { closeSource = resolve; });
+    const retirementError = new NativeSessionCloseUnrecoverableError({ runnerExited: false });
+    const interrupt = vi.fn(async () => { throw new HarnessOperationAlreadyTerminalError("interruption"); });
+    const close = vi.fn(async () => {
+      closeSource();
+      if (retirementFails) throw retirementError;
+    });
+    class CompletedProvider extends FakeHarnessSession {
+      override async *events() {
+        yield prpEvent(1, "item.completed", { kind: "tool_execution", status: "completed" });
+        await produced;
+        yield prpEvent(2, "turn.completed", { status: "completed" });
+        yield prpEvent(3, "run.terminal", { schema: "paperclip.prp.terminal.v1", turnTerminalState: "completed", runTerminalState: "succeeded", reportedWorkDisposition: "done" });
+        // A durable provider connection stays open until the existing close owner retires it.
+        await sourceClosed;
+      }
+      override async startTurn() { terminalProduced(); return { turnId: "turn-1" }; }
+      override async snapshot(): Promise<PersistedHarnessSession> {
+        return { ...(await super.snapshot()), semanticResult: null, activeTurnId: null };
+      }
+      interrupt = interrupt;
+      override close = close;
+    }
+    const backend = new HarnessDriverBackend({ ...driver, openSession: async () => new CompletedProvider() });
+    const identity = { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" };
+    const input: NativeExecutionInputV1 = {
+      schema: "paperclip.native-execution-input.v1",
+      binding: { companyId: identity.companyId, runId: identity.runId, issueId: identity.issueId, agentId: identity.agentId, executionWorkspaceId: "workspace-1" },
+      task: { identifier: "PAP-1", title: "Bounded document", description: null, prompt: "Write a document", workMode: "standard" },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: identity.sessionId, driverKind: "codex_app_server", protocolVersion: 1 },
+      provider: { kind: "codex", model: null },
+      completionContract: { id: "contract-1", sha256: "contract-sha", schemaVersion: "paperclip.completion-contract.v1", contract: { revision: "1", objective: "Write a document", criteria: [{ id: "objective", requirement: "Document persisted" }] } },
+      interactionResponses: [], credentialBindings: [],
+    };
+    const accepted: PrpEvent[] = [];
+    const completeRun = vi.fn();
+    const controlPlane: ControlPlanePort = {
+      async openRun() {}, async checkpointSession() {},
+      async appendEvent(event) {
+        appendStarted(); await appendGate; accepted.push(event);
+        return { cursor: 1, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" };
+      },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
+      completeRun,
+    };
+    let session!: NativeSession;
+    const running = executeNativeSession({ input, backend, controlPlane, runnerInstanceId: "runner-1", controlPlaneInstanceId: "control-1", requireSessionCloseBeforeReturn: true,
+      onSession(value) { if (value) session = value; } });
+    const outcome = running.catch(error => error);
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([Promise.all([appending, produced]), outcome.then(error => { throw error; })]);
+      await expect(session.cancel!({ reason: "operator Stop after provider terminal", signal: new AbortController().signal }).cleanup)
+        .rejects.toBeInstanceOf(HarnessOperationAlreadyTerminalError);
+      releaseAppend();
+      const error = await Promise.race([outcome, new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("cancelled event iterator did not reach owned cleanup")), 500);
+      })]);
+      expect(error).toMatchObject({ message: "native_session_cancelled" });
+      if (retirementFails) expect(error.cleanupError).toBe(retirementError);
+      expect(close).toHaveBeenCalledOnce();
+      expect(interrupt.mock.calls).toEqual([
+        [{ reason: "operator Stop after provider terminal", signal: expect.any(AbortSignal) }],
+        [{ reason: "Native session event consumption failed.", signal: expect.any(AbortSignal) }],
+      ]);
+      expect(completeRun).not.toHaveBeenCalled();
+      expect(accepted.map(event => event.eventType)).toEqual(["item.completed"]);
+      expect(await session.result()).toBeNull();
+    } finally {
+      if (deadline) clearTimeout(deadline);
+      releaseAppend(); closeSource();
+      await outcome;
+    }
+  });
+
+  it("wakes an already-blocked provider next without waiting for interrupt cleanup", async () => {
+    let nextStarted!: () => void;
+    const started = new Promise<void>(resolve => { nextStarted = resolve; });
+    let closeSource!: () => void;
+    const closed = new Promise<void>(resolve => { closeSource = resolve; });
+    let settleInterrupt!: () => void;
+    const interrupting = new Promise<void>(resolve => { settleInterrupt = resolve; });
+    class QuietProvider extends FakeHarnessSession {
+      override async *events() {
+        nextStarted();
+        await closed;
+        yield prpEvent(1, "turn.completed", { status: "completed" });
+      }
+      async interrupt() { await interrupting; }
+      override async close() { closeSource(); }
+    }
+    const backend = new HarnessDriverBackend({ ...driver, openSession: async () => new QuietProvider() });
+    const session = await backend.openSession({ identity: { runId: "run-1", sessionId: "session-1", companyId: "company-1", issueId: "issue-1", agentId: "agent-1" } });
+    const iterator = session.events()[Symbol.asyncIterator]();
+    const next = iterator.next();
+    await started;
+    const cancellation = session.cancel!({ reason: "operator Stop", signal: new AbortController().signal });
+    try {
+      await expect(next).rejects.toThrow("native_session_cancelled");
+      await session.close({ reason: "existing execution cleanup" });
+      await expect(iterator.return!()).resolves.toEqual({ done: true, value: undefined });
+      expect(await session.result()).toBeNull();
+    } finally {
+      closeSource(); settleInterrupt();
+      await cancellation.cleanup;
+    }
+  });
+
   it("does not synthesize a fallback after explicit run cancellation", async () => {
     class CancelledProviderSession extends FakeHarnessSession {
       override async *events() {
@@ -1015,7 +1135,7 @@ describe("HarnessDriverBackend", () => {
       reason: "operator cancelled the run",
       signal: new AbortController().signal,
     }).cleanup;
-    await expect(iterator.next()).rejects.toThrow("provider stopped after cancellation");
+    await expect(iterator.next()).rejects.toThrow("native_session_cancelled");
   });
 });
 
