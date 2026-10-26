@@ -991,11 +991,58 @@ describe("native incomplete-bootstrap evidence", () => {
 });
 
 describe("native provider usage normalization", () => {
+  // Public provider profile and counters retained from the CAAM Claude
+  // document pilot; no account or credential material belongs in this fixture.
+  const claudeProvider = {
+    kind: "acpx",
+    agent: "claude",
+    model: "claude-sonnet-5",
+    permissionMode: "approve-paperclip",
+    profile: {
+      acpxVersion: "0.13.1",
+      agent: "claude",
+      agentProfileVersion: 1,
+      agentRuntimePackage: "@anthropic-ai/claude-agent-sdk",
+      agentRuntimeVersion: "0.3.286",
+      agentServerPackage: "@agentclientprotocol/claude-agent-acp",
+      agentServerVersion: "0.73.0",
+      commandDigest: "sha256:9d73d1f0f121fb96cc8badb28c22d5bff02d8582eb2e40360a81c189e1b9422a",
+      driverKind: "acpx_runtime",
+      protocolVersion: 1,
+    },
+  } satisfies NativeExecutionInput["provider"];
+
+  it("attributes the qualified Claude profile to Anthropic", () => {
+    expect(nativeUsageBiller(claudeProvider)).toBe("anthropic");
+  });
+
+  it.each([
+    ["terminal prompt receipt", {
+      runDeltaAvailable: true,
+      runDelta: { inputTokens: 18, outputTokens: 4087, cacheReadTokens: 405727, cacheWriteTokens: 56220, requests: 1, providerCostUsd: 0 },
+      cumulative: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, requests: 1, providerCostUsd: 0.34693140000000006 },
+    }],
+    ["unknown streaming counters", {
+      runDeltaAvailable: false,
+      runDelta: { inputTokens: 0, outputTokens: 0, providerCostUsd: 0 },
+      cumulative: { inputTokens: 0, outputTokens: 0, providerCostUsd: 0 },
+    }],
+    ["persisted cumulative SDK cost", {
+      cumulative: { inputTokens: 18, outputTokens: 4087, cachedReadTokens: 405727, cachedWriteTokens: 56220 },
+      cost: { amount: 0.34693140000000006, currency: "USD" },
+    }],
+    ["direct normalized cost", { costUsd: 0.34693140000000006 }],
+    ["missing usage", null],
+  ])("keeps Claude %s unpriced rather than treating SDK metadata as billed USD", (_label, usage) => {
+    expect(nativeUsageCostUsd(usage, claudeProvider)).toBeUndefined();
+  });
+
   it("keeps normalized Codex cost unknown when tokens were billed without a USD receipt", () => {
     const provider = { kind: "codex", model: "gpt-6.1-sol" } as NativeExecutionInput["provider"];
     const usage = { inputTokens: 258693, cachedInputTokens: 227658, outputTokens: 2612, costUsd: 0 };
     expect(normalizeNativeUsage(usage)).toMatchObject({ inputTokens: 258693, outputTokens: 2612 });
     expect(nativeUsageCostUsd(usage, provider)).toBeUndefined();
+    expect(nativeUsageBiller(provider)).toBe("openai");
   });
 
   it.each([["cursor", "cursor"], ["copilot", "github"], ["pi", "openrouter"]] as const)("keeps %s cost unknown and attributes its actual biller", (agent, biller) => {

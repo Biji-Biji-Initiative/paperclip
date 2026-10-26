@@ -9460,6 +9460,7 @@ function nativeUsageMeasurement(usage: Record<string, unknown>) {
 
 export function nativeUsageBiller(provider: NativeExecutionInput["provider"]): string {
   if (provider.kind === "acpx") {
+    if (provider.agent === "claude") return "anthropic";
     if (provider.agent === "cursor") return "cursor";
     if (provider.agent === "copilot") return "github";
     if (provider.agent === "pi") return "openrouter";
@@ -9472,9 +9473,9 @@ export function nativeUsageCostUsd(
   provider?: NativeExecutionInput["provider"],
 ) {
   // The ACP normalization contract fills absent per-turn cost with zero and
-  // reports actual cost cumulatively. Until it carries an authoritative run
+  // reports cost metadata cumulatively. Until it carries an authoritative run
   // delta with provenance, neither value is a candidate's billed USD receipt.
-  if (provider?.kind === "acpx" && ["cursor", "copilot", "pi"].includes(provider.agent)) return undefined;
+  if (provider?.kind === "acpx" && ["claude", "cursor", "copilot", "pi"].includes(provider.agent)) return undefined;
   // Codex reports token usage, not an authoritative billed-USD receipt. The
   // normalized PRP projection fills absent cost with zero; treating it as a
   // receipt would label a paid API run free and defeat billed-cent budgets.
